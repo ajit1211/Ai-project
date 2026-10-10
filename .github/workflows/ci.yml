@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (lint, types, tests)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      NEXA_ENV: test
+      LOG_JSON: "true"
+      DATABASE_URL: postgresql://nexa_core:nexa_core_dev@localhost:5432/nexa
+      RUNTIME_DATABASE_URL: postgresql://nexa_runtime:nexa_runtime_dev@localhost:5432/nexa
+      REDIS_QUEUE_URL: redis://localhost:6379/0
+      REDIS_CACHE_URL: redis://localhost:6379/1
+      DJANGO_SECRET_KEY: ci-only-not-a-secret
+      DJANGO_DEBUG: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Create database roles
+        run: psql -h localhost -U postgres -f scripts/db/init.sql
+        env:
+          PGPASSWORD: postgres
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy apps/core apps/runtime packages/nexa-common
+      - name: Migrations match the models
+        run: uv run python apps/core/manage.py makemigrations --check --dry-run
+      - run: uv run pytest
+
+  web:
+    name: Web (types, lint, tests, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @nexa/web typecheck
+      - run: pnpm --filter @nexa/web lint
+      - run: pnpm --filter @nexa/web test
+      - run: pnpm --filter @nexa/web build

@@ -1,0 +1,97 @@
+"""The catalog of auditable actions.
+
+Adding an action is one line here. Future AI actions (AI_AGENT_EXECUTED, AI_TOOL_EXECUTED,
+DOCUMENT_ACCESSED, WORKFLOW_EXECUTED) are added the same way by the phases that introduce them.
+"""
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class Category(StrEnum):
+    AUDIT = "audit"
+    SECURITY = "security"
+
+
+class Severity(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+class AuditAction(StrEnum):
+    # Accounts and authentication
+    USER_REGISTERED = "USER_REGISTERED"
+    EMAIL_VERIFIED = "EMAIL_VERIFIED"
+    USER_LOGIN = "USER_LOGIN"
+    USER_LOGIN_FAILED = "USER_LOGIN_FAILED"
+    USER_LOGOUT = "USER_LOGOUT"
+    NEW_DEVICE_LOGIN = "NEW_DEVICE_LOGIN"
+    RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
+    PASSWORD_CHANGED = "PASSWORD_CHANGED"
+    PASSWORD_RESET_REQUESTED = "PASSWORD_RESET_REQUESTED"
+    PASSWORD_RESET = "PASSWORD_RESET"
+    PROFILE_UPDATED = "PROFILE_UPDATED"
+    USER_DEACTIVATED = "USER_DEACTIVATED"
+    # Sessions
+    SESSION_CREATED = "SESSION_CREATED"
+    SESSION_REVOKED = "SESSION_REVOKED"
+    ALL_SESSIONS_REVOKED = "ALL_SESSIONS_REVOKED"
+    TOKEN_REUSE_DETECTED = "TOKEN_REUSE_DETECTED"
+    # Organizations and membership
+    ORGANIZATION_CREATED = "ORGANIZATION_CREATED"
+    ORGANIZATION_UPDATED = "ORGANIZATION_UPDATED"
+    ORGANIZATION_DELETED = "ORGANIZATION_DELETED"
+    MEMBER_INVITED = "MEMBER_INVITED"
+    INVITATION_RESENT = "INVITATION_RESENT"
+    INVITATION_REVOKED = "INVITATION_REVOKED"
+    INVITATION_DECLINED = "INVITATION_DECLINED"
+    MEMBER_JOINED = "MEMBER_JOINED"
+    MEMBER_ROLE_CHANGED = "MEMBER_ROLE_CHANGED"
+    MEMBER_STATUS_CHANGED = "MEMBER_STATUS_CHANGED"
+    MEMBER_REMOVED = "MEMBER_REMOVED"
+    MEMBER_LEFT = "MEMBER_LEFT"
+    # Teams
+    TEAM_CREATED = "TEAM_CREATED"
+    TEAM_UPDATED = "TEAM_UPDATED"
+    TEAM_DELETED = "TEAM_DELETED"
+    TEAM_MEMBER_ADDED = "TEAM_MEMBER_ADDED"
+    TEAM_MEMBER_REMOVED = "TEAM_MEMBER_REMOVED"
+    # Roles and permissions
+    ROLE_CREATED = "ROLE_CREATED"
+    ROLE_UPDATED = "ROLE_UPDATED"
+    ROLE_DELETED = "ROLE_DELETED"
+    PERMISSION_CHANGED = "PERMISSION_CHANGED"
+
+
+@dataclass(frozen=True)
+class ActionSpec:
+    category: Category = Category.AUDIT
+    severity: Severity = Severity.INFO
+
+
+_SECURITY_INFO = ActionSpec(Category.SECURITY, Severity.INFO)
+_SECURITY_WARNING = ActionSpec(Category.SECURITY, Severity.WARNING)
+
+# Security events are a filtered view of the same log, so investigations see one timeline.
+ACTION_SPECS: dict[AuditAction, ActionSpec] = {
+    AuditAction.USER_LOGIN_FAILED: _SECURITY_WARNING,
+    AuditAction.NEW_DEVICE_LOGIN: _SECURITY_INFO,
+    AuditAction.RATE_LIMIT_EXCEEDED: _SECURITY_WARNING,
+    AuditAction.PASSWORD_CHANGED: _SECURITY_INFO,
+    AuditAction.PASSWORD_RESET_REQUESTED: _SECURITY_INFO,
+    AuditAction.PASSWORD_RESET: _SECURITY_INFO,
+    AuditAction.USER_DEACTIVATED: _SECURITY_WARNING,
+    AuditAction.SESSION_REVOKED: _SECURITY_INFO,
+    AuditAction.ALL_SESSIONS_REVOKED: _SECURITY_INFO,
+    AuditAction.TOKEN_REUSE_DETECTED: ActionSpec(Category.SECURITY, Severity.CRITICAL),
+    AuditAction.MEMBER_ROLE_CHANGED: _SECURITY_INFO,
+    AuditAction.ROLE_CREATED: _SECURITY_INFO,
+    AuditAction.ROLE_UPDATED: _SECURITY_INFO,
+    AuditAction.ROLE_DELETED: _SECURITY_INFO,
+    AuditAction.PERMISSION_CHANGED: _SECURITY_WARNING,
+}
+
+
+def spec_for(action: AuditAction) -> ActionSpec:
+    return ACTION_SPECS.get(action, ActionSpec())
