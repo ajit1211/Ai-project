@@ -228,6 +228,16 @@ describe("streamChat", () => {
     });
   });
 
+  it("treats a stream cut off before message.end as a network error, not an answer", async () => {
+    responses.push(sse([frame("message.start", 1, start), frame("message.delta", 2, { text: "Hel" })]));
+
+    const { events, error } = await drain(streamChat(request));
+
+    expect(events.map((e) => e.type)).toEqual(["message.start", "message.delta"]);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 0, code: "NETWORK_ERROR" });
+  });
+
   it("passes the abort signal to fetch and surfaces the abort", async () => {
     const controller = new AbortController();
     responses.push((init) => {

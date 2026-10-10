@@ -148,8 +148,10 @@ async def cancel(
 
 async def _respond(generation: Generation, request: Request, service: ChatService) -> Response:
     if _wants_stream(request):
+        events = service.stream(generation)
         return SSEResponse(
-            sse_bytes(service.stream(generation)),
+            sse_bytes(events),
+            source=events,
             media_type=SSE_MEDIA_TYPE,
             headers={**SSE_HEADERS, PROTOCOL_HEADER: PROTOCOL},
         )

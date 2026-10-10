@@ -153,11 +153,22 @@ provider was called at all (the gateway stream is handed to its reader before an
 can run, so even then the quota reservation is released and a `cancelled` usage row is
 written). A stop that arrives once the model has finished (after the `usage` event) changes
 nothing; the reply completes. `/cancel/` also stops a reply requested without streaming: the
-gateway call is cancelled and the `201` response carries the reply as `cancelled`.
+gateway call is cancelled (or not started, if the stop came first) and the `201` response
+carries the reply as `cancelled`.
+
+The web client presses **Stop** by calling `/cancel/` and then waiting for the stream's
+terminal event, never by dropping the request first. If `/cancel/` finds nothing running yet
+(the messages are still being stored), dropping the request would not undo the send, so the
+client asks again as soon as `message_start` arrives; only if nothing arrives within five
+seconds does it close the stream and reload.
 
 A client that disconnects (closed tab, lost network) stops the generation too: the reply is
 stored as `cancelled` with the text that had arrived, written in a task of its own so the
-cancellation of the request cannot interrupt it, and awaited at shutdown. Generation that
+cancellation of the request cannot interrupt it, and awaited at shutdown. That holds even
+when the client is gone before the response starts and not one event is read: the
+generation's stream object settles itself when it is closed unread, and the SSE response
+closes it directly, not only through the byte encoder (which, never started, would run no
+cleanup). Generation that
 continues after a disconnect, and resumable streams, are deferred to Phase 18.
 
 ## Streaming protocol `nexa.chat.v1`
@@ -253,7 +264,9 @@ Redis or per process without it.
 - Cross-process `/cancel/` needs Redis; without it only the generation's own process sees it.
 - The non-streaming path (`Accept: application/json`) does not notice a client that went away
   (`/cancel/` does stop it). A non-streaming reply stopped this way does not show the tokens
-  it used; its usage row (`source_id` = the message) has them.
+  it used; its usage row (`source_id` = the message) has them. A stop that lands in the
+  instant after the model answered, while the usage row is being written, stores that reply
+  as `cancelled` without its text, although the call completed and is billed.
 - Context is a recent-message window; long conversations lose their beginning (Phase 06).
 - Titles are the first line of the first message, not model-generated.
 - Conversations are private; sharing with a team is a later feature (the policy already

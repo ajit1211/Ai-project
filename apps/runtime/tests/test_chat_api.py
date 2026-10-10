@@ -789,6 +789,53 @@ class TestDuringGeneration:
         assert usage.status == "cancelled"
         assert stopped.usage_event_id == usage.id
 
+    def test_a_stream_closed_before_it_was_read_releases_the_conversation(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        conversation_id = UUID(new_conversation(runtime, auth(owner))["id"])
+        principal = _principal(owner)
+        service: ChatService = runtime.app.state.chat  # type: ignore[attr-defined]
+
+        async def scenario() -> None:
+            gen = await service.send(
+                principal, conversation_id, SendMessage(content="hello"), request_id=None
+            )
+            assert isinstance(gen, Generation)
+            # The client left before the response started: nothing is ever read.
+            await service.stream(gen).aclose()
+            await service.drain()
+
+        runtime.portal.call(scenario)  # type: ignore[union-attr]
+        reply = Message.objects.get(role="assistant")
+        assert reply.status == "cancelled"
+        assert Conversation.objects.get().active_generation_id is None
+        assert not AIUsageEvent.objects.exists()  # the model was never called
+
+    def test_a_stop_before_a_non_streaming_call_skips_the_model(
+        self, runtime: TestClient, owner: User, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conversation_id = UUID(new_conversation(runtime, auth(owner))["id"])
+        principal = _principal(owner)
+        service: ChatService = runtime.app.state.chat  # type: ignore[attr-defined]
+        mark_streaming = service._mark_streaming
+
+        async def scenario() -> Exchange:
+            async def stopped_meanwhile(message_id: UUID) -> None:
+                await mark_streaming(message_id)
+                assert (await service.cancel(principal, conversation_id)).cancelled
+
+            monkeypatch.setattr(service, "_mark_streaming", stopped_meanwhile)
+            gen = await service.send(
+                principal, conversation_id, SendMessage(content="hello"), request_id=None
+            )
+            assert isinstance(gen, Generation)
+            return await service.complete(gen)
+
+        exchange = runtime.portal.call(scenario)  # type: ignore[union-attr]
+        assert exchange.assistant_message.status == "cancelled"
+        assert not AIUsageEvent.objects.exists()  # no call, so no reservation to leak
+        assert Conversation.objects.get().active_generation_id is None
+
     def test_leaving_during_the_final_write_still_finishes_it(
         self, runtime: TestClient, owner: User, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -897,7 +944,7 @@ class TestDuringGeneration:
                 if isinstance(event, TextDelta):
                     received += event.text
                     break
-            await stream.aclose()  # type: ignore[attr-defined]
+            await stream.aclose()
             await service.drain()
             await runtime.app.state.gateway.drain()  # type: ignore[attr-defined]
             return received

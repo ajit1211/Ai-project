@@ -532,8 +532,23 @@ class Gateway:
             stream=stream,
             started=started,
         )
-        ticket = await self.quota.reserve(ctx, policy, tokens=_worst_case_tokens(plan))
+        # A round trip to Redis. If the call is cancelled meanwhile (a stop, a shutdown), the
+        # reservation may still land: it is then released and the call recorded as cancelled,
+        # so a cancelled call never keeps a request slot or its worst-case tokens.
+        reserving = asyncio.ensure_future(
+            self.quota.reserve(ctx, policy, tokens=_worst_case_tokens(plan))
+        )
+        try:
+            ticket = await asyncio.shield(reserving)
+        except asyncio.CancelledError:
+            reserving.add_done_callback(lambda done: self._settle_late(plan, done))
+            raise
         return replace(plan, ticket=ticket)
+
+    def _settle_late(self, plan: _Plan, reserving: "asyncio.Future[object]") -> None:
+        if reserving.cancelled() or reserving.exception() is not None:
+            return  # nothing was reserved
+        self._finish_detached(replace(plan, ticket=reserving.result()), _Tally())
 
     def _max_output_tokens(self, request: ChatRequest, policy: OrganizationPolicy) -> int:
         cap = (
@@ -706,8 +721,8 @@ class Gateway:
             if opened is None:
                 error = fatal or fallback.final_error()
                 finished = True
-                sink.usage = await self._finish(plan, tally, status="error", error=error)
-                yield UsageEvent(usage=sink.usage)
+                usage = await self._finish(plan, tally, status="error", error=error, sink=sink)
+                yield UsageEvent(usage=usage)
                 yield _stream_error(error, plan)
                 return
 
@@ -750,12 +765,12 @@ class Gateway:
             if failure is not None or end is None:
                 failure = failure or AIProviderError(provider=candidate.model.provider)
                 self._note_failure(plan, candidate, failure)
-                sink.usage = await self._finish(plan, tally, status="error", error=failure)
-                yield UsageEvent(usage=sink.usage)
+                usage = await self._finish(plan, tally, status="error", error=failure, sink=sink)
+                yield UsageEvent(usage=usage)
                 yield _stream_error(failure, plan)
                 return
-            sink.usage = await self._finish(plan, tally, status="success")
-            yield UsageEvent(usage=sink.usage)
+            usage = await self._finish(plan, tally, status="success", sink=sink)
+            yield UsageEvent(usage=usage)
             yield MessageEnd(
                 finish_reason=end.finish_reason,
                 latency_ms=self._elapsed_ms(plan.started),
@@ -768,10 +783,10 @@ class Gateway:
             if not finished:
                 finished = True
                 self._count_stream_usage(plan, tally, start, None, text)
-                sink.usage = await self._finish(
-                    plan, tally, status="error", error=AIInternalError()
+                usage = await self._finish(
+                    plan, tally, status="error", error=AIInternalError(), sink=sink
                 )
-                yield UsageEvent(usage=sink.usage)
+                yield UsageEvent(usage=usage)
             yield _stream_error(AIInternalError(), plan)
         finally:
             if events is not None:
@@ -914,10 +929,19 @@ class Gateway:
         return record, usage
 
     async def _finish(
-        self, plan: _Plan, tally: _Tally, *, status: str, error: AIError | None = None
+        self,
+        plan: _Plan,
+        tally: _Tally,
+        *,
+        status: str,
+        error: AIError | None = None,
+        sink: GatewayStream | None = None,
     ) -> Usage:
         record, usage = self._usage_record(plan, tally, status=status, error=error)
         self._observe(record)
+        if sink is not None:
+            # Known before the write below, so a stop during it does not lose the numbers.
+            sink.usage = usage
         # Shielded: if the request is cancelled now (the client left right after the last
         # token), the quota settle and the ledger row still complete in their own task.
         await asyncio.shield(self._spawn_persist(plan, record))

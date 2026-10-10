@@ -256,6 +256,13 @@ async function settle(): Promise<void> {
   });
 }
 
+/** Let the grace period after Stop run out; needs fake timers. */
+async function outlastStopGrace(): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_100);
+  });
+}
+
 /** Deliver stream events and let the page render them. */
 async function feed(stream: ControlledStream, ...events: ChatStreamEvent[]): Promise<void> {
   await act(async () => {
@@ -346,6 +353,7 @@ describe("ChatPage", () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.resetAllMocks();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -548,17 +556,48 @@ describe("ChatPage", () => {
     expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
   });
 
-  it("keeps a message stopped before the server answered, to retry", async () => {
+  it("stops a reply the server had not started yet as soon as it starts", async () => {
     const stream = controlledStream();
     vi.mocked(sendMessage).mockImplementation((_id, _body, control) => stream.events(control));
-    vi.mocked(cancelGeneration).mockResolvedValue({ cancelled: false, message_id: null });
+    vi.mocked(cancelGeneration)
+      .mockResolvedValueOnce({ cancelled: false, message_id: null }) // still storing the messages
+      .mockImplementationOnce(() => {
+        stream.push({ type: "message_cancelled", message: message({ status: "cancelled" }) });
+        return Promise.resolve({ cancelled: true, message_id: "m4" });
+      });
     await openChat("/chat/c1");
     sendText("Explain SSE");
 
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
     await settle();
+    // Dropping the request would not undo the send, so the client keeps listening.
+    expect(stream.signal?.aborted).toBe(false);
 
-    // Nothing was running on the server yet, so the request itself is dropped.
+    await feed(stream, started());
+    expect(cancelGeneration).toHaveBeenCalledTimes(2);
+    const list = screen.getByRole("list", { name: "Messages" });
+    expect(within(list).getAllByText("Explain SSE")).toHaveLength(1);
+    expect(within(list).getByText("Cancelled")).toBeTruthy();
+    expect(within(list).queryByText("Not sent")).toBeNull();
+    expect(liveRegion()).toBe("Reply stopped");
+  });
+
+  it("keeps a message stopped before the server answered, to retry", async () => {
+    const stream = controlledStream();
+    vi.mocked(sendMessage).mockImplementation((_id, _body, control) => stream.events(control));
+    vi.mocked(cancelGeneration).mockResolvedValue({ cancelled: false, message_id: null });
+    await openChat("/chat/c1");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    sendText("Explain SSE");
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(stream.signal?.aborted).toBe(false); // waiting for the reply to start
+    await outlastStopGrace();
+
+    // It never started, so the request itself is dropped.
     expect(stream.signal?.aborted).toBe(true);
     const list = screen.getByRole("list", { name: "Messages" });
     expect(within(list).getByText("Not sent")).toBeTruthy();
@@ -584,10 +623,11 @@ describe("ChatPage", () => {
         );
       });
     await openChat("/chat/c1");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     sendText("Explain SSE");
 
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
-    await settle();
+    await outlastStopGrace();
 
     const list = screen.getByRole("list", { name: "Messages" });
     expect(within(list).queryByText("Not sent")).toBeNull();
@@ -882,6 +922,24 @@ describe("ChatPage", () => {
     });
     expect(deleteConversation).toHaveBeenCalledWith("c1");
     expect(within(sidebar()).queryByRole("link", { name: "Explain Django middleware" })).toBeNull();
+  });
+
+  it("keeps Stop available when the open conversation is archived mid-reply", async () => {
+    const stream = controlledStream();
+    vi.mocked(sendMessage).mockImplementation((_id, _body, control) => stream.events(control));
+    vi.mocked(updateConversation).mockResolvedValue({ ...django, status: "archived" });
+    await openChat("/chat/c1");
+    sendText("Explain SSE");
+    await feed(stream, started(), delta("Partial"));
+
+    fireEvent.click(within(sidebar()).getByRole("button", { name: "Archive “Explain Django middleware”" }));
+    await settle();
+    expect(updateConversation).toHaveBeenCalledWith("c1", { status: "archived" });
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+
+    await feed(stream, completed("Partial answer"));
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect(screen.getByText("This conversation is archived. Restore it to continue.")).toBeTruthy();
   });
 
   it("changes the conversation's model", async () => {

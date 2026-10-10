@@ -17,7 +17,7 @@ deadlock.
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncGenerator, AsyncIterator, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -378,11 +378,14 @@ class ChatService:
 
     # --- Generation --------------------------------------------------------------------------
 
-    async def stream(self, gen: Generation) -> AsyncIterator[ChatEvent | KeepAlive]:
+    def stream(self, gen: Generation) -> "GenerationStream":
         """The `nexa.chat.v1` event stream for one generation. Exactly one terminal event.
+        The caller must close it (see `GenerationStream`)."""
+        return GenerationStream(self, gen)
 
-        The gateway stream is read in a separate task, so a stop request is noticed within a
-        quarter of a second even while the model is still thinking."""
+    async def _events(self, gen: Generation) -> AsyncGenerator[ChatEvent | KeepAlive]:
+        """The generation itself. The gateway stream is read in a separate task, so a stop
+        request is noticed within a quarter of a second even while the model is thinking."""
         assistant_id: UUID = gen.assistant_message.id
         progress = _Progress(started=time.perf_counter())
         stop = self._cancel.start(assistant_id)
@@ -841,6 +844,38 @@ class ChatService:
         return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
 
 
+class GenerationStream:
+    """The event stream of one generation, returned by `ChatService.stream`.
+
+    Closing it settles the generation however far it got, including a stream closed before
+    its first event was read (the client left before the response started). An async
+    generator that never started runs none of its cleanup, so this wrapper then stores the
+    reply as cancelled and releases the conversation itself.
+    """
+
+    def __init__(self, service: ChatService, gen: Generation) -> None:
+        self._service = service
+        self._gen = gen
+        self._events = service._events(gen)
+        self._started = False
+        self._closed = False
+
+    def __aiter__(self) -> "GenerationStream":
+        return self
+
+    async def __anext__(self) -> ChatEvent | KeepAlive:
+        self._started = True
+        return await self._events.__anext__()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if not self._started:
+            self._service._abandon(self._gen, _Progress(started=time.perf_counter()))
+        await self._events.aclose()
+
+
 def _organization(principal: Principal) -> UUID:
     if principal.organization_id is None:  # pragma: no cover - CurrentPrincipal guarantees it
         raise NotFound
@@ -901,6 +936,9 @@ async def _stop(pump: asyncio.Task[None]) -> None:
 async def _unless_stopped[T](call: Coroutine[Any, Any, T], stop: asyncio.Event) -> T | None:
     """Await `call`, unless `stop` is set first: then cancel it and return None. A call that
     has already finished wins over a stop."""
+    if stop.is_set():
+        call.close()  # stopped before the call began: do not start it
+        return None
     task = asyncio.ensure_future(call)
     stopped = asyncio.ensure_future(stop.wait())
     try:

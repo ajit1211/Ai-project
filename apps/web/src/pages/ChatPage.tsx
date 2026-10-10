@@ -222,7 +222,8 @@ export function ChatPage() {
 
         {body}
 
-        {archived ? (
+        {/* A reply still running in a conversation archived meanwhile keeps its Stop button. */}
+        {archived && !chat.streaming ? (
           <div className="chat-archived">
             <p>This conversation is archived. Restore it to continue.</p>
             <button

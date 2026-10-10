@@ -13,7 +13,7 @@ import type {
   StreamEventName,
   UsageSummary,
 } from "../types/ai";
-import { api } from "./client";
+import { ApiError, api } from "./client";
 import { frameObject, notAStream, postForStream } from "./stream";
 
 /** A stream that failed after it started: the server's `error` event. */
@@ -103,5 +103,12 @@ export async function* streamChat(
     if (!event) continue;
     if (event.type === "error") throw new AiStreamError(event);
     yield event;
+    if (event.type === "message.end") return;
   }
+  // Cut off (a proxy timeout, a dropped connection) before the answer was complete.
+  throw new ApiError(
+    0,
+    { code: "NETWORK_ERROR", message: "The connection closed before the answer finished." },
+    null,
+  );
 }

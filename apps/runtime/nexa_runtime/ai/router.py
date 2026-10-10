@@ -8,6 +8,7 @@ agent run in Phase 11) can skip it. Identity and organization come from the toke
 database only; the request body cannot name either.
 """
 
+from collections.abc import AsyncIterable, Mapping
 from typing import Annotated
 
 import anyio
@@ -61,17 +62,34 @@ class ModelInfo(BaseModel):
 
 
 class SSEResponse(StreamingResponse):
-    """Always closes the event iterator, even when the client disconnects or the task is
-    cancelled, so the gateway can record the call's usage."""
+    """Always closes the event stream, even when the client disconnects or the task is
+    cancelled, so the call's outcome and usage are recorded.
+
+    `source` is the stream the SSE bytes are made from; it is closed as well. That matters
+    when the bytes were never read at all (the client left before the response started):
+    closing an async generator that never started runs none of its cleanup, so closing the
+    encoder alone would never reach the source."""
+
+    def __init__(
+        self,
+        content: AsyncIterable[bytes],
+        *,
+        source: object = None,
+        media_type: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(content, media_type=media_type, headers=headers)
+        self._source = source
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
             await super().__call__(scope, receive, send)
         finally:
-            aclose = getattr(self.body_iterator, "aclose", None)
-            if aclose is not None:
-                with anyio.CancelScope(shield=True):
-                    await aclose()
+            with anyio.CancelScope(shield=True):
+                for stream in (self.body_iterator, self._source):
+                    aclose = getattr(stream, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
 
 
 @router.get("/models/")
@@ -117,4 +135,6 @@ async def chat_stream(
     # response starts, every failure is an `error` event in the stream.
     _check_feature(body)
     events = await gateway.open_stream(body, _context(principal))
-    return SSEResponse(sse_bytes(events), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS)
+    return SSEResponse(
+        sse_bytes(events), source=events, media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+    )

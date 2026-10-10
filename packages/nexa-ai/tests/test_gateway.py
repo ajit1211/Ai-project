@@ -227,6 +227,38 @@ class TestPolicy:
             await make_gateway(quota=Recording()).chat(ask("[[fail:invalid]]"), ctx)
         assert settled == [0]
 
+    async def test_a_reservation_cancelled_in_flight_is_released(
+        self, make_gateway: GatewayFactory, ctx: AIRequestContext, usage: MemoryUsageSink
+    ) -> None:
+        sent = asyncio.Event()
+        land = asyncio.Event()
+        released = asyncio.Event()
+        settled: list[tuple[object, int]] = []
+
+        class SlowQuota:
+            async def reserve(self, *_: object, **__: object) -> object:
+                sent.set()
+                await land.wait()  # Redis has applied it; the reply is still on its way
+                return "ticket-1"
+
+            async def settle(self, ticket: object, *, tokens_used: int) -> None:
+                settled.append((ticket, tokens_used))
+                released.set()
+
+        gateway = make_gateway(quota=SlowQuota())
+        call = asyncio.create_task(gateway.chat(ask("hi"), ctx))
+        await sent.wait()
+        call.cancel()  # a stop (or a shutdown) while the reservation is in flight
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        land.set()
+        async with asyncio.timeout(2):
+            await released.wait()
+        await gateway.drain()
+        assert settled == [("ticket-1", 0)]  # released, not held until it expires
+        assert usage.records[-1].status == "cancelled"
+        assert usage.records[-1].total_tokens == 0
+
     async def test_a_raised_error_names_its_usage_row(
         self, make_gateway: GatewayFactory, ctx: AIRequestContext, usage: MemoryUsageSink
     ) -> None:

@@ -9,7 +9,7 @@ import pytest
 
 from nexa_ai.context import AIRequestContext
 from nexa_ai.errors import AIInvalidRequest, AIModelUnavailable
-from nexa_ai.gateway import Gateway, KeepAlive, MemoryUsageSink
+from nexa_ai.gateway import Gateway, KeepAlive, MemoryUsageSink, UsageRecord
 from nexa_ai.providers.base import ProviderCall, ProviderEvent, StreamEnd, TextChunk, Timeouts
 from nexa_ai.providers.mock import MockProvider
 from nexa_ai.sse import PING, encode_event, sse_bytes
@@ -243,6 +243,34 @@ class TestStreaming:
         # The stream object carries the same numbers and the ledger row's id.
         assert stream.usage == reported.usage
         assert stream.call_id == record.id
+
+    async def test_a_stop_while_usage_is_saved_keeps_the_numbers(
+        self, make_gateway: GatewayFactory, ctx: AIRequestContext
+    ) -> None:
+        writing = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowSink:
+            async def record(self, usage: UsageRecord) -> None:
+                writing.set()
+                await release.wait()
+
+        gateway = make_gateway(usage=SlowSink())
+        stream = await gateway.open_stream(ask("hi"), ctx)
+
+        async def consume() -> None:
+            async for _ in stream:
+                pass
+
+        task = asyncio.create_task(consume())
+        await writing.wait()
+        task.cancel()  # the reader stops while the call's usage row is being written
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert stream.usage is not None
+        assert stream.usage.total_tokens > 0
+        release.set()
+        await gateway.drain()
 
     async def test_the_call_id_is_known_before_the_first_event(
         self, make_gateway: GatewayFactory, ctx: AIRequestContext, usage: MemoryUsageSink

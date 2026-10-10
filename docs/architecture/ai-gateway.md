@@ -249,7 +249,9 @@ is known before the first event, and its `usage` holds the call's final counts o
 is metered: after the `usage` event, or after the stream was closed early. Every caller must
 close it (`aclose()`); closing settles the call however far it got, including a stream that
 was opened (quota reserved) but never read, which an ordinary async generator could not do.
-`sse_bytes` and the chat engine always close it. An `AIError` raised by the non-streaming
+`sse_bytes`, the SSE responses (which close the stream itself as well as the encoder) and the
+chat engine always close it. The usage of a call is set on the stream before its row is
+written, so a reader that stops during the write still has the numbers. An `AIError` raised by the non-streaming
 `Gateway.chat` after the call was planned carries the same `call_id` and `usage`, so callers
 can link a failed call to its row too.
 
@@ -345,6 +347,8 @@ a structured request because of the possible repair turn) to each. Concurrent re
 therefore cannot jointly overshoot a limit; the residual overrun is the input estimator's
 error, and the estimator (three characters per token) errs high. When the call ends, however
 it ends, the reservation is replaced by the real count and the in-flight slot is released.
+That includes a call cancelled while its reservation is still in flight: the reservation may
+land after the cancellation, and is then released and the call recorded as `cancelled`.
 A breach is `AI_QUOTA_EXCEEDED` (429) with `Retry-After` set to the time until the window
 ends: the next minute, or 00:00 UTC for daily limits (two seconds for a busy in-flight slot).
 In-flight slots get their expiry when the first one is taken and are never extended by later
