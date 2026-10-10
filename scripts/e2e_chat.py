@@ -46,7 +46,9 @@ def call(method, path, body=None, token=None, expect=None, stream=False):
     summary = ""
     if isinstance(payload, dict):
         summary = payload.get("message") or (payload.get("error") or {}).get("code") or ""
-    results.append((ok, f"{'ok' if ok else '!!'} {status} {method:6} {path[:52]:52} {ms:5d} ms  {summary}"))
+    results.append(
+        (ok, f"{'ok' if ok else '!!'} {status} {method:6} {path[:52]:52} {ms:5d} ms  {summary}")
+    )
     if not ok:
         results.append((False, f"      body: {str(payload)[:300]}"))
     return status, payload
@@ -96,34 +98,57 @@ def run():
 
     # A streamed reply
     status, text = call(
-        "POST", f"{base}messages/", {"content": "Explain Django middleware", "client_message_id": "e2e-1"},
-        token=token, expect=200, stream=True,
+        "POST",
+        f"{base}messages/",
+        {"content": "Explain Django middleware", "client_message_id": "e2e-1"},
+        token=token,
+        expect=200,
+        stream=True,
     )
     stream = events(text) if status == 200 else []
     names = [n for n, _ in stream]
-    check(names[:1] == ["message_start"] and names[-1:] == ["message_complete"], f"events: {names[:2]} ... {names[-2:]}")
+    check(
+        names[:1] == ["message_start"] and names[-1:] == ["message_complete"],
+        f"events: {names[:2]} ... {names[-2:]}",
+    )
     check(names.count("text_delta") > 1, f"{names.count('text_delta')} text deltas")
     final = stream[-1][1]["message"] if stream else {}
     mock = final.get("provider") == "mock"
-    check(final.get("status") == "completed" and final.get("content"), f"reply from {final.get('provider')}/{final.get('provider_model')}")
+    check(
+        final.get("status") == "completed" and final.get("content"),
+        f"reply from {final.get('provider')}/{final.get('provider_model')}",
+    )
 
     # Stored history, title, usage link
     status, payload = call("GET", f"{base}messages/", token=token, expect=200)
     stored = payload["data"] if status == 200 else []
     check([m["role"] for m in stored] == ["user", "assistant"], "history stored in order")
-    check(stored and stored[-1]["content"] == final.get("content"), "stored reply equals streamed text")
+    check(
+        stored and stored[-1]["content"] == final.get("content"),
+        "stored reply equals streamed text",
+    )
     status, payload = call("GET", base, token=token, expect=200)
-    check(payload["data"]["title"] == "Explain Django middleware", f"title: {payload['data']['title']!r}")
+    check(
+        payload["data"]["title"] == "Explain Django middleware",
+        f"title: {payload['data']['title']!r}",
+    )
     status, payload = call("GET", "/ai/usage/?scope=me&days=1", token=token, expect=200)
     recent = payload["data"]["recent"] if status == 200 else []
-    check(recent and recent[0]["id"] == final.get("id") or any(r["id"] for r in recent), "usage row recorded")
+    check(any(r["feature"] == "chat" for r in recent), "usage row recorded as chat traffic")
 
     # Idempotent retry
     status, payload = call(
-        "POST", f"{base}messages/", {"content": "Explain Django middleware", "client_message_id": "e2e-1"},
-        token=token, expect=200, stream=True,
+        "POST",
+        f"{base}messages/",
+        {"content": "Explain Django middleware", "client_message_id": "e2e-1"},
+        token=token,
+        expect=200,
+        stream=True,
     )
-    check(isinstance(payload, dict) and payload["data"]["assistant_message"]["id"] == final.get("id"), "same client_message_id replays the stored reply")
+    check(
+        isinstance(payload, dict) and payload["data"]["assistant_message"]["id"] == final.get("id"),
+        "same client_message_id replays the stored reply",
+    )
 
     # Regenerate
     status, text = call("POST", f"{base}regenerate/", token=token, expect=200, stream=True)
@@ -132,9 +157,19 @@ def run():
 
     # A failure keeps the question and fails the reply (mock provider only)
     if mock:
-        status, text = call("POST", f"{base}messages/", {"content": "[[fail:timeout]] hello"}, token=token, expect=200, stream=True)
+        status, text = call(
+            "POST",
+            f"{base}messages/",
+            {"content": "[[fail:timeout]] hello"},
+            token=token,
+            expect=200,
+            stream=True,
+        )
         failed = events(text) if status == 200 else []
-        check(failed and failed[-1][0] == "error" and failed[-1][1]["code"] == "AI_TIMEOUT", "provider timeout ends with an error event")
+        check(
+            failed and failed[-1][0] == "error" and failed[-1][1]["code"] == "AI_TIMEOUT",
+            "provider timeout ends with an error event",
+        )
         status, text = call("POST", f"{base}regenerate/", token=token, stream=True)
 
     # Validation and conflicts

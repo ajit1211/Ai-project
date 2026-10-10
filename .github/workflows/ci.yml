@@ -50,7 +50,7 @@ jobs:
           PGPASSWORD: postgres
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run mypy apps/core apps/runtime packages/nexa-common
+      - run: uv run mypy apps/core apps/runtime packages/nexa-common packages/nexa-ai
       - name: Migrations match the models
         run: uv run python apps/core/manage.py makemigrations --check --dry-run
       - run: uv run pytest
