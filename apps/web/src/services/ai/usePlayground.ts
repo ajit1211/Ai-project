@@ -10,6 +10,7 @@ import { AiStreamError, chat, listModels, streamChat } from "../../api/ai";
 import { ApiError } from "../../api/client";
 import { describeError } from "../../components/forms";
 import type { ChatMessage, ChatRequest, FinishReason, ModelInfo, Usage } from "../../types/ai";
+import { retryHintFor } from "./errors";
 
 export type PlaygroundStatus = "idle" | "streaming" | "done" | "error";
 
@@ -50,17 +51,6 @@ const emptyResult: PlaygroundResult = {
   finishReason: null,
   cancelled: false,
 };
-
-const RETRY_LATER_CODES = new Set(["AI_RATE_LIMIT", "AI_TIMEOUT", "AI_PROVIDER_UNAVAILABLE"]);
-
-function retryHintFor(code: string, retryAfter: number | null): string | null {
-  if (retryAfter !== null && (code === "AI_QUOTA_EXCEEDED" || RETRY_LATER_CODES.has(code))) {
-    return `Try again in ${String(retryAfter)} s.`;
-  }
-  if (code === "AI_QUOTA_EXCEEDED") return "Your quota resets later; try again then.";
-  if (RETRY_LATER_CODES.has(code)) return "Try again in a moment.";
-  return null;
-}
 
 export function toPlaygroundError(err: unknown): PlaygroundError {
   if (err instanceof ApiError) {

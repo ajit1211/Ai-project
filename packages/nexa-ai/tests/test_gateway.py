@@ -227,6 +227,24 @@ class TestPolicy:
             await make_gateway(quota=Recording()).chat(ask("[[fail:invalid]]"), ctx)
         assert settled == [0]
 
+    async def test_a_raised_error_names_its_usage_row(
+        self, make_gateway: GatewayFactory, ctx: AIRequestContext, usage: MemoryUsageSink
+    ) -> None:
+        with pytest.raises(AITimeout) as raised:
+            await make_gateway().chat(ask("[[fail:timeout]]"), ctx)
+        record = usage.records[-1]
+        assert raised.value.call_id == record.id
+        assert raised.value.usage is not None
+        assert raised.value.usage.total_tokens == record.total_tokens
+
+    async def test_errors_before_the_call_is_planned_name_no_row(
+        self, make_gateway: GatewayFactory, ctx: AIRequestContext, usage: MemoryUsageSink
+    ) -> None:
+        with pytest.raises(AIModelUnavailable) as raised:
+            await make_gateway().chat(ask("hi", model="nexa-nope"), ctx)
+        assert raised.value.call_id is None
+        assert usage.records == []
+
     @pytest.mark.parametrize(
         "message",
         [

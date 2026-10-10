@@ -32,6 +32,8 @@ class ErrorCode(StrEnum):
     CONFLICT = "CONFLICT"
     PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
     GENERATION_IN_PROGRESS = "GENERATION_IN_PROGRESS"
+    # Stored on a reply whose generation died with its process (never an HTTP error).
+    GENERATION_INTERRUPTED = "GENERATION_INTERRUPTED"
     RATE_LIMITED = "RATE_LIMITED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
@@ -67,6 +69,7 @@ DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.CONFLICT: "The request conflicts with the current state of the resource.",
     ErrorCode.PAYLOAD_TOO_LARGE: "The request is too large.",
     ErrorCode.GENERATION_IN_PROGRESS: "A reply is already being generated in this conversation.",
+    ErrorCode.GENERATION_INTERRUPTED: "The reply was interrupted before it finished. Please try again.",
     ErrorCode.RATE_LIMITED: "Too many requests. Please try again later.",
     ErrorCode.INTERNAL_ERROR: "Something went wrong on our side.",
     ErrorCode.SERVICE_UNAVAILABLE: "The service is temporarily unavailable.",

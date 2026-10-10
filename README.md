@@ -4,22 +4,31 @@ AI Intelligence & Agent Platform. The architecture and the 20-phase plan are in
 [docs/architecture/NEXA-architecture.md](docs/architecture/NEXA-architecture.md); decisions
 made since are in [docs/adr/](docs/adr/).
 
-**Current phase: 04, the AI Gateway.** Every model call goes through one framework-free
-gateway (`packages/nexa-ai`): logical model names resolved by a database catalog, Anthropic
-and OpenAI adapters plus a deterministic mock, retries and fallback under one deadline,
-SSE streaming, validated structured output, an append-only usage ledger with per-call cost,
-and reserve-then-settle quotas. The React playground at `/playground` exercises all of it.
-Details: [docs/architecture/ai-gateway.md](docs/architecture/ai-gateway.md); endpoints in
-[docs/api/ai.md](docs/api/ai.md); decisions in [ADR-026 to 032](docs/adr/README.md). Phase 03
-(identity and access) is described in [authentication.md](docs/architecture/authentication.md),
-[authorization.md](docs/architecture/authorization.md), [multi-tenancy.md](docs/architecture/multi-tenancy.md)
-and [security.md](docs/architecture/security.md).
+**Current phase: 05, the chat engine.** Signed-in users hold private conversations at
+`/chat`: pick a model, send messages, watch replies stream in, stop or regenerate a reply,
+search, rename, archive and delete conversations. Replies come from the Phase 04 AI Gateway
+with a bounded window of recent messages as context; every message, its status and its
+token usage are stored. Details: [docs/architecture/chat-engine.md](docs/architecture/chat-engine.md);
+endpoints and the `nexa.chat.v1` stream in [docs/api/conversations.md](docs/api/conversations.md);
+decision in [ADR-033](docs/adr/033-conversations-in-runtime.md).
+
+Earlier phases: the AI Gateway (Phase 04, [ai-gateway.md](docs/architecture/ai-gateway.md),
+[docs/api/ai.md](docs/api/ai.md), ADR-026 to 032; the developer playground is at `/playground`)
+and identity and access (Phase 03, [authentication.md](docs/architecture/authentication.md),
+[authorization.md](docs/architecture/authorization.md), [multi-tenancy.md](docs/architecture/multi-tenancy.md),
+[security.md](docs/architecture/security.md)).
+
+```text
+React (/chat) ──► edge (Vite proxy locally) ──► FastAPI /api/v1/conversations, /api/v1/ai
+                                           └──► Django   /api/v1/auth, /users, /organizations, /ai/usage
+FastAPI ──► AI Gateway ──► Anthropic | OpenAI | mock          (one PostgreSQL; Django owns the schema)
+```
 
 | Part | Where | What it is |
 | --- | --- | --- |
-| React | http://localhost:5173 | `apps/web`: sign-in, settings, organization switcher, the AI playground; `/status` shows the stack |
-| Django | http://localhost:8000 | `apps/core`: the control plane (identity, organizations, roles, audit, AI catalog and usage ledger, admin) |
-| FastAPI | http://localhost:8001 | `apps/runtime`: the AI plane (`/api/v1/ai/*`: models, chat, streaming) |
+| React | http://localhost:5173 | `apps/web`: chat workspace, sign-in, settings, organization switcher, the AI playground; `/status` shows the stack |
+| Django | http://localhost:8000 | `apps/core`: the control plane (identity, organizations, roles, audit, AI catalog, usage ledger, the schema of every table, admin) |
+| FastAPI | http://localhost:8001 | `apps/runtime`: the AI plane (`/api/v1/conversations/*` and `/api/v1/ai/*`) |
 | PostgreSQL | localhost:5433 (project-local) | One database, two roles: `nexa_core` and `nexa_runtime` |
 | Redis | localhost:6379 | Rate limits, AI quotas, Celery broker and pub/sub (db 0), cache (db 1) |
 | Celery | worker process | Emails and background jobs on `core.default` and `core.email` |
@@ -70,6 +79,7 @@ as down. Without AI provider keys the mock provider answers; add `AI_ANTHROPIC_A
 | `pnpm migrate` | Applies database migrations |
 | `uv run python scripts/e2e_auth.py` | Walks the whole sign-up and sign-in flow against the running stack |
 | `uv run python scripts/e2e_ai.py` | Walks the AI gateway (models, chat, structured output, streaming, errors, usage) against the running stack |
+| `uv run python scripts/e2e_chat.py` | Walks the chat engine (conversation, streamed reply, history, retries, failures, isolation, deletion) against the running stack |
 | `uv run python apps/core/manage.py createsuperuser` | Creates an admin login for http://localhost:8000/admin/ |
 
 Emails in development are written to `.local/mail/`; open the newest file for the link.

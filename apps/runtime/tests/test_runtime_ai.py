@@ -265,8 +265,9 @@ class TestStream:
         )
         assert response.status_code == 200
         events = _events(response.text)
-        assert [n for n, _ in events] == ["message.start", "message.delta", "error"]
+        assert [n for n, _ in events] == ["message.start", "message.delta", "usage", "error"]
         assert events[-1][1]["code"] == "AI_PROVIDER_UNAVAILABLE"
+        assert events[-2][1]["output_tokens"] > 0  # what the failed call used
         assert AIUsageEvent.objects.get().status == "error"
 
     def test_errors_before_the_stream_are_json(self, runtime: TestClient, owner: User) -> None:

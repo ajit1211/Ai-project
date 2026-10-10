@@ -4,7 +4,7 @@ import pytest
 
 from nexa_ai.errors import AIContextTooLarge
 from nexa_ai.types import Role
-from nexa_runtime.chat.context import ContextPolicy, HistoryItem, build_context
+from nexa_runtime.chat.context import BuiltContext, ContextPolicy, HistoryItem, build_context
 from nexa_runtime.chat.prompts import DEFAULT_PROMPT_VERSION, PROMPTS
 
 
@@ -60,10 +60,50 @@ def test_unknown_prompt_version_falls_back_to_the_default() -> None:
 
 def test_message_count_is_bounded_and_keeps_the_newest() -> None:
     history = turns(11)
-    texts = build(history, max_messages=4)
-    assert len(texts) == 1 + 4
+    texts = build(history, max_messages=5)
+    assert len(texts) == 1 + 5
     assert texts[-1] == history[-1].content  # the message being answered
-    assert texts[1] == history[-4].content  # oldest kept
+    assert texts[1] == history[-5].content  # oldest kept
+
+
+def test_the_window_never_opens_with_an_orphaned_answer() -> None:
+    # Four messages would open with the answer to a question that did not fit. Providers
+    # reject a conversation that starts with the model, so that answer goes too.
+    history = turns(11)
+    built = build_context(
+        history,
+        prompt_version=DEFAULT_PROMPT_VERSION,
+        context_window=200_000,
+        max_output_tokens=2_000,
+        policy=ContextPolicy(max_messages=4),
+    )
+    assert [m.role for m in built.messages] == [Role.SYSTEM, Role.USER, Role.ASSISTANT, Role.USER]
+    assert built.messages[1].text == history[-3].content
+    assert (built.included, built.dropped) == (3, len(history) - 3)
+
+
+def test_a_budget_cut_never_opens_with_an_answer() -> None:
+    history = [
+        HistoryItem(role="user", content="x" * 9_000, status="completed"),  # ~3,000 tokens
+        HistoryItem(role="assistant", content="short answer", status="completed"),
+        HistoryItem(role="user", content="follow-up", status="completed"),
+    ]
+
+    def context(items: list[HistoryItem]) -> BuiltContext:
+        return build_context(
+            items,
+            prompt_version=DEFAULT_PROMPT_VERSION,
+            context_window=200_000,
+            max_output_tokens=2_000,
+            policy=ContextPolicy(max_tokens=2_000),
+        )
+
+    built = context(history)
+    assert [m.role for m in built.messages] == [Role.SYSTEM, Role.USER]
+    assert built.messages[-1].text == "follow-up"
+    assert built.dropped == 2
+    # The dropped answer no longer counts towards the estimate.
+    assert built.estimated_tokens == context(history[-1:]).estimated_tokens
 
 
 def test_token_budget_drops_the_oldest_first() -> None:

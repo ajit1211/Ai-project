@@ -7,7 +7,9 @@ for logs and never shown to a client.
 """
 
 from typing import ClassVar
+from uuid import UUID
 
+from nexa_ai.types import Usage
 from nexa_common.errors import ErrorCode, NexaError
 
 _PROVIDER_MESSAGE_LIMIT = 300
@@ -43,6 +45,10 @@ class AIError(NexaError):
         self.provider_message = (provider_message or "")[:_PROVIDER_MESSAGE_LIMIT]
         self.provider_request_id = provider_request_id
         self.retry_after_seconds = retry_after_seconds
+        # Set by `Gateway.chat` when it raises the error for a call it metered: the usage
+        # row's id and what the call consumed, so a caller can link its own record to them.
+        self.call_id: UUID | None = None
+        self.usage: Usage | None = None
 
     def log_fields(self) -> dict[str, object]:
         """What the log line may carry: codes, statuses and a truncated provider message."""

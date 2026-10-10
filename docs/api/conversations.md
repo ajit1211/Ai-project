@@ -34,6 +34,7 @@ Besides the codes in [authentication.md](authentication.md) and the `AI_*` codes
 | AI_MODEL_UNAVAILABLE | 422 | The conversation's model is not available to this organization |
 | RATE_LIMITED | 429 | Too many new conversations in a minute; see `Retry-After` |
 | AI_EMPTY_RESPONSE | — | (stream `error` event only) The model finished without any text; retryable |
+| GENERATION_INTERRUPTED | — | (stored `error_code` only) The process generating the reply died; regenerate to retry |
 
 ## Objects
 
@@ -85,8 +86,12 @@ Message:
 
 `role` is `user` or `assistant`. `status` is `completed` for user messages and one of
 `pending`, `streaming`, `completed`, `failed`, `cancelled` for assistant messages. A failed or
-cancelled assistant message keeps whatever text had arrived; `error_code` names the failure.
-Generation fields (`provider` onwards) are empty or zero on user messages.
+cancelled assistant message keeps whatever text had arrived; `error_code` names the failure,
+and its token counts and cost are what the stopped or failed call used. Generation fields
+(`provider` onwards) are empty or zero on user messages.
+
+Text fields (`content`, `title`, the `q` search) must not contain the NUL character
+(U+0000): 422 `VALIDATION_FAILED`. NUL in a model's answer is dropped.
 
 ## Conversations
 
@@ -170,8 +175,14 @@ Terminal events, exactly one per stream: `message_complete` (status `completed`)
 ```text
 event: error
 data: {"message_id":"0199...","code":"AI_TIMEOUT","message":"The AI provider took too long to answer.",
-       "retryable":true,"retry_after":null,"request_id":"req_...","message":{...Message, "status":"failed"}}
+       "retryable":true,"retry_after":null,"request_id":"req_...",
+       "assistant_message":{...Message, "status":"failed"}}
 ```
+
+`usage` arrives once the AI Gateway has metered the call: before `message_complete`, and
+also before an `error` caused by the model call (with what the failed call used). An `error`
+for a refusal before the call (an exhausted quota, for example) has no `usage` before it. A
+client should treat `usage` as information and wait for the terminal event.
 
 Every event carries an incrementing `id`; `: ping` comment lines keep the connection alive
 while the model thinks. Events after `message_start` always name the assistant `message_id`,
@@ -186,7 +197,14 @@ generated before noticing are still billed.
 **Non-streaming** (`Accept: application/json`, the default): the response waits for the
 reply and returns `201 {"data": {"user_message": Message, "assistant_message": Message}}`. On
 a generation failure the assistant message is stored as `failed` and the response is the
-AI error (its status and code), so the client should reload the messages.
+AI error (its status and code), so the client should reload the messages. If the reply is
+stopped with `POST /cancel/`, the response is the same `201` with the assistant message
+`cancelled`.
+
+Retrying with the same `client_message_id` returns `200` with the stored exchange as JSON,
+even when the request asked for a stream. While that reply is still being generated the
+retry gets 409 `GENERATION_IN_PROGRESS`; if the process generating it died, the reply comes
+back `failed` with `GENERATION_INTERRUPTED`.
 
 ### POST /conversations/{id}/regenerate/
 
@@ -201,9 +219,11 @@ there is nothing to regenerate.
 
 Stops the reply currently being generated, from any client. Returns
 `{"cancelled": true, "message_id": "..."}` or `{"cancelled": false, "message_id": null}` when
-nothing is running. The generating request ends with a `message_cancelled` event. Because
-providers are stopped by closing their stream, a few more tokens may be billed after the
-cancel; they are not shown.
+nothing is running. A streaming request ends with a `message_cancelled` event; a
+non-streaming one returns its reply as `cancelled`. A stop that arrives after the model has
+finished (after the `usage` event) changes nothing: the reply completes. Because providers are
+stopped by closing their stream, a few more tokens may be billed after the cancel; they are
+not shown.
 
 ## Context
 
@@ -211,4 +231,5 @@ The reply is generated from NEXA's system instructions plus the most recent mess
 same conversation: at most 40 messages and a token budget that fits the model's context
 window (estimated at three characters per token, with the output budget reserved). Older
 messages are left out, not summarized; summarization and memory arrive in Phase 06. Failed
-assistant messages are skipped; cancelled ones contribute the text they have.
+assistant messages are skipped; cancelled ones contribute the text they have. The window
+always starts with a user message.

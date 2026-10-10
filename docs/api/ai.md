@@ -153,8 +153,9 @@ Rules:
 - `: ping` comment lines keep the connection alive while the provider is thinking; ignore
   them.
 - Any failure after the response started, before or after the first text, is one
-  `event: error` with `{"code", "message", "retryable", "request_id"}` and then the stream
-  ends. The codes are the same as for JSON errors.
+  `event: usage` with what the failed call consumed, then one `event: error` with
+  `{"code", "message", "retryable", "request_id"}`, and then the stream ends. The codes are
+  the same as for JSON errors.
 - Cancel by aborting the request. The call is recorded as cancelled with the tokens seen so
   far.
 - Read the stream with `fetch` and an SSE parser; `EventSource` cannot send the

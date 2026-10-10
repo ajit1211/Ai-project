@@ -97,7 +97,7 @@ class TestStreaming:
             await make_gateway().open_stream(ask("[[fail:stream_after:2]] hi"), ctx)
         )
         names = kinds(events)
-        assert names == ["message.start", "message.delta", "message.delta", "error"]
+        assert names == ["message.start", "message.delta", "message.delta", "usage", "error"]
         error = events[-1]
         assert isinstance(error, StreamError)
         assert error.code == "AI_PROVIDER_UNAVAILABLE"
@@ -114,8 +114,8 @@ class TestStreaming:
         self, make_gateway: GatewayFactory, ctx: AIRequestContext
     ) -> None:
         events = await collect(await make_gateway().open_stream(ask("[[fail:content]]"), ctx))
-        assert kinds(events) == ["error"]
-        error = events[0]
+        assert kinds(events) == ["usage", "error"]
+        error = events[-1]
         assert isinstance(error, StreamError)
         assert error.code == "AI_CONTENT_REJECTED"
         assert error.retryable is False
@@ -124,9 +124,9 @@ class TestStreaming:
         self, make_gateway: GatewayFactory, ctx: AIRequestContext
     ) -> None:
         events = await collect(await make_gateway().open_stream(ask("[[fail:timeout]]"), ctx))
-        assert kinds(events) == ["error"]
-        assert isinstance(events[0], StreamError)
-        assert events[0].code == "AI_TIMEOUT"
+        assert kinds(events) == ["usage", "error"]
+        assert isinstance(events[-1], StreamError)
+        assert events[-1].code == "AI_TIMEOUT"
 
     async def test_errors_before_any_provider_call_are_raised(
         self, make_gateway: GatewayFactory, ctx: AIRequestContext
@@ -175,7 +175,7 @@ class TestStreaming:
 
         gateway = make_gateway(providers={"mock": Freezing()}, timeouts=Timeouts(idle=0.1))
         events = await collect(await gateway.open_stream(ask("hi"), ctx))
-        assert kinds(events) == ["message.start", "message.delta", "error"]
+        assert kinds(events) == ["message.start", "message.delta", "usage", "error"]
         assert isinstance(events[-1], StreamError)
         assert events[-1].code == "AI_TIMEOUT"
 
@@ -206,7 +206,7 @@ class TestStreaming:
             seen.append(event)
             if isinstance(event, MessageDelta):
                 break  # the client goes away after the first delta
-        await stream.aclose()  # type: ignore[attr-defined]
+        await stream.aclose()
         await gateway.drain()
         record = usage.records[-1]
         assert record.status == "cancelled"
@@ -229,6 +229,61 @@ class TestStreaming:
             await task
         await gateway.drain()
         assert usage.records[-1].status == "cancelled"
+
+    async def test_an_error_is_preceded_by_what_the_call_used(
+        self, make_gateway: GatewayFactory, ctx: AIRequestContext, usage: MemoryUsageSink
+    ) -> None:
+        stream = await make_gateway().open_stream(ask("[[fail:stream_after:2]] hi"), ctx)
+        events = await collect(stream)
+        reported = events[-2]
+        assert isinstance(reported, UsageEvent)
+        record = usage.records[-1]
+        assert record.status == "error"
+        assert reported.usage.output_tokens == record.output_tokens > 0
+        # The stream object carries the same numbers and the ledger row's id.
+        assert stream.usage == reported.usage
+        assert stream.call_id == record.id
+
+    async def test_the_call_id_is_known_before_the_first_event(
+        self, make_gateway: GatewayFactory, ctx: AIRequestContext, usage: MemoryUsageSink
+    ) -> None:
+        stream = await make_gateway().open_stream(ask("hi"), ctx)
+        call_id = stream.call_id
+        before = stream.usage  # nothing is metered yet
+        assert before is None
+        events = await collect(stream)
+        start = events[0]
+        assert isinstance(start, MessageStart)
+        assert start.id == str(call_id)
+        assert usage.records[-1].id == call_id
+        assert stream.usage is not None
+        assert stream.usage.total_tokens == usage.records[-1].total_tokens
+
+    async def test_closing_an_unread_stream_releases_its_reservation(
+        self, make_gateway: GatewayFactory, ctx: AIRequestContext, usage: MemoryUsageSink
+    ) -> None:
+        settled: list[tuple[object, int]] = []
+
+        class Recording:
+            async def reserve(self, *_: object, **__: object) -> object:
+                return "ticket-1"
+
+            async def settle(self, ticket: object, *, tokens_used: int) -> None:
+                settled.append((ticket, tokens_used))
+
+        gateway = make_gateway(quota=Recording())
+        stream = await gateway.open_stream(ask("hi"), ctx)
+        await stream.aclose()  # before reading a single event
+        await stream.aclose()  # closing twice is harmless
+        await gateway.drain()
+        assert settled == [("ticket-1", 0)]
+        record = usage.records[-1]
+        assert record.id == stream.call_id
+        assert record.status == "cancelled"
+        assert record.total_tokens == 0
+        assert record.attempts == 0
+        assert stream.usage is not None
+        assert stream.usage.total_tokens == 0
 
 
 class TestSSE:

@@ -3,7 +3,7 @@
  * module that calls `/ai/...`; pages go through the playground hook.
  */
 
-import { parseSSE, type SseFrame } from "../services/ai/sse";
+import type { SseFrame } from "../services/ai/sse";
 import type {
   ChatRequest,
   ChatResponse,
@@ -13,7 +13,8 @@ import type {
   StreamEventName,
   UsageSummary,
 } from "../types/ai";
-import { ApiError, api, authorizedFetch, parseEnvelope } from "./client";
+import { api } from "./client";
+import { frameObject, notAStream, postForStream } from "./stream";
 
 /** A stream that failed after it started: the server's `error` event. */
 export class AiStreamError extends Error {
@@ -66,23 +67,14 @@ function isStreamEventName(name: string): name is StreamEventName {
   return STREAM_EVENT_NAMES.has(name);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
 /**
  * Type one SSE frame by its event name. Frames with an unknown name or a body that is not
  * a JSON object are dropped (null), so a newer server never breaks an older client.
  */
 export function parseStreamEvent(frame: SseFrame): StreamEvent | null {
   if (!isStreamEventName(frame.event)) return null;
-  let payload: unknown;
-  try {
-    payload = JSON.parse(frame.data);
-  } catch {
-    return null;
-  }
-  if (!isRecord(payload)) return null;
+  const payload = frameObject(frame);
+  if (!payload) return null;
   // The server owns these shapes (architecture doc, "Streaming"); the client trusts them.
   return { ...payload, type: frame.event } as unknown as StreamEvent;
 }
@@ -98,29 +90,15 @@ export async function* streamChat(
   request: ChatRequest,
   control: RequestControl = {},
 ): AsyncGenerator<StreamEvent, void, undefined> {
-  const response = await authorizedFetch("/ai/chat/stream/", {
-    method: "POST",
-    headers: {
-      Accept: "text/event-stream, application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(request),
+  // Refused before the stream began: postForStream throws the envelope's ApiError.
+  const reply = await postForStream<unknown>("/ai/chat/stream/", request, {
+    accept: "text/event-stream, application/json",
     signal: control.signal,
   });
+  // A success envelope instead of a stream means the server misbehaved.
+  if (reply.kind === "json") throw notAStream(reply.status, reply.requestId);
 
-  const contentType = response.headers.get("Content-Type") ?? "";
-  if (!contentType.startsWith("text/event-stream") || !response.body) {
-    // Refused before the stream began: a normal JSON envelope. parseEnvelope throws the
-    // ApiError; a success envelope here means the server misbehaved.
-    await parseEnvelope(response);
-    throw new ApiError(
-      response.status,
-      { code: "NETWORK_ERROR", message: "Expected an event stream." },
-      response.headers.get("X-Request-ID"),
-    );
-  }
-
-  for await (const frame of parseSSE(response.body)) {
+  for await (const frame of reply.frames) {
     const event = parseStreamEvent(frame);
     if (!event) continue;
     if (event.type === "error") throw new AiStreamError(event);

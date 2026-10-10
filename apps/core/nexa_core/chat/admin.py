@@ -1,5 +1,6 @@
 """Read-only views of conversations for platform staff. Runtime is the only writer, and
-message content is private: the admin shows metadata, not text."""
+message content is private: the admin shows metadata, not text. That includes titles, which
+are the first line of the first message unless the owner renamed the conversation."""
 
 from typing import Any
 
@@ -13,7 +14,6 @@ from nexa_core.chat.models import Conversation, Message
 class ConversationAdmin(admin.ModelAdmin[Conversation]):
     list_display = (
         "id",
-        "title",
         "organization",
         "owner",
         "model",
@@ -22,8 +22,9 @@ class ConversationAdmin(admin.ModelAdmin[Conversation]):
         "last_message_at",
     )
     list_filter = ("status", "model")
-    search_fields = ("id", "title", "owner__email")
-    readonly_fields = tuple(f.name for f in Conversation._meta.fields)
+    search_fields = ("id", "owner__email")
+    exclude = ("title",)
+    readonly_fields = tuple(f.name for f in Conversation._meta.fields if f.name != "title")
     date_hierarchy = "created_at"
 
     def has_add_permission(self, request: HttpRequest) -> bool:

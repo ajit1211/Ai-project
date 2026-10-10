@@ -10,7 +10,7 @@ a second send while the first runs) drive the service directly inside the app's 
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import timedelta
 from typing import Any
 from uuid import UUID
@@ -21,8 +21,11 @@ import pytest
 from django.db import connection
 from django.utils import timezone
 from fastapi.testclient import TestClient
+from sqlalchemy import event as sa_event
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
-from nexa_ai.providers.base import ProviderCall, ProviderEvent, StreamEnd
+from nexa_ai.providers.base import ProviderCall, ProviderEvent, StreamEnd, TextChunk
 from nexa_ai.providers.mock import MockProvider
 from nexa_ai.types import FinishReason
 from nexa_common.access import Principal
@@ -37,8 +40,8 @@ from nexa_core.testing import add_member
 from nexa_runtime.ai.quota import RedisQuota
 from nexa_runtime.auth.jwks import JWKSClient
 from nexa_runtime.chat.cancellation import CancelRegistry
-from nexa_runtime.chat.events import MessageStart, TextDelta
-from nexa_runtime.chat.schemas import SendMessage
+from nexa_runtime.chat.events import MessageStart, TextDelta, UsageReport
+from nexa_runtime.chat.schemas import Exchange, SendMessage
 from nexa_runtime.chat.service import ChatService, Generation, GenerationInProgress
 from nexa_runtime.config import RuntimeSettings
 from nexa_runtime.main import create_app
@@ -268,6 +271,42 @@ class TestConversations:
             assert response.status_code == 422
             assert response.json()["error"]["code"] == "AI_MODEL_UNAVAILABLE"
 
+    def test_text_with_nul_is_refused(self, runtime: TestClient, owner: User) -> None:
+        # PostgreSQL text cannot hold NUL: a 422 here, not a database error (whose message
+        # would carry the text) and a 500.
+        headers = auth(owner)
+        conversation = new_conversation(runtime, headers)
+        base = f"/api/v1/conversations/{conversation['id']}/"
+        attempts = [
+            runtime.post("/api/v1/conversations/", json={"title": "a\x00b"}, headers=headers),
+            runtime.patch(base, json={"title": "a\x00b"}, headers=headers),
+            runtime.post(
+                f"{base}messages/", json={"content": "a\x00b"}, headers={**headers, **STREAM}
+            ),
+            runtime.get("/api/v1/conversations/", params={"q": "a\x00b"}, headers=headers),
+        ]
+        assert [r.status_code for r in attempts] == [422] * len(attempts)
+        assert {r.json()["error"]["code"] for r in attempts} == {"VALIDATION_FAILED"}
+        assert not Message.objects.exists()
+
+    def test_database_errors_do_not_carry_message_text(self, runtime: TestClient) -> None:
+        engine = runtime.app.state.engine  # type: ignore[attr-defined]
+
+        async def scenario() -> str:
+            try:
+                async with engine.connect() as conn:
+                    await conn.execute(
+                        text("SELECT 1 / (length(CAST(:words AS text)) * 0)"),
+                        {"words": "private words"},
+                    )
+            except DBAPIError as exc:
+                return str(exc)
+            return ""
+
+        message = runtime.portal.call(scenario)  # type: ignore[union-attr]
+        assert "division by zero" in message
+        assert "private words" not in message
+
     def test_creation_is_rate_limited(self, make_runtime: Runtime, owner: User) -> None:
         client = make_runtime(chat_conversations_per_minute=2)
         headers = auth(owner)
@@ -447,7 +486,8 @@ class TestGeneration:
         headers = auth(owner)
         conversation = new_conversation(runtime, headers)
         stream = say(runtime, headers, conversation["id"], f"{phrase} hello")
-        assert [n for n, _ in stream] == ["message_start", "error"]
+        # What the failed call used comes first, then the error.
+        assert [n for n, _ in stream] == ["message_start", "usage", "error"]
         error = stream[-1][1]
         assert error["code"] == code
         assert error["assistant_message"]["status"] == "failed"
@@ -456,6 +496,7 @@ class TestGeneration:
         assert user.content == f"{phrase} hello"
         reply = Message.objects.get(role="assistant")
         assert (reply.status, reply.error_code) == ("failed", code)
+        assert reply.usage_event_id == AIUsageEvent.objects.get().id
         assert Conversation.objects.get().active_generation_id is None
 
     def test_failure_mid_stream_keeps_the_partial_text(
@@ -465,12 +506,109 @@ class TestGeneration:
         conversation = new_conversation(runtime, headers)
         stream = say(runtime, headers, conversation["id"], "[[fail:stream_after:2]] hello")
         names = [n for n, _ in stream]
-        assert names == ["message_start", "text_delta", "text_delta", "error"]
+        assert names == ["message_start", "text_delta", "text_delta", "usage", "error"]
         partial = "".join(d["text"] for n, d in stream if n == "text_delta")
         reply = Message.objects.get(role="assistant")
         assert reply.status == "failed"  # never "completed" with half an answer
         assert reply.content == partial
         assert reply.error_code == "AI_PROVIDER_UNAVAILABLE"
+        # The tokens the failed call used are on the reply and linked to the ledger.
+        usage = AIUsageEvent.objects.get()
+        assert reply.output_tokens == usage.output_tokens > 0
+        assert reply.usage_event_id == usage.id
+        assert stream[-1][1]["assistant_message"]["output_tokens"] == reply.output_tokens
+
+    def test_a_failed_non_streaming_reply_is_linked_to_its_usage(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        headers = auth(owner)
+        conversation = new_conversation(runtime, headers)
+        response = runtime.post(
+            f"/api/v1/conversations/{conversation['id']}/messages/",
+            json={"content": "[[fail:timeout]] hello"},
+            headers=headers,
+        )
+        assert response.json()["error"]["code"] == "AI_TIMEOUT"
+        reply = Message.objects.get(role="assistant")
+        assert (reply.status, reply.error_code) == ("failed", "AI_TIMEOUT")
+        assert reply.usage_event_id == AIUsageEvent.objects.get().id
+
+    def test_nul_from_the_model_is_dropped(self, make_runtime: Runtime, owner: User) -> None:
+        class Nul(MockProvider):
+            async def stream(self, call: ProviderCall) -> AsyncIterator[ProviderEvent]:
+                yield TextChunk("Hel\x00lo")
+                yield TextChunk("\x00")
+                yield StreamEnd(finish_reason=FinishReason.STOP)
+
+        client = make_runtime(Nul())
+        headers = auth(owner)
+        conversation = new_conversation(client, headers)
+        stream = say(client, headers, conversation["id"], "hi")
+        assert stream[-1][0] == "message_complete"
+        assert [d["text"] for n, d in stream if n == "text_delta"] == ["Hello"]
+        assert Message.objects.get(role="assistant").content == "Hello"
+
+    def test_an_unexpected_error_fails_the_reply_and_unlocks(
+        self, runtime: TestClient, owner: User, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def broken(gen: Generation) -> None:
+            raise RuntimeError("a bug")
+
+        monkeypatch.setattr(runtime.app.state.chat, "_prepare", broken)  # type: ignore[attr-defined]
+        headers = auth(owner)
+        conversation = new_conversation(runtime, headers)
+        url = f"/api/v1/conversations/{conversation['id']}/messages/"
+        response = runtime.post(url, json={"content": "hello"}, headers=headers)
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "AI_INTERNAL_ERROR"
+        reply = Message.objects.get(role="assistant")
+        assert (reply.status, reply.error_code) == ("failed", "AI_INTERNAL_ERROR")
+        assert Conversation.objects.get().active_generation_id is None
+        stream = say(runtime, headers, conversation["id"], "again")  # streaming: the same
+        assert [n for n, _ in stream] == ["message_start", "error"]
+        assert stream[-1][1]["code"] == "AI_INTERNAL_ERROR"
+        assert Conversation.objects.get().active_generation_id is None
+
+    def test_a_failed_final_write_still_ends_the_stream_and_unlocks(
+        self, runtime: TestClient, owner: User, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def broken(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("the database went away")
+
+        monkeypatch.setattr(runtime.app.state.chat, "_finalize", broken)  # type: ignore[attr-defined]
+        headers = auth(owner)
+        conversation = new_conversation(runtime, headers)
+        stream = say(runtime, headers, conversation["id"], "hello")
+        assert stream[-1][0] == "error"  # a terminal event, not a stream that just stops
+        assert stream[-1][1]["code"] == "AI_INTERNAL_ERROR"
+        assert stream[-1][1]["assistant_message"]["status"] == "failed"
+        reply = Message.objects.get(role="assistant")
+        assert (reply.status, reply.error_code) == ("failed", "AI_INTERNAL_ERROR")
+        assert Conversation.objects.get().active_generation_id is None
+        monkeypatch.undo()
+        assert say(runtime, headers, conversation["id"], "again")[-1][0] == "message_complete"
+
+    def test_finishing_a_reply_locks_the_conversation_first(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        # Sending and regenerating lock the conversation and then write messages; finishing a
+        # reply takes the same order, so two of them cannot deadlock.
+        statements: list[str] = []
+        engine = runtime.app.state.engine.sync_engine  # type: ignore[attr-defined]
+
+        def record(*args: Any) -> None:
+            statements.append(" ".join(args[2].split()[:2]))
+
+        sa_event.listen(engine, "before_cursor_execute", record)
+        try:
+            headers = auth(owner)
+            conversation = new_conversation(runtime, headers)
+            stream = say(runtime, headers, conversation["id"], "hello")
+        finally:
+            sa_event.remove(engine, "before_cursor_execute", record)
+        assert stream[-1][0] == "message_complete"
+        writes = [s for s in statements if s in ("UPDATE conversations", "UPDATE messages")]
+        assert writes[-3:] == ["UPDATE conversations", "UPDATE conversations", "UPDATE messages"]
 
     def test_empty_answer_is_a_retryable_failure(self, make_runtime: Runtime, owner: User) -> None:
         class Silent(MockProvider):
@@ -597,6 +735,7 @@ class TestDuringGeneration:
                 if isinstance(event, TextDelta) and names.count("text_delta") == 1:
                     result = await service.cancel(principal, conversation_id)
                     assert result.cancelled
+            await runtime.app.state.gateway.drain()  # type: ignore[attr-defined]
             return names
 
         names = runtime.portal.call(scenario)  # type: ignore[union-attr]
@@ -606,6 +745,138 @@ class TestDuringGeneration:
         assert reply.status == "cancelled"
         assert reply.content  # the text that had arrived is kept
         assert Conversation.objects.get().active_generation_id is None
+        # What the stopped call used is on the reply and linked to the ledger.
+        usage = AIUsageEvent.objects.get()
+        assert usage.status == "cancelled"
+        assert reply.usage_event_id == usage.id
+        assert reply.output_tokens == usage.output_tokens > 0
+
+    def test_a_stop_before_the_model_starts_releases_the_quota(
+        self, make_runtime: Runtime, owner: User
+    ) -> None:
+        # One request at a time: a reservation that leaked would refuse the second reply.
+        client = make_runtime(ai_user_concurrent_requests=1)
+        conversation_id = UUID(new_conversation(client, auth(owner))["id"])
+        principal = _principal(owner)
+        service: ChatService = client.app.state.chat  # type: ignore[attr-defined]
+        gateway = client.app.state.gateway  # type: ignore[attr-defined]
+
+        async def scenario() -> tuple[UUID, list[str]]:
+            gen = await service.send(
+                principal, conversation_id, SendMessage(content="[[slow:300]] hi"), request_id=None
+            )
+            assert isinstance(gen, Generation)
+            names: list[str] = []
+            async for event in service.stream(gen):
+                names.append(getattr(event, "type", "ping"))
+                if isinstance(event, MessageStart):  # before the gateway is even called
+                    assert (await service.cancel(principal, conversation_id)).cancelled
+            await gateway.drain()
+            again = await service.send(
+                principal, conversation_id, SendMessage(content="hello"), request_id=None
+            )
+            assert isinstance(again, Generation)
+            async for event in service.stream(again):
+                names.append(getattr(event, "type", "ping"))
+            return gen.assistant_message.id, names
+
+        stopped_id, names = client.portal.call(scenario)  # type: ignore[union-attr]
+        assert names[:2] == ["message_start", "message_cancelled"]
+        assert names[-1] == "message_complete"  # the reservation was released
+        stopped = Message.objects.get(id=stopped_id)
+        assert stopped.status == "cancelled"
+        usage = AIUsageEvent.objects.get(source_id=stopped_id)
+        assert usage.status == "cancelled"
+        assert stopped.usage_event_id == usage.id
+
+    def test_leaving_during_the_final_write_still_finishes_it(
+        self, runtime: TestClient, owner: User, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conversation_id = UUID(new_conversation(runtime, auth(owner))["id"])
+        principal = _principal(owner)
+        service: ChatService = runtime.app.state.chat  # type: ignore[attr-defined]
+        finalize = service._finalize
+
+        async def scenario() -> None:
+            writing = asyncio.Event()
+
+            async def slow_finalize(*args: Any, **kwargs: Any) -> Any:
+                writing.set()
+                await asyncio.sleep(0.3)
+                return await finalize(*args, **kwargs)
+
+            monkeypatch.setattr(service, "_finalize", slow_finalize)
+            gen = await service.send(
+                principal, conversation_id, SendMessage(content="hello"), request_id=None
+            )
+            assert isinstance(gen, Generation)
+
+            async def consume() -> None:
+                async for _ in service.stream(gen):
+                    pass
+
+            task = asyncio.create_task(consume())
+            await writing.wait()
+            task.cancel()  # the client leaves while the reply is being stored
+            with suppress(asyncio.CancelledError):
+                await task
+            await service.drain()
+
+        runtime.portal.call(scenario)  # type: ignore[union-attr]
+        reply = Message.objects.get(role="assistant")
+        assert reply.status == "completed"
+        assert reply.content
+        assert Conversation.objects.get().active_generation_id is None
+
+    def test_stop_ends_a_non_streaming_reply(self, runtime: TestClient, owner: User) -> None:
+        conversation_id = UUID(new_conversation(runtime, auth(owner))["id"])
+        principal = _principal(owner)
+        service: ChatService = runtime.app.state.chat  # type: ignore[attr-defined]
+        gateway = runtime.app.state.gateway  # type: ignore[attr-defined]
+
+        async def scenario() -> Exchange:
+            gen = await service.send(
+                principal,
+                conversation_id,
+                SendMessage(content="[[slow:3000]] hello"),
+                request_id=None,
+            )
+            assert isinstance(gen, Generation)
+            task = asyncio.create_task(service.complete(gen))
+            await asyncio.sleep(0.3)
+            assert (await service.cancel(principal, conversation_id)).cancelled
+            exchange = await asyncio.wait_for(task, 2)  # long before the model would answer
+            await gateway.drain()
+            return exchange
+
+        exchange = runtime.portal.call(scenario)  # type: ignore[union-attr]
+        assert exchange.assistant_message.status == "cancelled"
+        assert Message.objects.get(role="assistant").status == "cancelled"
+        assert AIUsageEvent.objects.get().status == "cancelled"
+        assert Conversation.objects.get().active_generation_id is None
+
+    def test_a_stop_after_the_usage_report_changes_nothing(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        conversation_id = UUID(new_conversation(runtime, auth(owner))["id"])
+        principal = _principal(owner)
+        service: ChatService = runtime.app.state.chat  # type: ignore[attr-defined]
+
+        async def scenario() -> list[str]:
+            gen = await service.send(
+                principal, conversation_id, SendMessage(content="hello"), request_id=None
+            )
+            assert isinstance(gen, Generation)
+            names: list[str] = []
+            async for event in service.stream(gen):
+                names.append(getattr(event, "type", "ping"))
+                if isinstance(event, UsageReport):  # the model has finished
+                    assert (await service.cancel(principal, conversation_id)).cancelled
+            return names
+
+        names = runtime.portal.call(scenario)  # type: ignore[union-attr]
+        assert names[-2:] == ["usage", "message_complete"]
+        assert Message.objects.get(role="assistant").status == "completed"
 
     def test_client_disconnect_saves_what_arrived(self, runtime: TestClient, owner: User) -> None:
         conversation_id = UUID(new_conversation(runtime, auth(owner))["id"])
@@ -628,7 +899,7 @@ class TestDuringGeneration:
                     break
             await stream.aclose()  # type: ignore[attr-defined]
             await service.drain()
-            await asyncio.sleep(0.2)
+            await runtime.app.state.gateway.drain()  # type: ignore[attr-defined]
             return received
 
         received = runtime.portal.call(scenario)  # type: ignore[union-attr]
@@ -636,6 +907,9 @@ class TestDuringGeneration:
         assert reply.status == "cancelled"
         assert reply.content.startswith(received)
         assert Conversation.objects.get().active_generation_id is None
+        usage = AIUsageEvent.objects.get()
+        assert usage.status == "cancelled"
+        assert reply.usage_event_id == usage.id
 
     def test_one_generation_at_a_time(self, runtime: TestClient, owner: User) -> None:
         conversation_id = UUID(new_conversation(runtime, auth(owner))["id"])
@@ -671,14 +945,58 @@ class TestDuringGeneration:
             "three",
         ]
 
+    def _abandoned_reply(
+        self, runtime: TestClient, owner: User, conversation_id: UUID, **message: Any
+    ) -> UUID:
+        """A reply claimed by a process that then died: never generated, never finished."""
+        principal = _principal(owner)
+        service: ChatService = runtime.app.state.chat  # type: ignore[attr-defined]
+
+        async def claim() -> UUID:
+            gen = await service.send(
+                principal, conversation_id, SendMessage(**message), request_id=None
+            )
+            assert isinstance(gen, Generation)
+            return UUID(str(gen.assistant_message.id))
+
+        return runtime.portal.call(claim)  # type: ignore[union-attr]
+
     def test_a_stale_lock_from_a_dead_process_is_taken_over(
         self, runtime: TestClient, owner: User
     ) -> None:
         headers = auth(owner)
-        conversation = new_conversation(runtime, headers)
-        Conversation.objects.filter(id=conversation["id"]).update(
-            active_generation_id=conversation["id"],
-            generation_started_at=timezone.now() - timedelta(hours=1),
+        conversation_id = UUID(new_conversation(runtime, headers)["id"])
+        orphan_id = self._abandoned_reply(runtime, owner, conversation_id, content="hello")
+        busy = runtime.post(
+            f"/api/v1/conversations/{conversation_id}/messages/",
+            json={"content": "too soon"},
+            headers={**headers, **STREAM},
         )
-        stream = say(runtime, headers, conversation["id"], "hello")
+        assert busy.status_code == 409
+        Conversation.objects.filter(id=conversation_id).update(
+            generation_started_at=timezone.now() - timedelta(hours=1)
+        )
+        stream = say(runtime, headers, str(conversation_id), "hello again")
         assert stream[-1][0] == "message_complete"
+        # The reply the dead process left behind says so, instead of staying pending forever.
+        orphan = Message.objects.get(id=orphan_id)
+        assert (orphan.status, orphan.error_code) == ("failed", "GENERATION_INTERRUPTED")
+
+    def test_replaying_a_message_whose_reply_died(self, runtime: TestClient, owner: User) -> None:
+        headers = auth(owner)
+        conversation_id = UUID(new_conversation(runtime, headers)["id"])
+        self._abandoned_reply(
+            runtime, owner, conversation_id, content="hello", client_message_id="abc-1"
+        )
+        url = f"/api/v1/conversations/{conversation_id}/messages/"
+        retry = {"content": "hello", "client_message_id": "abc-1"}
+        early = runtime.post(url, json=retry, headers={**headers, **STREAM})
+        assert early.status_code == 409  # still being generated, as far as anyone knows
+        assert early.json()["error"]["code"] == "GENERATION_IN_PROGRESS"
+        Conversation.objects.filter(id=conversation_id).update(
+            generation_started_at=timezone.now() - timedelta(hours=1)
+        )
+        replay = runtime.post(url, json=retry, headers={**headers, **STREAM})
+        assert replay.status_code == 200
+        reply = replay.json()["data"]["assistant_message"]
+        assert (reply["status"], reply["error_code"]) == ("failed", "GENERATION_INTERRUPTED")

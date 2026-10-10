@@ -103,6 +103,14 @@ POST /conversations/{id}/messages/  {content, client_message_id?, model?}
     usage copied from the gateway, the claim released; terminal event sent
 ```
 
+Step 10 is one transaction that locks the conversation row before the message row, the same
+order sending, regenerating and deleting use, so two of them cannot deadlock. It runs in a
+task of its own: a client that leaves during this final write cannot interrupt it half-way
+and leave the conversation claimed. If the write fails (the database went away, a value it
+rejects), a smaller write marks the reply `failed` with `AI_INTERNAL_ERROR` and releases the
+claim, and the stream still ends with an `error` event; if even that fails, the claim expires
+on its own (see below).
+
 Message states: user messages are stored `completed`. Assistant messages go `pending` →
 `streaming` → `completed` | `failed` | `cancelled`. A reply is `completed` only after the
 gateway's `message.end`; a stream that breaks after some text is `failed` with the text it
@@ -119,7 +127,9 @@ whatever its state, and generates a new one for the same question.
 - One generation per conversation at a time. Step 4 is an `UPDATE ... WHERE
   active_generation_id IS NULL` on the locked row; a second send gets 409
   `GENERATION_IN_PROGRESS`. A claim older than the AI total timeout plus a minute belongs to a
-  process that died and is taken over.
+  process that died and is taken over; the reply that process left `pending` or `streaming`
+  is marked `failed` with `GENERATION_INTERRUPTED` instead of staying unfinished forever. A
+  replayed `client_message_id` whose reply was abandoned that way reports it the same way.
 - `client_message_id` makes a submission idempotent: a retried request with the same id
   returns the stored user message and its reply as JSON instead of calling the model again.
   The UI creates one per submission and reuses it when it retries after a network error.
@@ -135,8 +145,15 @@ flag four times a second; `/cancel/` sets that flag in the same process and a Re
 other processes poll once a second. Stopping closes the gateway stream, which closes the
 provider's stream. Providers have no cancel API for a running generation: tokens generated
 before the provider notices the closed connection are billed and recorded as a `cancelled`
-usage row. Without Redis, `/cancel/` only reaches generations in the same process; aborting
-the request always works.
+usage row, and the reply shows them. Without Redis, `/cancel/` only reaches generations in the
+same process; aborting the request always works.
+
+A stop is honoured at any point until the gateway has metered the call: also before the
+provider was called at all (the gateway stream is handed to its reader before anything else
+can run, so even then the quota reservation is released and a `cancelled` usage row is
+written). A stop that arrives once the model has finished (after the `usage` event) changes
+nothing; the reply completes. `/cancel/` also stops a reply requested without streaming: the
+gateway call is cancelled and the `201` response carries the reply as `cancelled`.
 
 A client that disconnects (closed tab, lost network) stops the generation too: the reply is
 stored as `cancelled` with the text that had arrived, written in a task of its own so the
@@ -153,7 +170,7 @@ sent in `message_start` and in the `X-NEXA-Stream-Protocol` header so it can evo
 | --- | --- | --- |
 | `message_start` | protocol, conversation_id, request_id, user_message, assistant_message (`pending`) | First, once the messages are stored |
 | `text_delta` | message_id, text | Each chunk, as it arrives; never buffered |
-| `usage` | message_id, input/output/total/cached/cache-write tokens, cost_usd | Once, before completion |
+| `usage` | message_id, input/output/total/cached/cache-write tokens, cost_usd | Once the gateway has metered the call: before `message_complete`, and before an `error` from the provider (what the failed call used) |
 | `message_complete` | message (`completed`) | Terminal |
 | `message_cancelled` | message (`cancelled`, with partial text) | Terminal |
 | `error` | message_id, code, message, retryable, retry_after, request_id, assistant_message (`failed`) | Terminal |
@@ -178,7 +195,7 @@ conversation:
 | Messages | at most 40 (`CHAT_CONTEXT_MAX_MESSAGES`) |
 | Tokens | at most 24 000 estimated (`CHAT_CONTEXT_MAX_TOKENS`), and never more than the model's context window minus the 2 048-token reply budget and a 1 000-token margin |
 | Estimate | three characters per token, the gateway's estimator |
-| Order | newest first until a limit is hit; the question being answered is always included |
+| Order | newest first until a limit is hit; the question being answered is always included; the window always opens with a user turn (an answer whose question was cut off goes too: providers reject a conversation that starts with the model) |
 | Skipped | failed replies (no answer to learn from) |
 | Kept | cancelled replies' partial text |
 | Too long | a single message larger than the budget fails with `AI_CONTEXT_TOO_LARGE` |
@@ -204,7 +221,15 @@ cost and timings for display and points at the row. A regenerated reply leaves t
 row in place: both calls were billed. A replayed `client_message_id` makes no call and no row.
 A stream that fails or is cancelled after some output records what the provider reported, or
 an estimate from the text that arrived (`usage_source = estimated`); the provider may bill a
-little more than was delivered.
+little more than was delivered. Failed and cancelled replies carry those numbers and the
+link to their row as well, not zeros; only a reply refused before the gateway call was
+planned (an unknown model, an exhausted quota) has no row.
+
+PostgreSQL text cannot hold the NUL character. Requests containing it are refused with 422;
+NUL in a model's output is dropped before the client sees it, so the stored reply is exactly
+what was streamed. Database errors never include statement parameters (`hide_parameters`), so
+message text cannot reach a log through one, and the admin shows conversation metadata but
+neither message text nor titles (a title is the first line of the first message).
 
 ## Observability
 
@@ -226,7 +251,9 @@ Redis or per process without it.
 - A disconnect stops the reply; there is no background completion or stream resumption
   (Phase 18).
 - Cross-process `/cancel/` needs Redis; without it only the generation's own process sees it.
-- The non-streaming path (`Accept: application/json`) does not notice a client that went away.
+- The non-streaming path (`Accept: application/json`) does not notice a client that went away
+  (`/cancel/` does stop it). A non-streaming reply stopped this way does not show the tokens
+  it used; its usage row (`source_id` = the message) has them.
 - Context is a recent-message window; long conversations lose their beginning (Phase 06).
 - Titles are the first line of the first message, not model-generated.
 - Conversations are private; sharing with a team is a later feature (the policy already

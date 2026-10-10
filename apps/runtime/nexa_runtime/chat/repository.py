@@ -281,6 +281,20 @@ async def update_message(conn: AsyncConnection, message_id: UUID, **values: Any)
     return cast(Row[Any], result.one())
 
 
+async def fail_message(
+    conn: AsyncConnection, message_id: UUID, *, error_code: str
+) -> MessageRow | None:
+    """Mark an unfinished reply failed, leaving its text as it is. None when the reply is gone
+    or already finished."""
+    result = await conn.execute(
+        update(t.messages)
+        .where(t.messages.c.id == message_id, t.messages.c.status.in_(("pending", "streaming")))
+        .values(status="failed", error_code=error_code, completed_at=now())
+        .returning(t.messages)
+    )
+    return cast("Row[Any] | None", result.one_or_none())
+
+
 async def delete_message(conn: AsyncConnection, message_id: UUID) -> None:
     await conn.execute(delete(t.messages).where(t.messages.c.id == message_id))
 

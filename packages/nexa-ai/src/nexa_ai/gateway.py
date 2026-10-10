@@ -17,7 +17,7 @@ same checks as a playground request.
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypeVar
@@ -267,6 +267,45 @@ _SUMMARY_PRIORITY: tuple[type[AIError], ...] = (
 Decision = Literal["retry", "next", "fatal"]
 
 
+class GatewayStream:
+    """The event stream of one gateway call, returned by `Gateway.open_stream`.
+
+    Closing it settles the call however far it got: the quota reservation is released and a
+    usage row is written, even when not a single event was read. (An async generator that was
+    never started runs no cleanup when closed; this wrapper does it instead.) Every caller
+    must close it; `sse_bytes` and the chat engine do.
+
+    `call_id` is the call's usage row id, known before the first event. `usage` holds the
+    call's final token counts once the gateway has metered it: after the `usage` event, or
+    after the stream was closed early.
+    """
+
+    def __init__(self, gateway: "Gateway", plan: _Plan) -> None:
+        self.call_id: UUID = plan.call_id
+        self.usage: Usage | None = None
+        self._gateway = gateway
+        self._plan = plan
+        self._events = gateway._stream(plan, self)
+        self._started = False
+        self._closed = False
+
+    def __aiter__(self) -> "GatewayStream":
+        return self
+
+    async def __anext__(self) -> StreamEvent | KeepAlive:
+        self._started = True
+        return await self._events.__anext__()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if not self._started:
+            # Planned and reserved but never run: release the reservation, record the call.
+            self.usage = self._gateway._finish_detached(self._plan, _Tally())
+        await self._events.aclose()
+
+
 @dataclass
 class _Fallback:
     """Retry and fallback decisions for one gateway call, shared by both execution paths.
@@ -398,7 +437,8 @@ class Gateway:
                     fallback, candidate, result, plan.request.response_format
                 )
         except AIError as error:
-            await self._finish(plan, tally, status="error", error=error)
+            error.usage = await self._finish(plan, tally, status="error", error=error)
+            error.call_id = plan.call_id
             raise
         except asyncio.CancelledError:
             self._finish_detached(plan, tally)
@@ -406,7 +446,8 @@ class Gateway:
         except Exception as exc:
             log.error("ai.gateway.bug", error=type(exc).__name__, request_id=ctx.request_id)
             internal = AIInternalError()
-            await self._finish(plan, tally, status="error", error=internal)
+            internal.usage = await self._finish(plan, tally, status="error", error=internal)
+            internal.call_id = plan.call_id
             raise internal from exc
         usage = await self._finish(plan, tally, status="success")
         return ChatResponse(
@@ -423,14 +464,14 @@ class Gateway:
             fallback_used=candidate.is_fallback,
         )
 
-    async def open_stream(
-        self, request: ChatRequest, ctx: AIRequestContext
-    ) -> AsyncIterator[StreamEvent | KeepAlive]:
+    async def open_stream(self, request: ChatRequest, ctx: AIRequestContext) -> GatewayStream:
         """Check everything that can be checked before a provider is called (permission,
         policy, model, quota), raising errors normally, then return the event stream.
-        From here on every failure, before or after the first token, is an `error` event."""
+        From here on every failure, before or after the first token, is an `error` event,
+        preceded by a `usage` event with what the call consumed. The caller must close the
+        stream (see `GatewayStream`)."""
         plan = await self._plan(request, ctx, stream=True)
-        return self._stream(plan)
+        return GatewayStream(self, plan)
 
     async def drain(self) -> None:
         """Wait for usage writes started by cancelled calls."""
@@ -605,7 +646,9 @@ class Gateway:
 
     # --- Streaming -----------------------------------------------------------------------
 
-    async def _stream(self, plan: _Plan) -> AsyncIterator[StreamEvent | KeepAlive]:
+    async def _stream(
+        self, plan: _Plan, sink: GatewayStream
+    ) -> AsyncGenerator[StreamEvent | KeepAlive]:
         tally = _Tally()
         fallback = _Fallback(self, plan, tally, plan.started + self.timeouts.total)
         events: AsyncIterator[ProviderEvent | KeepAlive] | None = None
@@ -663,7 +706,8 @@ class Gateway:
             if opened is None:
                 error = fatal or fallback.final_error()
                 finished = True
-                await self._finish(plan, tally, status="error", error=error)
+                sink.usage = await self._finish(plan, tally, status="error", error=error)
+                yield UsageEvent(usage=sink.usage)
                 yield _stream_error(error, plan)
                 return
 
@@ -706,11 +750,12 @@ class Gateway:
             if failure is not None or end is None:
                 failure = failure or AIProviderError(provider=candidate.model.provider)
                 self._note_failure(plan, candidate, failure)
-                await self._finish(plan, tally, status="error", error=failure)
+                sink.usage = await self._finish(plan, tally, status="error", error=failure)
+                yield UsageEvent(usage=sink.usage)
                 yield _stream_error(failure, plan)
                 return
-            usage = await self._finish(plan, tally, status="success")
-            yield UsageEvent(usage=usage)
+            sink.usage = await self._finish(plan, tally, status="success")
+            yield UsageEvent(usage=sink.usage)
             yield MessageEnd(
                 finish_reason=end.finish_reason,
                 latency_ms=self._elapsed_ms(plan.started),
@@ -723,7 +768,10 @@ class Gateway:
             if not finished:
                 finished = True
                 self._count_stream_usage(plan, tally, start, None, text)
-                await self._finish(plan, tally, status="error", error=AIInternalError())
+                sink.usage = await self._finish(
+                    plan, tally, status="error", error=AIInternalError()
+                )
+                yield UsageEvent(usage=sink.usage)
             yield _stream_error(AIInternalError(), plan)
         finally:
             if events is not None:
@@ -731,7 +779,7 @@ class Gateway:
             if not finished:
                 # The client went away (or the task was cancelled). Record what was used.
                 self._count_stream_usage(plan, tally, start, None, text)
-                self._finish_detached(plan, tally)
+                sink.usage = self._finish_detached(plan, tally)
 
     async def _provider_events(
         self, plan: _Plan, candidate: Candidate, deadline: float
@@ -875,12 +923,13 @@ class Gateway:
         await asyncio.shield(self._spawn_persist(plan, record))
         return usage
 
-    def _finish_detached(self, plan: _Plan, tally: _Tally) -> None:
+    def _finish_detached(self, plan: _Plan, tally: _Tally) -> Usage:
         """Record a cancelled call without awaiting: the current task is being cancelled, so
         the write runs in its own task (awaited by `drain`, and at shutdown)."""
-        record, _ = self._usage_record(plan, tally, status="cancelled", error=None)
+        record, usage = self._usage_record(plan, tally, status="cancelled", error=None)
         self._observe(record)
         self._spawn_persist(plan, record)
+        return usage
 
     def _spawn_persist(self, plan: _Plan, record: UsageRecord) -> asyncio.Task[None]:
         task = asyncio.get_running_loop().create_task(self._persist(plan, record))

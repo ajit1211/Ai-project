@@ -9,11 +9,15 @@
 Everything here is scoped by the caller's principal (organization from the token, ownership
 checked with the shared policy). The gateway does authorization, quotas and metering for the
 model call itself; this service only persists what happened to it.
+
+A transaction that writes both a conversation and its messages locks the conversation row
+first (sending, regenerating, deleting and finishing a reply all do), so two of them cannot
+deadlock.
 """
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -30,7 +34,7 @@ from nexa_ai.errors import (
     AIModelUnavailable,
     AIProviderError,
 )
-from nexa_ai.gateway import Gateway, KeepAlive
+from nexa_ai.gateway import Gateway, GatewayStream, KeepAlive
 from nexa_ai.types import ChatRequest, Feature, Usage, UsageEvent
 from nexa_ai.types import MessageDelta as GatewayDelta
 from nexa_ai.types import MessageEnd as GatewayEnd
@@ -128,6 +132,19 @@ class _Progress:
     @property
     def text(self) -> str:
         return "".join(self.parts)
+
+    @property
+    def call_finished(self) -> bool:
+        """The gateway has metered the model call: only its closing event is still to come."""
+        return self.ended or self.usage is not None
+
+    def add_text(self, text: str) -> str:
+        """Append model output; returns what was kept. PostgreSQL cannot store NUL, so it is
+        dropped here, before the client sees it: what was streamed is what is saved."""
+        text = text.replace("\x00", "")
+        if text:
+            self.parts.append(text)
+        return text
 
 
 class ChatService:
@@ -369,6 +386,7 @@ class ChatService:
         assistant_id: UUID = gen.assistant_message.id
         progress = _Progress(started=time.perf_counter())
         stop = self._cancel.start(assistant_id)
+        events: GatewayStream | None = None
         pump: asyncio.Task[None] | None = None
         done = False
         try:
@@ -379,18 +397,32 @@ class ChatService:
                 assistant_message=MessageOut.from_row(gen.assistant_message),
             )
             request, ctx = await self._prepare(gen)
-            events = await self._gateway.open_stream(request, ctx)
+            # Marked before the gateway call: between opening the gateway stream (which holds
+            # a quota reservation) and handing it to the pump nothing is awaited, so it cannot
+            # be abandoned unclosed.
             await self._mark_streaming(assistant_id)
+            events = await self._gateway.open_stream(request, ctx)
+            progress.usage_event_id = events.call_id
             queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
-            pump = asyncio.create_task(_pump(events, queue))
+            # Started eagerly, so the pump owns the gateway stream (and closes it on the way
+            # out) even when a stop is already waiting. (Python 3.13 needs the loop passed.)
+            pump = asyncio.Task(
+                _pump(events, queue), loop=asyncio.get_running_loop(), eager_start=True
+            )
             last_flush = time.monotonic()
             while True:
-                if stop.is_set():
+                # A stop that arrives once the model has finished changes nothing.
+                if stop.is_set() and not progress.call_finished:
                     await _stop(pump)
                     pump = None
+                    await _close(events)
+                    _take_usage(progress, events)
                     done = True
-                    row = await self._finalize(gen, progress, status="cancelled")
-                    yield MessageCancelled(message=MessageOut.from_row(row))
+                    out, ok = await self._settle(gen, progress, status="cancelled")
+                    if ok:
+                        yield MessageCancelled(message=out)
+                    else:
+                        yield _error_event(AIInternalError(), out, gen.request_id)
                     return
                 try:
                     async with asyncio.timeout(_STOP_CHECK_SECONDS):
@@ -407,16 +439,18 @@ class ChatService:
                     progress.alias = item.model
                     progress.provider = item.provider
                     progress.provider_model = item.provider_model
-                    progress.usage_event_id = UUID(item.id)
                 elif isinstance(item, GatewayDelta):
+                    text = progress.add_text(item.text)
+                    if not text:
+                        continue
                     if progress.ttft_ms is None:
                         progress.ttft_ms = _elapsed_ms(progress.started)
-                    progress.parts.append(item.text)
-                    yield TextDelta(message_id=assistant_id, text=item.text)
+                    yield TextDelta(message_id=assistant_id, text=text)
                     if time.monotonic() - last_flush > _FLUSH_SECONDS:
                         await self._flush(assistant_id, progress.text)
                         last_flush = time.monotonic()
                 elif isinstance(item, UsageEvent):
+                    # Sent before the end of the stream, whether it succeeded or failed.
                     progress.usage = item.usage
                     yield UsageReport(message_id=assistant_id, **item.usage.model_dump())
                 elif isinstance(item, GatewayEnd):
@@ -424,14 +458,16 @@ class ChatService:
                     progress.ended = True
                 elif isinstance(item, GatewayError):
                     done = True
-                    row = await self._finalize(gen, progress, status="failed", error_code=item.code)
+                    out, _ = await self._settle(
+                        gen, progress, status="failed", error_code=item.code
+                    )
                     yield GenerationError(
                         message_id=assistant_id,
                         code=item.code,
                         message=item.message,
                         retryable=item.retryable,
                         request_id=gen.request_id,
-                        assistant_message=MessageOut.from_row(row),
+                        assistant_message=out,
                     )
                     return
             if not progress.ended:
@@ -439,66 +475,85 @@ class ChatService:
             empty = _empty_answer_error(progress)
             done = True
             if empty is not None:
-                row = await self._finalize(gen, progress, status="failed", error=empty)
-                yield _error_event(empty, row, gen.request_id)
+                out, _ = await self._settle(gen, progress, status="failed", error=empty)
+                yield _error_event(empty, out, gen.request_id)
                 return
-            row = await self._finalize(gen, progress, status="completed")
-            yield MessageComplete(message=MessageOut.from_row(row))
+            out, ok = await self._settle(gen, progress, status="completed")
+            if ok:
+                yield MessageComplete(message=out)
+            else:
+                yield _error_event(AIInternalError(), out, gen.request_id)
         except NexaError as exc:
             if not done:
                 done = True
-                row = await self._finalize(gen, progress, status="failed", error=exc)
-                yield _error_event(exc, row, gen.request_id)
+                _take_usage(progress, events)
+                out, _ = await self._settle(gen, progress, status="failed", error=exc)
+                yield _error_event(exc, out, gen.request_id)
         except (GeneratorExit, asyncio.CancelledError):
             raise
         except Exception as exc:
             log.error("chat.generation.bug", error=type(exc).__name__, message_id=str(assistant_id))
             if not done:
                 done = True
+                _take_usage(progress, events)
                 internal = AIInternalError()
-                row = await self._finalize(gen, progress, status="failed", error=internal)
-                yield _error_event(internal, row, gen.request_id)
+                out, _ = await self._settle(gen, progress, status="failed", error=internal)
+                yield _error_event(internal, out, gen.request_id)
         finally:
             self._cancel.finish(assistant_id)
-            if pump is not None and not pump.done():
+            if not done:
+                # The client went away, or the server is shutting down.
+                self._abandon(gen, progress, pump, events)
+            elif pump is not None and not pump.done():
                 # Closes the gateway stream, which closes the provider's and records usage.
                 pump.cancel()
                 self._track(pump)
-            if not done:
-                # The client went away (or the server is shutting down): keep the text that
-                # arrived, in a task of its own so the cancellation cannot interrupt it.
-                self._finalize_detached(gen, progress)
 
     async def complete(self, gen: Generation) -> Exchange:
-        """The non-streaming path: wait for the whole reply."""
+        """The non-streaming path: wait for the whole reply. A stop request ends it too; the
+        reply is then returned as cancelled."""
+        assistant_id: UUID = gen.assistant_message.id
         progress = _Progress(started=time.perf_counter())
+        stop = self._cancel.start(assistant_id)
         try:
             request, ctx = await self._prepare(gen)
-            await self._mark_streaming(gen.assistant_message.id)
-            response = await self._gateway.chat(request, ctx)
+            await self._mark_streaming(assistant_id)
+            response = await _unless_stopped(self._gateway.chat(request, ctx), stop)
         except NexaError as exc:
-            await self._finalize(gen, progress, status="failed", error=exc)
+            if isinstance(exc, AIError) and exc.call_id is not None:
+                progress.usage_event_id = exc.call_id
+                progress.usage = exc.usage
+            await self._settle(gen, progress, status="failed", error=exc)
             raise
         except asyncio.CancelledError:
-            self._finalize_detached(gen, progress)
+            self._abandon(gen, progress)
             raise
-        progress.parts.append(response.content)
-        progress.alias = response.model
-        progress.provider = response.provider
-        progress.provider_model = response.provider_model
-        progress.usage = response.usage
-        progress.usage_event_id = UUID(response.id)
-        progress.finish_reason = response.finish_reason.value
-        progress.ended = True
-        empty = _empty_answer_error(progress)
-        if empty is not None:
-            await self._finalize(gen, progress, status="failed", error=empty)
-            raise empty
-        row = await self._finalize(gen, progress, status="completed")
-        return Exchange(
-            user_message=MessageOut.from_row(gen.user_message),
-            assistant_message=MessageOut.from_row(row),
-        )
+        except Exception as exc:
+            log.error("chat.generation.bug", error=type(exc).__name__, message_id=str(assistant_id))
+            internal = AIInternalError()
+            await self._settle(gen, progress, status="failed", error=internal)
+            raise internal from exc
+        finally:
+            self._cancel.finish(assistant_id)
+        if response is None:
+            out, ok = await self._settle(gen, progress, status="cancelled")
+        else:
+            progress.add_text(response.content)
+            progress.alias = response.model
+            progress.provider = response.provider
+            progress.provider_model = response.provider_model
+            progress.usage = response.usage
+            progress.usage_event_id = UUID(response.id)
+            progress.finish_reason = response.finish_reason.value
+            progress.ended = True
+            empty = _empty_answer_error(progress)
+            if empty is not None:
+                await self._settle(gen, progress, status="failed", error=empty)
+                raise empty
+            out, ok = await self._settle(gen, progress, status="completed")
+        if not ok:
+            raise AIInternalError()
+        return Exchange(user_message=MessageOut.from_row(gen.user_message), assistant_message=out)
 
     async def drain(self) -> None:
         while pending := [task for task in self._background if not task.done()]:
@@ -543,10 +598,22 @@ class ChatService:
             raise AIModelUnavailable(f"Model '{model}' is not available.")
 
     async def _claim(self, conn: Any, conversation: repo.ConversationRow, message_id: UUID) -> None:
+        """Claim the conversation (already locked) for a new reply."""
         if not await repo.acquire_generation(
             conn, conversation.id, message_id, stale_before=self._stale_before()
         ):
             raise GenerationInProgress()
+        if conversation.active_generation_id is not None:
+            # Taken over from a process that died mid-reply: that reply will never finish.
+            await self._interrupted(conn, conversation.active_generation_id)
+
+    async def _interrupted(self, conn: Any, message_id: UUID) -> repo.MessageRow | None:
+        row = await repo.fail_message(
+            conn, message_id, error_code=ErrorCode.GENERATION_INTERRUPTED.value
+        )
+        if row is not None:
+            log.warning("chat.generation.interrupted", message_id=str(message_id))
+        return row
 
     async def _replay(
         self, conn: Any, conversation: repo.ConversationRow, user: repo.MessageRow
@@ -554,8 +621,11 @@ class ChatService:
         reply = await repo.message_at(conn, conversation.id, user.sequence + 1)
         if reply is None or reply.role != "assistant":
             raise Conflict("The earlier message has no reply to return.")
-        if reply.status in ("pending", "streaming") and self._generating(conversation):
-            raise GenerationInProgress("The reply to that message is still being generated.")
+        if reply.status in ("pending", "streaming"):
+            if self._generating(conversation) and conversation.active_generation_id == reply.id:
+                raise GenerationInProgress("The reply to that message is still being generated.")
+            # Its generation died with its process: report that, not a reply pending forever.
+            reply = await self._interrupted(conn, reply.id) or reply
         return Exchange(
             user_message=MessageOut.from_row(user), assistant_message=MessageOut.from_row(reply)
         )
@@ -620,7 +690,7 @@ class ChatService:
         except Exception as exc:
             log.warning("chat.flush_failed", message_id=str(message_id), error=type(exc).__name__)
 
-    async def _finalize(
+    async def _settle(
         self,
         gen: Generation,
         progress: _Progress,
@@ -628,8 +698,64 @@ class ChatService:
         status: str,
         error: NexaError | None = None,
         error_code: str | None = None,
-    ) -> repo.MessageRow:
+    ) -> tuple[MessageOut, bool]:
+        """Store how the generation ended and release the conversation (`_store_outcome`).
+
+        The write runs in a task of its own: if the request is cancelled now (the client left
+        during the final write), it still completes instead of stopping half-way with the
+        conversation locked. `drain` waits for it at shutdown."""
+        task = asyncio.get_running_loop().create_task(
+            self._store_outcome(gen, progress, status=status, error=error, error_code=error_code)
+        )
+        self._track(task)
+        return await asyncio.shield(task)
+
+    async def _store_outcome(
+        self,
+        gen: Generation,
+        progress: _Progress,
+        *,
+        status: str,
+        error: NexaError | None = None,
+        error_code: str | None = None,
+    ) -> tuple[MessageOut, bool]:
+        """`ok` is False when the outcome could not be stored. A smaller write then marks the
+        reply failed and releases the conversation, so nothing stays locked, and the caller
+        reports an internal error instead of the outcome it meant to."""
         code = error_code or (error.error_code.value if error else "")
+        try:
+            row = await self._finalize(gen, progress, status=status, code=code)
+            return MessageOut.from_row(row), True
+        except Exception as exc:
+            log.error(
+                "chat.finalize_failed",
+                message_id=str(gen.assistant_message.id),
+                error=type(exc).__name__,
+            )
+        if status != "failed":
+            code = ErrorCode.AI_INTERNAL_ERROR.value
+        try:
+            async with self._engine.begin() as conn:
+                await repo.release_generation(conn, gen.conversation.id, gen.assistant_message.id)
+                failed = await repo.fail_message(conn, gen.assistant_message.id, error_code=code)
+            if failed is not None:
+                return MessageOut.from_row(failed), False
+        except Exception as exc:
+            log.error(
+                "chat.finalize_fallback_failed",
+                message_id=str(gen.assistant_message.id),
+                error=type(exc).__name__,
+            )
+        # Nothing could be written (the database is unreachable): the claim on the conversation
+        # expires on its own, and the reply is taken over as interrupted.
+        unsaved = MessageOut.from_row(gen.assistant_message).model_copy(
+            update={"status": "failed", "error_code": code, "content": progress.text}
+        )
+        return unsaved, False
+
+    async def _finalize(
+        self, gen: Generation, progress: _Progress, *, status: str, code: str
+    ) -> repo.MessageRow:
         usage = progress.usage
         values: dict[str, Any] = {
             "content": progress.text,
@@ -649,9 +775,10 @@ class ChatService:
             "completed_at": repo.now(),
         }
         async with self._engine.begin() as conn:
-            row = await repo.update_message(conn, gen.assistant_message.id, **values)
-            await repo.release_generation(conn, gen.conversation.id, gen.assistant_message.id)
+            # The conversation row first (see the module docstring).
             await repo.update_conversation(conn, gen.conversation.id, last_message_at=repo.now())
+            await repo.release_generation(conn, gen.conversation.id, gen.assistant_message.id)
+            row = await repo.update_message(conn, gen.assistant_message.id, **values)
         log.info(
             "chat.generation.completed",
             conversation_id=str(gen.conversation.id),
@@ -669,12 +796,25 @@ class ChatService:
         )
         return row
 
-    def _finalize_detached(self, gen: Generation, progress: _Progress) -> None:
-        self._track(
-            asyncio.get_running_loop().create_task(
-                self._finalize(gen, progress, status="cancelled")
-            )
-        )
+    def _abandon(
+        self,
+        gen: Generation,
+        progress: _Progress,
+        pump: asyncio.Task[None] | None = None,
+        events: GatewayStream | None = None,
+    ) -> None:
+        """The client went away (or the server is shutting down): stop the model call and keep
+        the text that arrived, in a task of its own so the cancellation cannot interrupt it."""
+
+        async def wind_down() -> None:
+            if pump is not None:
+                await _stop(pump)
+            if events is not None:
+                await _close(events)
+                _take_usage(progress, events)
+            await self._store_outcome(gen, progress, status="cancelled")
+
+        self._track(asyncio.get_running_loop().create_task(wind_down()))
 
     def _track(self, task: asyncio.Task[Any]) -> None:
         self._background.add(task)
@@ -707,19 +847,19 @@ def _organization(principal: Principal) -> UUID:
     return principal.organization_id
 
 
-def _error_event(error: NexaError, row: repo.MessageRow, request_id: str | None) -> GenerationError:
+def _error_event(error: NexaError, message: MessageOut, request_id: str | None) -> GenerationError:
     retry_after = None
     if isinstance(error, AIError) and error.retry_after_seconds is not None:
         retry_after = max(1, int(error.retry_after_seconds + 0.999))
     retryable = isinstance(error, AIError) and (error.retryable or error.fallback_eligible)
     return GenerationError(
-        message_id=row.id,
+        message_id=message.id,
         code=error.error_code.value,
         message=error.message,
         retryable=retryable,
         retry_after=retry_after,
         request_id=request_id,
-        assistant_message=MessageOut.from_row(row),
+        assistant_message=message,
     )
 
 
@@ -730,6 +870,12 @@ def _empty_answer_error(progress: _Progress) -> AIError | None:
     if progress.finish_reason == "content_filter":
         return AIContentRejected()
     return EmptyResponse()
+
+
+def _take_usage(progress: _Progress, events: GatewayStream | None) -> None:
+    """Keep what the gateway metered when the stream ended without a `usage` event."""
+    if progress.usage is None and events is not None and events.usage is not None:
+        progress.usage = events.usage
 
 
 async def _pump(events: AsyncIterator[Any], queue: "asyncio.Queue[Any]") -> None:
@@ -750,6 +896,23 @@ async def _stop(pump: asyncio.Task[None]) -> None:
     """Stop reading the gateway stream and wait until it has been closed."""
     pump.cancel()
     await asyncio.gather(pump, return_exceptions=True)
+
+
+async def _unless_stopped[T](call: Coroutine[Any, Any, T], stop: asyncio.Event) -> T | None:
+    """Await `call`, unless `stop` is set first: then cancel it and return None. A call that
+    has already finished wins over a stop."""
+    task = asyncio.ensure_future(call)
+    stopped = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait((task, stopped), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stopped.cancel()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    if task.cancelled():
+        return None
+    return task.result()
 
 
 def _elapsed_ms(started: float) -> int:

@@ -170,11 +170,25 @@ def run():
             failed and failed[-1][0] == "error" and failed[-1][1]["code"] == "AI_TIMEOUT",
             "provider timeout ends with an error event",
         )
+        check(
+            [n for n, _ in failed][-2:] == ["usage", "error"],
+            "what the failed call used is reported before the error",
+        )
+        failed_reply = failed[-1][1].get("assistant_message", {}) if failed else {}
+        status, payload = call("GET", "/ai/usage/?scope=me&days=1", token=token, expect=200)
+        recent = payload["data"]["recent"] if status == 200 else []
+        check(
+            any(r["status"] == "error" and r["error_code"] == "AI_TIMEOUT" for r in recent)
+            and failed_reply.get("status") == "failed",
+            "the failed reply is stored as failed and its call is in the ledger",
+        )
         status, text = call("POST", f"{base}regenerate/", token=token, stream=True)
 
     # Validation and conflicts
     call("POST", "/conversations/", {"model": "nexa-nope"}, token=token, expect=422)
     call("POST", "/conversations/", {"owner_id": str(uuid.uuid4())}, token=token, expect=422)
+    # PostgreSQL text cannot hold NUL: refused up front, never a database error.
+    call("POST", f"{base}messages/", {"content": "a\x00b"}, token=token, expect=422, stream=True)
     call("POST", f"{base}cancel/", token=token, expect=200)
 
     # Another user sees nothing

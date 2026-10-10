@@ -229,7 +229,9 @@ runs before the response starts, so those failures are ordinary JSON errors with
 status (401, 403, 413, 422, 429, 503). The response then starts as 200 `text/event-stream`,
 and from that moment every failure, before or after the first token, is an `error` event
 with the same NEXA code and message a JSON error would carry, followed by the end of the
-stream. The HTTP access log shows 200 for a streamed error; the `ai.request.completed` log
+stream. The `error` event is preceded by a `usage` event with what the failed call consumed
+(tokens the provider accepted, text it produced), so a caller can show and store the cost of
+a failure as well as of a success. The HTTP access log shows 200 for a streamed error; the `ai.request.completed` log
 line carries the real outcome. `message.start` is sent exactly once, immediately before the
 first text of the model that will serve the answer, so fallback before the first token never
 produces two starts. Events carry an incrementing `id`; responses set `Cache-Control:
@@ -241,6 +243,15 @@ with the text seen so far (output tokens estimated, `usage_source = estimated`),
 quota and writes the usage row in a task of its own, outside the cancelled request, and
 awaits those tasks at shutdown. The non-streaming route does not observe disconnects: an
 aborted `POST /ai/chat/` runs to completion and is billed.
+
+In code, `Gateway.open_stream` returns a `GatewayStream`. Its `call_id` (the usage row's id)
+is known before the first event, and its `usage` holds the call's final counts once the call
+is metered: after the `usage` event, or after the stream was closed early. Every caller must
+close it (`aclose()`); closing settles the call however far it got, including a stream that
+was opened (quota reserved) but never read, which an ordinary async generator could not do.
+`sse_bytes` and the chat engine always close it. An `AIError` raised by the non-streaming
+`Gateway.chat` after the call was planned carries the same `call_id` and `usage`, so callers
+can link a failed call to its row too.
 
 ## Structured output
 

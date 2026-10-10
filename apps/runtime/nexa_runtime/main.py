@@ -49,6 +49,8 @@ def create_app(
             pool_size=5,
             max_overflow=5,
             connect_args={"timeout": 3},
+            # Parameters are message text: keep them out of error messages, hence out of logs.
+            hide_parameters=True,
         )
         app.state.redis = Redis.from_url(
             settings.redis_queue_url, socket_connect_timeout=1, socket_timeout=1

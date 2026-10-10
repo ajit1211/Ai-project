@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { AuthProvider } from "./auth/AuthContext";
 import { ProtectedRoute, PublicOnlyRoute } from "./auth/routes";
 import { AppShell } from "./components/AppShell";
+import { ChatRoute } from "./pages/ChatRoute";
 import { DashboardPage } from "./pages/DashboardPage";
 import { InvitationPage } from "./pages/InvitationPage";
 import { OrganizationPage } from "./pages/OrganizationPage";
@@ -46,6 +47,8 @@ export function App() {
           <Route element={<ProtectedRoute />}>
             <Route element={<AppShell />}>
               <Route path="/dashboard" element={<DashboardPage />} />
+              {/* One route for both URLs, so opening a conversation does not remount the page. */}
+              <Route path="/chat/:conversationId?" element={<ChatRoute />} />
               <Route path="/playground" element={<PlaygroundPage />} />
               <Route path="/organizations/:organizationId" element={<OrganizationPage />} />
               <Route path="/settings" element={<SettingsLayout />}>

@@ -22,6 +22,7 @@ export function AppShell() {
         <OrgSwitcher />
         <nav className="topnav" aria-label="Main">
           <NavLink to="/dashboard">Dashboard</NavLink>
+          <NavLink to="/chat">Chat</NavLink>
           <NavLink to="/playground">Playground</NavLink>
           <NavLink to="/settings">Settings</NavLink>
         </nav>

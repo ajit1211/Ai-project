@@ -23,6 +23,7 @@ from nexa_runtime.chat.schemas import (
     CreateConversation,
     Exchange,
     MessageOut,
+    NulFree,
     Regenerate,
     SendMessage,
     UpdateConversation,
@@ -57,7 +58,7 @@ async def list_conversations(
     principal: CurrentPrincipal,
     service: Service,
     status: Literal["active", "archived"] = "active",
-    q: Annotated[str, Query(max_length=200)] = "",
+    q: Annotated[NulFree, Query(max_length=200)] = "",
     limit: Annotated[int, Query(ge=1, le=100)] = 30,
     cursor: Annotated[str | None, Query(max_length=200)] = None,
 ) -> Envelope[list[ConversationOut]]:

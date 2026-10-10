@@ -67,7 +67,8 @@ class Conversation(models.Model):
         ]
 
     def __str__(self) -> str:
-        return self.title or f"Conversation {self.id}"
+        # Not the title: it is message text, and this string shows up in the admin and logs.
+        return f"Conversation {self.id}"
 
 
 class Message(models.Model):

@@ -27,6 +27,9 @@ export function DashboardPage() {
         <section className="card section">
           <h2>What's next</h2>
           <p>
+            <Link to="/chat">Open chat</Link>
+          </p>
+          <p>
             <Link to="/playground">Try the AI playground</Link>
           </p>
           <p className="muted">Set up your organization and invite your team.</p>

@@ -5,7 +5,9 @@ Phase 05 uses a bounded recent-message window (docs/architecture/chat-engine.md#
 - never more than `max_messages` messages;
 - never more than `token_budget` estimated tokens, so the input plus the reply fits the
   model's context window with a safety margin;
-- the newest user message is always included; older messages are dropped, oldest first.
+- the newest user message is always included; older messages are dropped, oldest first;
+- it starts with a user message: where the window cuts between a question and its answer,
+  the orphaned answer goes too (providers reject a conversation that opens with the model).
 
 Failed assistant messages are skipped (they have no answer); cancelled ones contribute the
 text they have. Everything comes from one conversation, already authorized by the caller.
@@ -82,6 +84,8 @@ def build_context(
         chosen.append(message)
         used += cost
     chosen.reverse()
+    while len(chosen) > 1 and chosen[0].role is Role.ASSISTANT:
+        used -= estimate_message_tokens([chosen.pop(0)])
     return BuiltContext(
         messages=[system, *chosen],
         included=len(chosen),

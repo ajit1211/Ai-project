@@ -3,6 +3,7 @@ and the conversation permissions every role carries."""
 
 import pytest
 from django.db import IntegrityError, transaction
+from django.test import Client
 
 from nexa_core.access.catalog import ROLE_TEMPLATES
 from nexa_core.chat.models import Conversation, Message
@@ -66,3 +67,28 @@ def test_every_role_can_use_its_own_conversations() -> None:
     }
     for template in ROLE_TEMPLATES:
         assert needed <= template.permissions, template.key
+
+
+def test_the_admin_never_shows_message_text_or_titles(
+    client: Client, conversation: Conversation, make_user: UserFactory
+) -> None:
+    # A title is the first line of the first message unless the owner renamed it.
+    private = "my private question"
+    conversation.title = private
+    conversation.save(update_fields=["title"])
+    message = _message(conversation, 1, content=private)
+    client.force_login(make_user("staff@example.com", is_staff=True, is_superuser=True))
+    pages = [
+        "/admin/chat/conversation/",
+        f"/admin/chat/conversation/{conversation.id}/change/",
+        "/admin/chat/message/",
+        f"/admin/chat/message/{message.id}/change/",
+    ]
+    for url in pages:
+        response = client.get(url)
+        assert response.status_code == 200, url
+        assert private not in response.content.decode(), url
+    assert private not in str(conversation)
+    # Searching by title would confirm guesses about what someone asked.
+    found = client.get("/admin/chat/conversation/", {"q": "private"})
+    assert str(conversation.id) not in found.content.decode()
