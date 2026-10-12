@@ -349,6 +349,10 @@ error, and the estimator (three characters per token) errs high. When the call e
 it ends, the reservation is replaced by the real count and the in-flight slot is released.
 That includes a call cancelled while its reservation is still in flight: the reservation may
 land after the cancellation, and is then released and the call recorded as `cancelled`.
+Calls NEXA makes on a user's behalf in the background (memory extraction and conversation
+summaries, Phase 06; recognized by their server-set `source_type`) count against the token
+allowances only, never the request or concurrency limits, so they cannot make the user's own
+next message wait or fail.
 A breach is `AI_QUOTA_EXCEEDED` (429) with `Retry-After` set to the time until the window
 ends: the next minute, or 00:00 UTC for daily limits (two seconds for a busy in-flight slot).
 In-flight slots get their expiry when the first one is taken and are never extended by later

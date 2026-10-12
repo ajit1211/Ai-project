@@ -173,6 +173,9 @@ class MockProvider:
             repaired = _is_repair_attempt(call)
             if "[[bad_json]]" in asked or ("[[bad_json_once]]" in asked and not repaired):
                 return '{"this is": not json', FinishReason.STOP
+            canned = _canned_structured(fmt.name, call)
+            if canned is not None:
+                return json.dumps(canned), FinishReason.STOP
             return json.dumps(example_for_schema(fmt.json_schema)), FinishReason.STOP
 
         visible = _last_user_text(call)
@@ -188,6 +191,108 @@ def _last_user_text(call: ProviderCall) -> str:
         if message.role is Role.USER:
             return message.text
     return ""
+
+
+# --- The memory engine's schemas -------------------------------------------------------------
+#
+# Development and end-to-end runs have no API key, so the mock answers the chat engine's two
+# structured requests (nexa_runtime.memory) from the exchange itself: a handful of phrase
+# shapes become memory proposals, and a summary is pieced together from the user's turns.
+# Everything a real model would judge (grounding, sensitivity) is still judged by the engine.
+
+# A sentence ends at . ! or ? followed by a space or the end: "example.com" is one word.
+_END = r"(?:[.!?](?=\s|$)|$)"
+_MEMORY_PHRASES: tuple[tuple[re.Pattern[str], str, str, str], ...] = (
+    (re.compile(rf"\bremember (?:that )?(.+?){_END}", re.I | re.M), "fact", "explicit", "{}"),
+    (
+        re.compile(rf"\bi prefer (.+?){_END}", re.I | re.M),
+        "preference",
+        "explicit",
+        "Prefers {}",
+    ),
+    (
+        re.compile(rf"\bwe decided (?:to |on )?(.+?){_END}", re.I | re.M),
+        "decision",
+        "explicit",
+        "Decided to {}",
+    ),
+    (re.compile(rf"\bmy (\w+) is (.+?){_END}", re.I | re.M), "fact", "explicit", "{} is {}"),
+    (
+        re.compile(rf"\b(?:probably|maybe|i guess) (.+?){_END}", re.I | re.M),
+        "fact",
+        "inferred",
+        "Possibly {}",
+    ),
+)
+_HEALTH = re.compile(r"\b(health|diagnos\w*|medical|illness|allerg\w*)\b", re.I)
+_FINANCE = re.compile(r"\b(salary|bank|loan|income|debt)\b", re.I)
+_CONTACT = re.compile(r"\b(e-?mail|phone|mobile|address)\b", re.I)
+
+
+def _block(text: str, tag: str) -> str:
+    match = re.search(rf"<{tag}>\n?(.*?)\n?</{tag}>", text, re.S)
+    return match.group(1) if match else text
+
+
+def _canned_structured(schema_name: str, call: ProviderCall) -> dict[str, Any] | None:
+    text = _last_user_text(call)
+    if schema_name == "memory_extraction":
+        return {"memories": _mock_memories(_block(text, "user_message"))}
+    if schema_name == "conversation_summary":
+        return _mock_summary(text)
+    return None
+
+
+def _mock_memories(user_text: str) -> list[dict[str, Any]]:
+    proposals: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pattern, kind, source_type, template in _MEMORY_PHRASES:
+        for match in pattern.finditer(user_text):
+            groups = [g.strip() for g in match.groups()]
+            if template == "{} is {}":
+                content = f"{groups[0].capitalize()} is {groups[1]}"
+                key = f"my_{groups[0].lower()}"
+            else:
+                content = template.format(groups[0])
+                key = "_".join(re.findall(r"[a-z0-9]+", groups[0].lower())[:3])
+            if content.casefold() in seen or len(proposals) >= 8:
+                continue
+            seen.add(content.casefold())
+            category, sensitive = "other", False
+            if _HEALTH.search(content):
+                category, sensitive = "health", True
+            elif _FINANCE.search(content):
+                category, sensitive = "finance", True
+            elif _CONTACT.search(content):
+                category, sensitive = "contact", True
+            elif kind == "preference":
+                category = "preference"
+            proposals.append(
+                {
+                    "kind": kind,
+                    "key": key[:80],
+                    "content": content[:500],
+                    "source_type": source_type,
+                    "confidence": 0.9 if source_type == "explicit" else 0.5,
+                    "importance": 3,
+                    "sensitive": sensitive,
+                    "category": category,
+                }
+            )
+    return proposals
+
+
+def _mock_summary(text: str) -> dict[str, Any]:
+    previous = _block(text, "previous_summary").strip()
+    users = [u.strip() for u in re.findall(r"<user>\n?(.*?)\n?</user>", text, re.S) if u.strip()]
+    topics = "; ".join(u[:80] for u in users[:6]) or "nothing in particular"
+    carried = "" if previous in ("", "(none)") else previous.split("\n\n", 1)[0][:600] + " "
+    return {
+        "summary": (carried + f"The user asked about: {topics}.")[:1500],
+        "decisions": [u[:200] for u in users if "decided" in u.lower()][:5],
+        "open_questions": [u[:200] for u in users if u.endswith("?")][:5],
+        "episode": f"A conversation about {users[0][:120]}" if users else "A short conversation.",
+    }
 
 
 def _is_repair_attempt(call: ProviderCall) -> bool:

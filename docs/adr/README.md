@@ -22,5 +22,6 @@ ADR-00N"; they are filed under their NEXA numbers:
 | [031](031-usage-ledger-and-quotas.md) | Append-only usage ledger, integer cost, reserve-then-settle quotas instead of money budgets | 04 / ADR-013 |
 | [032](032-fallback-retry-and-timeouts.md) | Fallback, retry and timeout strategy under one deadline | 04 / ADR-014 |
 | [033](033-conversations-in-runtime.md) | Conversations served by Runtime; Core owns their schema and permissions; no service-to-service calls | 05 |
+| [034](034-memory-engine.md) | Structured memory in PostgreSQL, team scope as project memory, in-process extraction | 06 |
 
 Format: context, decision, alternatives, consequences. Status is *accepted* unless noted.

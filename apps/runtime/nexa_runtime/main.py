@@ -22,6 +22,7 @@ from nexa_runtime.chat.service import ChatService
 from nexa_runtime.config import RuntimeSettings, get_settings
 from nexa_runtime.errors import register_exception_handlers
 from nexa_runtime.health import router as health_router
+from nexa_runtime.memory.service import MemoryEngine
 from nexa_runtime.middleware import RequestContextMiddleware
 from nexa_runtime.ratelimit import Limiter
 
@@ -78,12 +79,18 @@ def create_app(
         # The chat engine (docs/architecture/chat-engine.md) on top of the gateway.
         app.state.cancel = CancelRegistry(app.state.redis)
         app.state.limiter = Limiter(app.state.redis)
+        # The memory engine (docs/architecture/memory-engine.md): recall before a reply,
+        # extraction and summaries after it, and the `/memories` API.
+        app.state.memory = MemoryEngine(
+            engine=app.state.engine, gateway=app.state.gateway, settings=settings
+        )
         app.state.chat = ChatService(
             engine=app.state.engine,
             gateway=app.state.gateway,
             cancel=app.state.cancel,
             limiter=app.state.limiter,
             settings=settings,
+            memory=app.state.memory,
         )
         try:
             yield

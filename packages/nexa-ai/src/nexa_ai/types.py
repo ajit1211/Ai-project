@@ -48,6 +48,9 @@ class Feature(StrEnum):
     API = "api"
     PLAYGROUND = "playground"
     CHAT = "chat"
+    # Set by the memory engine (Phase 06): extraction after a turn, and conversation summaries.
+    MEMORY = "memory"
+    SUMMARY = "summary"
 
 
 class FinishReason(StrEnum):

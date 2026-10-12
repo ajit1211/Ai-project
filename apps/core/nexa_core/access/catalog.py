@@ -71,6 +71,13 @@ PERMISSIONS: tuple[PermissionSpec, ...] = (
     PermissionSpec("conversation.create", "Start conversations"),
     PermissionSpec("conversation.update", "Rename and archive your conversations"),
     PermissionSpec("conversation.delete", "Delete your conversations"),
+    # Memory (06): private memories are the user's alone; team and organization memories are
+    # shared. `memory.manage_all` reaches shared memories only, never anyone's private ones.
+    PermissionSpec("memory.view", "View your memories and the ones shared with you"),
+    PermissionSpec("memory.create", "Save memories"),
+    PermissionSpec("memory.update", "Edit your memories"),
+    PermissionSpec("memory.delete", "Delete your memories"),
+    PermissionSpec("memory.manage_all", "Manage team and organization memories saved by others"),
     # AI capabilities (04+). Agents can never exceed these (doc 14.5).
     PermissionSpec("ai.chat", "Chat with AI models"),
     PermissionSpec("ai.agent.execute", "Let AI agents act on your behalf"),
@@ -96,6 +103,10 @@ _VIEWER = frozenset(
         "conversation.create",
         "conversation.update",
         "conversation.delete",
+        "memory.view",
+        "memory.create",
+        "memory.update",
+        "memory.delete",
         "ai.chat",
     }
 )
@@ -124,6 +135,7 @@ _MANAGER = _MEMBER | {
     "knowledge.delete",
     "agents.delete",
     "analytics.view",
+    "memory.manage_all",
     "ai.code_execute",
 }
 _ADMIN = ALL_PERMISSIONS - {"organization.delete"}

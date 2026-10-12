@@ -211,7 +211,9 @@ conversation:
 | Kept | cancelled replies' partial text |
 | Too long | a single message larger than the budget fails with `AI_CONTEXT_TOO_LARGE` |
 
-Older messages are dropped, not summarized. Summaries and long-term memory are Phase 06. The
+Since Phase 06 the context also carries recalled memories and a rolling summary of the
+older messages ([memory-engine.md](memory-engine.md#context)); older messages are still
+never deleted, only left out of the window once a summary covers them. The
 history comes only from the authorized conversation; nothing from another conversation or
 organization can enter it.
 
@@ -267,7 +269,8 @@ Redis or per process without it.
   it used; its usage row (`source_id` = the message) has them. A stop that lands in the
   instant after the model answered, while the usage row is being written, stores that reply
   as `cancelled` without its text, although the call completed and is billed.
-- Context is a recent-message window; long conversations lose their beginning (Phase 06).
+- Context is a recent-message window plus, since Phase 06, a rolling summary of what fell
+  out of it and recalled memories (memory-engine.md).
 - Titles are the first line of the first message, not model-generated.
 - Conversations are private; sharing with a team is a later feature (the policy already
   supports team visibility and grants).

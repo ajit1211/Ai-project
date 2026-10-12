@@ -132,7 +132,24 @@ class Limits:
         )
 
 
+# Calls the platform makes on a user's behalf after a reply (memory extraction, conversation
+# summaries; the source type is set by Runtime, never by a client). They count against the
+# token allowances, which bound what they cost, but not against the request and concurrency
+# limits, which pace the user's own requests: background work must never make the user's
+# next message wait or fail.
+BACKGROUND_SOURCES: frozenset[str] = frozenset({"memory", "summary"})
+
+
 def counters(
+    ctx: AIRequestContext, limits: Limits, *, tokens: int, now: datetime, stream_ttl: int
+) -> list[Counter]:
+    items = _all_counters(ctx, limits, tokens=tokens, now=now, stream_ttl=stream_ttl)
+    if ctx.source_type in BACKGROUND_SOURCES:
+        return [item for item in items if item.kind == "tokens"]
+    return items
+
+
+def _all_counters(
     ctx: AIRequestContext, limits: Limits, *, tokens: int, now: datetime, stream_ttl: int
 ) -> list[Counter]:
     minute = int(now.timestamp() // 60)

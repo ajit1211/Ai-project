@@ -4,31 +4,35 @@ AI Intelligence & Agent Platform. The architecture and the 20-phase plan are in
 [docs/architecture/NEXA-architecture.md](docs/architecture/NEXA-architecture.md); decisions
 made since are in [docs/adr/](docs/adr/).
 
-**Current phase: 05, the chat engine.** Signed-in users hold private conversations at
-`/chat`: pick a model, send messages, watch replies stream in, stop or regenerate a reply,
-search, rename, archive and delete conversations. Replies come from the Phase 04 AI Gateway
-with a bounded window of recent messages as context; every message, its status and its
-token usage are stored. Details: [docs/architecture/chat-engine.md](docs/architecture/chat-engine.md);
-endpoints and the `nexa.chat.v1` stream in [docs/api/conversations.md](docs/api/conversations.md);
-decision in [ADR-033](docs/adr/033-conversations-in-runtime.md).
+**Current phase: 06, conversation memory.** NEXA remembers selected things about you and
+your work across conversations: what you state (and approve) becomes a memory, relevant
+memories and your standing preferences are recalled into each reply's context, long
+conversations get a rolling summary, and everything is visible, editable and deletable at
+`/memories`, with automatic memory on or off. Memories are private, team or organization
+scoped, never cross a tenant, and never hold secrets. Details:
+[memory-engine.md](docs/architecture/memory-engine.md), [memory-security.md](docs/architecture/memory-security.md),
+endpoints in [docs/api/memories.md](docs/api/memories.md), decision in [ADR-034](docs/adr/034-memory-engine.md).
 
-Earlier phases: the AI Gateway (Phase 04, [ai-gateway.md](docs/architecture/ai-gateway.md),
+Earlier phases: the chat engine (Phase 05, [chat-engine.md](docs/architecture/chat-engine.md),
+[docs/api/conversations.md](docs/api/conversations.md), ADR-033; private conversations at
+`/chat`, streamed with the `nexa.chat.v1` protocol), the AI Gateway (Phase 04, [ai-gateway.md](docs/architecture/ai-gateway.md),
 [docs/api/ai.md](docs/api/ai.md), ADR-026 to 032; the developer playground is at `/playground`)
 and identity and access (Phase 03, [authentication.md](docs/architecture/authentication.md),
 [authorization.md](docs/architecture/authorization.md), [multi-tenancy.md](docs/architecture/multi-tenancy.md),
 [security.md](docs/architecture/security.md)).
 
 ```text
-React (/chat) ──► edge (Vite proxy locally) ──► FastAPI /api/v1/conversations, /api/v1/ai
+React (/chat, /memories) ──► edge (Vite proxy) ──► FastAPI /api/v1/conversations, /memories, /ai
                                            └──► Django   /api/v1/auth, /users, /organizations, /ai/usage
-FastAPI ──► AI Gateway ──► Anthropic | OpenAI | mock          (one PostgreSQL; Django owns the schema)
+FastAPI ──► memory engine (recall, extraction, summaries) ──► AI Gateway ──► Anthropic | OpenAI | mock
+                                                   (one PostgreSQL; Django owns the schema)
 ```
 
 | Part | Where | What it is |
 | --- | --- | --- |
-| React | http://localhost:5173 | `apps/web`: chat workspace, sign-in, settings, organization switcher, the AI playground; `/status` shows the stack |
+| React | http://localhost:5173 | `apps/web`: chat workspace, memories, sign-in, settings, organization switcher, the AI playground; `/status` shows the stack |
 | Django | http://localhost:8000 | `apps/core`: the control plane (identity, organizations, roles, audit, AI catalog, usage ledger, the schema of every table, admin) |
-| FastAPI | http://localhost:8001 | `apps/runtime`: the AI plane (`/api/v1/conversations/*` and `/api/v1/ai/*`) |
+| FastAPI | http://localhost:8001 | `apps/runtime`: the AI plane (`/api/v1/conversations/*`, `/api/v1/memories/*`, `/api/v1/ai/*`) |
 | PostgreSQL | localhost:5433 (project-local) | One database, two roles: `nexa_core` and `nexa_runtime` |
 | Redis | localhost:6379 | Rate limits, AI quotas, Celery broker and pub/sub (db 0), cache (db 1) |
 | Celery | worker process | Emails and background jobs on `core.default` and `core.email` |
@@ -80,6 +84,7 @@ as down. Without AI provider keys the mock provider answers; add `AI_ANTHROPIC_A
 | `uv run python scripts/e2e_auth.py` | Walks the whole sign-up and sign-in flow against the running stack |
 | `uv run python scripts/e2e_ai.py` | Walks the AI gateway (models, chat, structured output, streaming, errors, usage) against the running stack |
 | `uv run python scripts/e2e_chat.py` | Walks the chat engine (conversation, streamed reply, history, retries, failures, isolation, deletion) against the running stack |
+| `uv run python scripts/e2e_memory.py` | Walks the memory engine (extraction, refusals, approval, manual memories, search, isolation, settings, clearing) against the running stack |
 | `uv run python apps/core/manage.py createsuperuser` | Creates an admin login for http://localhost:8000/admin/ |
 
 Emails in development are written to `.local/mail/`; open the newest file for the link.

@@ -17,7 +17,7 @@ deadlock.
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Coroutine
+from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -46,7 +46,7 @@ from nexa_common.ids import new_id
 from nexa_common.logs import get_logger
 from nexa_runtime.chat import repository as repo
 from nexa_runtime.chat.cancellation import CancelRegistry
-from nexa_runtime.chat.context import ContextPolicy, HistoryItem, build_context
+from nexa_runtime.chat.context import ContextPolicy, HistoryItem, MemoryItem, build_context
 from nexa_runtime.chat.events import (
     ChatEvent,
     GenerationError,
@@ -68,6 +68,7 @@ from nexa_runtime.chat.schemas import (
     UpdateConversation,
 )
 from nexa_runtime.config import RuntimeSettings
+from nexa_runtime.memory.service import MemoryEngine
 from nexa_runtime.ratelimit import Limiter
 
 log = get_logger("nexa.runtime.chat")
@@ -156,8 +157,10 @@ class ChatService:
         cancel: CancelRegistry,
         settings: RuntimeSettings,
         limiter: Limiter | None = None,
+        memory: MemoryEngine | None = None,
     ) -> None:
         self._engine = engine
+        self._memory = memory
         self._gateway = gateway
         self._cancel = cancel
         self._limiter = limiter or Limiter(None)
@@ -165,6 +168,8 @@ class ChatService:
         self._policy = ContextPolicy(
             max_messages=settings.chat_context_max_messages,
             max_tokens=settings.chat_context_max_tokens,
+            memory_budget=settings.memory_context_max_tokens,
+            summary_budget=settings.memory_summary_max_tokens,
         )
         self._background: set[asyncio.Task[Any]] = set()
 
@@ -238,6 +243,8 @@ class ChatService:
             row = await self._load(conn, principal, conversation_id, "delete", for_update=True)
             if self._generating(row):
                 raise GenerationInProgress("Stop the reply being generated before deleting.")
+            if self._memory is not None:
+                await self._memory.forget_conversation(conn, row.id)
             await repo.delete_conversation(conn, row.id)
 
     async def list_messages(
@@ -634,7 +641,8 @@ class ChatService:
         )
 
     async def _prepare(self, gen: Generation) -> tuple[ChatRequest, AIRequestContext]:
-        """The gateway request: system instructions plus the bounded recent history."""
+        """The gateway request: system instructions, relevant memories, the rolling summary
+        and the bounded recent history (docs/architecture/memory-engine.md#context)."""
         model = gen.assistant_message.model
         registry = await self._gateway.catalog.registry()
         alias = registry.get(model) if model else registry.default_alias
@@ -648,8 +656,11 @@ class ChatService:
                 limit=self._policy.max_messages + 2,
                 before=gen.assistant_message.sequence,
             )
+        memories, summary = await self._recall(gen)
         history = [
-            HistoryItem(role=row.role, content=row.content, status=row.status)
+            HistoryItem(
+                role=row.role, content=row.content, status=row.status, sequence=row.sequence
+            )
             for row in rows
             if row.role in ("user", "assistant")
         ]
@@ -659,6 +670,8 @@ class ChatService:
             context_window=context_window,
             max_output_tokens=self._settings.chat_max_output_tokens,
             policy=self._policy,
+            memories=memories,
+            summary=summary,
         )
         log.info(
             "chat.context.built",
@@ -666,6 +679,9 @@ class ChatService:
             message_id=str(gen.assistant_message.id),
             included=built.included,
             dropped=built.dropped,
+            memories=built.memories_included,
+            memories_dropped=built.memories_dropped,
+            summary=built.summary_included,
             estimated_tokens=built.estimated_tokens,
         )
         request = ChatRequest(
@@ -680,6 +696,23 @@ class ChatService:
             source_id=gen.assistant_message.id,
         )
         return request, ctx
+
+    async def _recall(self, gen: Generation) -> tuple[Sequence[MemoryItem], Any]:
+        """What the memory engine has for this turn. A failure there costs the turn its
+        memories, never the reply."""
+        if self._memory is None:
+            return (), None
+        try:
+            return await self._memory.recall(
+                gen.principal, conversation_id=gen.conversation.id, query=gen.user_message.content
+            )
+        except Exception as exc:
+            log.error(
+                "memory.recall.failed",
+                conversation_id=str(gen.conversation.id),
+                error=type(exc).__name__,
+            )
+            return (), None
 
     async def _mark_streaming(self, message_id: UUID) -> None:
         async with self._engine.begin() as conn:
@@ -728,6 +761,8 @@ class ChatService:
         code = error_code or (error.error_code.value if error else "")
         try:
             row = await self._finalize(gen, progress, status=status, code=code)
+            if status == "completed":
+                self._after_turn(gen, row)
             return MessageOut.from_row(row), True
         except Exception as exc:
             log.error(
@@ -818,6 +853,23 @@ class ChatService:
             await self._store_outcome(gen, progress, status="cancelled")
 
         self._track(asyncio.get_running_loop().create_task(wind_down()))
+
+    def _after_turn(self, gen: Generation, reply: repo.MessageRow) -> None:
+        """Memory extraction and summarization run after a completed reply, in a task of
+        their own: they never delay the answer, and their failure never fails it."""
+        if self._memory is None:
+            return
+        self._track(
+            asyncio.get_running_loop().create_task(
+                self._memory.after_turn(
+                    gen.principal,
+                    conversation=gen.conversation,
+                    user_message=gen.user_message,
+                    assistant_message=reply,
+                    request_id=gen.request_id,
+                )
+            )
+        )
 
     def _track(self, task: asyncio.Task[Any]) -> None:
         self._background.add(task)

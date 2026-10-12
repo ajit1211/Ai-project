@@ -28,6 +28,8 @@ export function DashboardPage() {
           <h2>What's next</h2>
           <p>
             <Link to="/chat">Open chat</Link>
+            {" · "}
+            <Link to="/memories">Manage memories</Link>
           </p>
           <p>
             <Link to="/playground">Try the AI playground</Link>

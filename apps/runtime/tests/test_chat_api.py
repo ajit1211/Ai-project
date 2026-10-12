@@ -65,6 +65,7 @@ def make_settings(**overrides: Any) -> RuntimeSettings:
         "runtime_database_url": _test_database_url(),
         "redis_queue_url": "redis://127.0.0.1:1/0",
         "ai_registry_ttl_seconds": 0.0,
+        "memory_enabled": False,  # the memory tests switch it on
     }
     values.update(overrides)
     return RuntimeSettings(**values)

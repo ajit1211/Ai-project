@@ -1,5 +1,6 @@
 """AI quotas against an in-memory Redis (with Lua), and the degraded mode without one."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -114,6 +115,23 @@ class TestRedisQuota:
             await quota.reserve(ctx(uuid4(), user), policy, tokens=1)
         await quota.settle(ticket, tokens_used=1)
         await quota.reserve(ctx(uuid4(), user), policy, tokens=1)
+
+    async def test_background_calls_spend_tokens_but_never_request_slots(
+        self, quota: RedisQuota
+    ) -> None:
+        org, user = uuid4(), uuid4()
+        policy = OrganizationPolicy()
+        background = replace(ctx(org, user), source_type="memory")
+        # Far more background calls than the per-minute (2) and in-flight (1) limits allow,
+        # none of them settled: they hold no request or concurrency slot.
+        for _ in range(5):
+            await quota.reserve(background, policy, tokens=10)
+        # The user's own request still gets through...
+        own = await quota.reserve(ctx(org, user), policy, tokens=10)
+        await quota.settle(own, tokens_used=10)
+        # ...while the token allowance (800 for the user) binds background work too.
+        with pytest.raises(AIQuotaExceeded, match="token allowance"):
+            await quota.reserve(replace(background, source_type="summary"), policy, tokens=800)
 
     async def test_organization_policy_overrides_defaults(self, quota: RedisQuota) -> None:
         org = uuid4()

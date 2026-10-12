@@ -82,6 +82,23 @@ class RuntimeSettings(BaseSettings):
     # New conversations per user per minute (message sends are limited by the AI quotas).
     chat_conversations_per_minute: int = 20
 
+    # Memory engine (docs/architecture/memory-engine.md). Extraction and summaries are gateway
+    # calls on `memory_model`, metered to the user like any other.
+    memory_enabled: bool = True
+    memory_model: str = "nexa-fast"
+    # How many relevant memories, and how many standing preferences, one turn may recall.
+    memory_retrieval_limit: int = 5
+    memory_preference_limit: int = 5
+    # Context budget shares, in estimated tokens.
+    memory_context_max_tokens: int = 1_500
+    memory_summary_max_tokens: int = 2_000
+    # Summarize once this many messages lie outside the summary, keeping the newest in full.
+    memory_summary_after_messages: int = 20
+    memory_summary_keep_recent: int = 10
+    memory_max_candidates_per_turn: int = 8
+    memory_candidate_ttl_days: int = 30
+    memory_conversation_ttl_days: int = 30
+
     @property
     def async_database_url(self) -> URL:
         return make_url(self.runtime_database_url).set(drivername="postgresql+asyncpg")

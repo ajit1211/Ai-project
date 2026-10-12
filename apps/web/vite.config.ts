@@ -11,6 +11,7 @@ const runtimePrefixes = [
   "ai",
   "conversations",
   "messages",
+  "memories",
   "runs",
   "approvals",
   "search",

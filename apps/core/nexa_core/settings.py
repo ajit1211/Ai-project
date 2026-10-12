@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django.contrib.postgres",
     "corsheaders",
     "rest_framework",
     "nexa_core.identity",
@@ -47,6 +48,7 @@ INSTALLED_APPS = [
     "nexa_core.audit",
     "nexa_core.ai",
     "nexa_core.chat",
+    "nexa_core.memory",
     "nexa_core.system",
 ]
 
