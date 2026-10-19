@@ -8,6 +8,7 @@ from django.urls import URLPattern, URLResolver, include, path
 
 from nexa_core.ai.urls import urlpatterns as ai_urls
 from nexa_core.audit.views import AuditLogListView
+from nexa_core.documents.urls import urlpatterns as document_urls
 from nexa_core.identity import views as identity_views
 from nexa_core.identity.urls import urlpatterns as identity_urls
 from nexa_core.organizations.urls import urlpatterns as organization_urls
@@ -17,6 +18,7 @@ api_v1: list[URLPattern | URLResolver] = [
     *identity_urls,
     *organization_urls,
     *ai_urls,
+    *document_urls,
     path(
         "organizations/<uuid:organization_id>/audit-logs/",
         AuditLogListView.as_view(),

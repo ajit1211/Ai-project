@@ -46,6 +46,7 @@ PERMISSIONS: tuple[PermissionSpec, ...] = (
     # Later phases: documents and knowledge (07-09)
     PermissionSpec("documents.view", "View documents"),
     PermissionSpec("documents.upload", "Upload documents"),
+    PermissionSpec("documents.update", "Rename, categorize and share your documents"),
     PermissionSpec("documents.delete", "Delete documents"),
     PermissionSpec("documents.manage_all", "Manage every document in the organization"),
     PermissionSpec("knowledge.view", "View knowledge bases"),
@@ -113,6 +114,8 @@ _VIEWER = frozenset(
 _MEMBER = _VIEWER | {
     "team.manage_members",
     "documents.upload",
+    "documents.update",
+    "documents.delete",
     "knowledge.create",
     "knowledge.update",
     "agents.create",

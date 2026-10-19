@@ -56,6 +56,20 @@ class CoreSettings(BaseSettings):
     email_host_password: SecretStr = SecretStr("")
     default_from_email: str = "NEXA <no-reply@nexa.local>"
 
+    # Documents (docs/architecture/documents.md): private files under .local/documents in
+    # development; an object store behind the same interface when deployed.
+    documents_storage_backend: str = "local"
+    documents_storage_root: Path = REPO_ROOT / ".local" / "documents"
+    documents_max_upload_bytes: int = 50 * 1024 * 1024
+    documents_max_text_chars: int = 5_000_000
+    documents_max_pages: int = 500
+    documents_max_csv_rows: int = 50_000
+    documents_processing_timeout_seconds: int = 600
+    documents_max_attempts: int = 5
+    documents_uploads_per_hour: int = 60
+    documents_org_storage_bytes: int = 5 * 1024 * 1024 * 1024
+    documents_purge_after_days: int = 30
+
     @property
     def allowed_hosts(self) -> list[str]:
         return _split(self.django_allowed_hosts)

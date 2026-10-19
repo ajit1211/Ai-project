@@ -32,6 +32,18 @@ NEXA_REDIS_QUEUE_URL = env.redis_queue_url
 NEXA_FRONTEND_URL = env.frontend_url.rstrip("/")
 NEXA_JWT_PRIVATE_KEY = env.jwt_private_key.get_secret_value() if env.jwt_private_key else None
 NEXA_JWT_PRIVATE_KEY_FILE = env.jwt_private_key_file
+# Documents (docs/architecture/documents.md)
+NEXA_DOCUMENTS_STORAGE_BACKEND = env.documents_storage_backend
+NEXA_DOCUMENTS_STORAGE_ROOT = env.documents_storage_root
+NEXA_DOCUMENTS_MAX_UPLOAD_BYTES = env.documents_max_upload_bytes
+NEXA_DOCUMENTS_MAX_TEXT_CHARS = env.documents_max_text_chars
+NEXA_DOCUMENTS_MAX_PAGES = env.documents_max_pages
+NEXA_DOCUMENTS_MAX_CSV_ROWS = env.documents_max_csv_rows
+NEXA_DOCUMENTS_PROCESSING_TIMEOUT_SECONDS = env.documents_processing_timeout_seconds
+NEXA_DOCUMENTS_MAX_ATTEMPTS = env.documents_max_attempts
+NEXA_DOCUMENTS_UPLOADS_PER_HOUR = env.documents_uploads_per_hour
+NEXA_DOCUMENTS_ORG_STORAGE_BYTES = env.documents_org_storage_bytes
+NEXA_DOCUMENTS_PURGE_AFTER_DAYS = env.documents_purge_after_days
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -49,6 +61,7 @@ INSTALLED_APPS = [
     "nexa_core.ai",
     "nexa_core.chat",
     "nexa_core.memory",
+    "nexa_core.documents",
     "nexa_core.system",
 ]
 
@@ -148,7 +161,15 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_WORKER_HIJACK_ROOT_LOGGER = False
 CELERY_TIMEZONE = "UTC"
 CELERY_BROKER_CONNECTION_TIMEOUT = 2
-CELERY_TASK_ROUTES = {"core.identity.send_email": {"queue": "core.email"}}
+CELERY_TASK_ROUTES = {
+    "core.identity.send_email": {"queue": "core.email"},
+    # Parsing is CPU-bound and may take minutes: its own queue, so a burst of uploads
+    # never delays an email (doc 21.2). Its tasks carry their own time limits.
+    "core.documents.process": {"queue": "core.documents"},
+    "core.documents.purge": {"queue": "core.documents"},
+}
+# Uploads above this size are streamed to a temporary file instead of memory.
+FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024
 
 # Logging is configured above by nexa_common; stop Django from applying its own defaults.
 LOGGING_CONFIG = None

@@ -13,6 +13,8 @@ dependencies = [
     "nexa-common",
     "psycopg[binary]>=3.3.6",
     "pydantic-settings>=2.15.0",
+    "pypdf>=6.0",
+    "python-docx>=1.2",
     "redis>=8.1.0",
     "tzdata>=2026.5",
 ]

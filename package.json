@@ -8,7 +8,7 @@
     "dev:web": "pnpm --filter @nexa/web dev",
     "dev:core": "uv run python apps/core/manage.py runserver 8000",
     "dev:runtime": "uv run uvicorn nexa_runtime.main:app --reload --reload-dir apps/runtime --reload-dir packages/nexa-common --port 8001 --no-access-log",
-    "dev:worker": "uv run celery -A nexa_core worker --loglevel INFO --pool solo --queues core.default,core.email",
+    "dev:worker": "uv run celery -A nexa_core worker --loglevel INFO --pool solo --queues core.default,core.email,core.documents",
     "migrate": "uv run python apps/core/manage.py migrate",
     "test": "uv run pytest && pnpm --filter @nexa/web test",
     "lint": "uv run ruff check . && uv run ruff format --check . && uv run mypy apps/core apps/runtime packages/nexa-common && pnpm --filter @nexa/web lint && pnpm --filter @nexa/web typecheck"

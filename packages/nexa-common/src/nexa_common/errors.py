@@ -31,6 +31,8 @@ class ErrorCode(StrEnum):
     METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED"
     CONFLICT = "CONFLICT"
     PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
+    UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE"
+    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
     GENERATION_IN_PROGRESS = "GENERATION_IN_PROGRESS"
     # Stored on a reply whose generation died with its process (never an HTTP error).
     GENERATION_INTERRUPTED = "GENERATION_INTERRUPTED"
@@ -68,6 +70,8 @@ DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.METHOD_NOT_ALLOWED: "This method is not allowed for this endpoint.",
     ErrorCode.CONFLICT: "The request conflicts with the current state of the resource.",
     ErrorCode.PAYLOAD_TOO_LARGE: "The request is too large.",
+    ErrorCode.UNSUPPORTED_MEDIA_TYPE: "This file type is not supported.",
+    ErrorCode.QUOTA_EXCEEDED: "A storage or usage quota has been reached.",
     ErrorCode.GENERATION_IN_PROGRESS: "A reply is already being generated in this conversation.",
     ErrorCode.GENERATION_INTERRUPTED: "The reply was interrupted before it finished. Please try again.",
     ErrorCode.RATE_LIMITED: "Too many requests. Please try again later.",
@@ -147,6 +151,21 @@ class Conflict(NexaError):
     code = ErrorCode.CONFLICT
 
 
+class PayloadTooLarge(NexaError):
+    status = 413
+    code = ErrorCode.PAYLOAD_TOO_LARGE
+
+
+class UnsupportedMediaType(NexaError):
+    status = 415
+    code = ErrorCode.UNSUPPORTED_MEDIA_TYPE
+
+
+class QuotaExceeded(NexaError):
+    status = 402
+    code = ErrorCode.QUOTA_EXCEEDED
+
+
 class RateLimited(NexaError):
     status = 429
     code = ErrorCode.RATE_LIMITED
@@ -171,6 +190,7 @@ _STATUS_CODES: dict[int, ErrorCode] = {
     405: ErrorCode.METHOD_NOT_ALLOWED,
     409: ErrorCode.CONFLICT,
     413: ErrorCode.PAYLOAD_TOO_LARGE,
+    415: ErrorCode.UNSUPPORTED_MEDIA_TYPE,
     422: ErrorCode.VALIDATION_FAILED,
     429: ErrorCode.RATE_LIMITED,
     503: ErrorCode.SERVICE_UNAVAILABLE,
