@@ -51,6 +51,19 @@ NEXA_RAG_CHUNK_OVERLAP_CHARS = env.rag_chunk_overlap_chars
 NEXA_RAG_MAX_CHUNKS_PER_DOCUMENT = env.rag_max_chunks_per_document
 NEXA_RAG_INDEX_TIMEOUT_SECONDS = env.rag_index_timeout_seconds
 NEXA_RAG_INDEX_REQUESTS_PER_HOUR = env.rag_index_requests_per_hour
+# Embeddings for semantic search (docs/architecture/vector-search.md)
+NEXA_EMBEDDING_ENABLED = env.embedding_enabled
+NEXA_EMBEDDING_MODEL = env.embedding_model
+NEXA_EMBEDDING_BATCH_SIZE = env.embedding_batch_size
+NEXA_EMBEDDING_MAX_BATCH_TOKENS = env.embedding_max_batch_tokens
+NEXA_EMBEDDING_TIMEOUT_SECONDS = env.embedding_timeout_seconds
+NEXA_EMBEDDING_MAX_ATTEMPTS = env.embedding_max_attempts
+NEXA_EMBEDDING_TASK_RETRIES = env.embedding_task_retries
+NEXA_EMBEDDING_JOB_TIMEOUT_SECONDS = env.embedding_job_timeout_seconds
+NEXA_EMBEDDING_ORG_TOKENS_PER_DAY = env.embedding_org_tokens_per_day
+NEXA_EMBEDDING_MOCK_ALLOWED = env.mock_provider_enabled
+NEXA_AI_OPENAI_API_KEY = env.ai_openai_api_key.get_secret_value() if env.ai_openai_api_key else None
+NEXA_AI_OPENAI_BASE_URL = env.ai_openai_base_url
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -178,6 +191,7 @@ CELERY_TASK_ROUTES = {
     "core.documents.process": {"queue": "core.documents"},
     "core.documents.purge": {"queue": "core.documents"},
     "core.documents.index": {"queue": "core.documents"},
+    "core.documents.embed": {"queue": "core.documents"},
 }
 # Uploads above this size are streamed to a temporary file instead of memory.
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024

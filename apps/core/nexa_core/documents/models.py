@@ -25,6 +25,7 @@ from django.db import models
 from django.db.models import Q
 
 from nexa_common.ids import new_id
+from nexa_core.ai.models import AIEmbeddingModel
 from nexa_core.chat.models import Conversation
 from nexa_core.documents import lifecycle
 from nexa_core.organizations.models import Organization, Team
@@ -355,3 +356,75 @@ class DocumentChunk(models.Model):
 
     def __str__(self) -> str:
         return f"Chunk {self.chunk_index} of {self.document_id}"
+
+
+# --- Semantic index (Phase 09, docs/architecture/vector-search.md) -----------------------------
+
+EMBEDDING_STATUSES = ("pending", "embedding", "ready", "failed")
+
+
+class DocumentEmbedding(models.Model):
+    """Where the vectors of one document stand for one embedding model.
+
+    The vectors themselves are in `chunk_embeddings` (a pgvector table created only where the
+    extension exists; documents/vectors.py). A document takes part in semantic search for a
+    model only when this row is `ready` for the chunks currently indexed
+    (`source_generation` equals the search index's `indexed_generation`): never with a mixture
+    of vectors for old and new chunks.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        EMBEDDING = "embedding"
+        READY = "ready"
+        FAILED = "failed"
+
+    id = models.UUIDField(primary_key=True, default=new_id, editable=False)
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="+")
+    document = models.ForeignKey(
+        Document, on_delete=models.CASCADE, related_name="embedding_states"
+    )
+    embedding_model = models.ForeignKey(
+        AIEmbeddingModel, on_delete=models.PROTECT, related_name="document_states"
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    # Counts requests; a task carries the generation it was queued for (as indexing does).
+    generation = models.PositiveIntegerField(default=0)
+    # The search-index generation whose chunks the vectors cover; null until ready once.
+    source_generation = models.PositiveIntegerField(null=True, blank=True)
+    space = models.CharField(max_length=200)
+    chunk_count = models.PositiveIntegerField(default=0)
+    embedded_count = models.PositiveIntegerField(default=0)
+    reused_count = models.PositiveIntegerField(default=0)
+    input_tokens = models.PositiveBigIntegerField(default=0)
+    attempt_count = models.PositiveSmallIntegerField(default=0)
+    error_code = models.CharField(max_length=48, blank=True)
+    error_message = models.CharField(max_length=MAX_ERROR_MESSAGE_CHARS, blank=True)
+    retryable = models.BooleanField(default=False)
+    duration_ms = models.PositiveIntegerField(default=0)
+    requested_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    ready_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "document_embeddings"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["document", "embedding_model"], name="document_embeddings_model_uniq"
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=EMBEDDING_STATUSES), name="document_embeddings_status_chk"
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["organization", "embedding_model", "status"],
+                name="document_embeddings_state_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"Embeddings of {self.document_id} ({self.space}): {self.status}"

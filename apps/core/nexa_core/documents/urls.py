@@ -4,6 +4,9 @@ from nexa_core.documents import views
 
 urlpatterns = [
     path("documents/", views.DocumentCollectionView.as_view(), name="documents"),
+    path(
+        "documents/search-status/", views.SearchStatusView.as_view(), name="documents-search-status"
+    ),
     path("documents/<uuid:document_id>/", views.DocumentView.as_view(), name="document"),
     path(
         "documents/<uuid:document_id>/status/",

@@ -90,6 +90,9 @@ class RetrievalQuery:
     scope: DocumentFilter
     limit: int
     min_matched_terms: int = 1
+    # Semantic retrieval: the question's unit-length vector and the model that made it.
+    vector: Sequence[float] | None = None
+    model: Any = None  # nexa_ai.embeddings.EmbeddingModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +115,11 @@ class Passage:
     format: str
     score: float
     matched_terms: int
+    # Semantic and hybrid retrieval: cosine similarity (not a distance, not a confidence) and
+    # the passage's rank in each method's list.
+    similarity: float | None = None
+    lexical_rank: int | None = None
+    vector_rank: int | None = None
 
 
 class Retriever(Protocol):

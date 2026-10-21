@@ -53,6 +53,7 @@ from nexa_core.documents.extraction import (
 from nexa_core.documents.models import (
     MAX_FILENAME_CHARS,
     Document,
+    DocumentIndex,
     DocumentIngestion,
     DocumentText,
 )
@@ -91,9 +92,11 @@ def visible_documents(context: OrganizationContext) -> QuerySet[Document]:
     """The documents this member may see: their own, their teams', the organization's; or
     all of them with `documents.manage_all`. Deleted documents are never listed."""
     principal = context.principal
-    documents = Document.objects.filter(
-        organization=context.organization, deleted_at__isnull=True
-    ).select_related("uploaded_by", "search_index")
+    documents = (
+        Document.objects.filter(organization=context.organization, deleted_at__isnull=True)
+        .select_related("uploaded_by", "search_index")
+        .prefetch_related("embedding_states")
+    )
     if principal.has("documents.manage_all"):
         return documents
     allowed = Q(visibility=Document.Visibility.ORGANIZATION) | Q(uploaded_by_id=principal.user_id)
@@ -109,6 +112,7 @@ def get_document(
     deleted, or invisible to them; 403 when visible but beyond their role."""
     document = (
         Document.objects.select_related("uploaded_by", "search_index")
+        .prefetch_related("embedding_states")
         .filter(organization=context.organization, id=document_id, deleted_at__isnull=True)
         .first()
     )
@@ -475,8 +479,14 @@ def _index_limit() -> ratelimit.Limit:
     )
 
 
-def request_reindex(context: OrganizationContext, document: Document) -> Document:
-    """Rebuild a document's search index (after a chunking upgrade, or a failed run)."""
+def request_reindex(
+    context: OrganizationContext, document: Document, *, reembed: bool = False
+) -> Document:
+    """Rebuild a document's search index (after a chunking upgrade, or a failed run); its
+    vectors follow, reusing those of unchanged passages. `reembed` instead embeds every
+    passage again for the active embedding model (after a failure, or to refresh them)."""
+    from nexa_core.documents import embedding
+
     authorize(context.principal, "update", document_resource(document))
     ratelimit.consume(_index_limit(), str(context.principal.user_id))
     with transaction.atomic():
@@ -485,14 +495,23 @@ def request_reindex(context: OrganizationContext, document: Document) -> Documen
             raise NotFound
         if locked.status != lifecycle.COMPLETED:
             raise Conflict("The document has no extracted text to index yet.")
-        index = indexing.request_indexing(locked)
+        if reembed:
+            index = DocumentIndex.objects.filter(document=locked).first()
+            if index is None or not index.searchable:
+                raise Conflict("The document's passages are not indexed yet.")
+            state = embedding.request_embedding(locked, force=True)
+            if state is None:
+                raise Conflict("Semantic search is not available here.")
+            metadata = {"embedding_generation": state.generation, "reembed": True}
+        else:
+            metadata = {"generation": indexing.request_indexing(locked).generation}
         record(
             AuditAction.DOCUMENT_INDEX_REQUESTED,
             actor_id=context.principal.user_id,
             organization_id=context.organization.id,
             resource_type="document",
             resource_id=document.id,
-            metadata={"generation": index.generation},
+            metadata=metadata,
         )
     return document
 
@@ -601,3 +620,92 @@ def record_download(context: OrganizationContext, document: Document) -> None:
         resource_id=document.id,
         metadata={"format": document.format},
     )
+
+
+# --- Search readiness (Phase 09) -----------------------------------------------------------------
+
+
+def search_status(context: OrganizationContext) -> dict[str, Any]:
+    """Counts and codes for administrators: is semantic search running, with which model, and
+    how much of the organization's library is embedded. Never text or vectors."""
+    from django.db import connection
+    from django.db.models import Count, F
+
+    from nexa_core.documents import embedding, vectors
+    from nexa_core.documents.models import DocumentChunk, DocumentEmbedding
+
+    organization = context.organization
+    available = embedding.availability(fresh=True)
+    store = vectors.status(connection)
+    live = Document.objects.filter(organization=organization, deleted_at__isnull=True)
+    indexed = live.filter(
+        status=lifecycle.COMPLETED,
+        search_index__indexed_at__isnull=False,
+        search_index__chunk_count__gt=0,
+    )
+    model = available.model
+    states: dict[str, int] = {}
+    ready = 0
+    embedded = 0
+    hnsw = False
+    if model is not None:
+        current = DocumentEmbedding.objects.filter(
+            organization=organization, embedding_model=model, document__deleted_at__isnull=True
+        )
+        states = {
+            row["status"]: row["n"] for row in current.values("status").annotate(n=Count("id"))
+        }
+        ready = current.filter(
+            status=DocumentEmbedding.Status.READY,
+            source_generation=F("document__search_index__indexed_generation"),
+        ).count()
+        if store.ready:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT count(*) FROM chunk_embeddings e JOIN documents d "
+                    "ON d.id = e.document_id AND d.organization_id = e.organization_id "
+                    "WHERE e.organization_id = %s AND e.embedding_model_id = %s "
+                    "AND d.deleted_at IS NULL",
+                    [organization.id, model.id],
+                )
+                embedded = int(cursor.fetchone()[0])
+                cursor.execute(
+                    "SELECT EXISTS (SELECT FROM pg_indexes WHERE indexname = %s)",
+                    [vectors.index_name(model.key)],
+                )
+                hnsw = bool(cursor.fetchone()[0])
+    return {
+        "semantic": {
+            "available": available.enabled,
+            "reason": available.reason,
+            "model": None
+            if model is None
+            else {
+                "key": model.key,
+                "provider": model.provider,
+                "provider_model": model.provider_model,
+                "dimensions": model.dimensions,
+                "distance": model.distance,
+            },
+            "vector_store": {
+                "extension_available": store.extension_available,
+                "extension_installed": store.extension_installed,
+                "table": store.table_exists,
+                "approximate_index": hnsw,
+            },
+        },
+        "documents": {
+            "total": live.count(),
+            "indexed": indexed.count(),
+            "semantic_ready": ready,
+            "pending": states.get("pending", 0),
+            "embedding": states.get("embedding", 0),
+            "failed": states.get("failed", 0),
+        },
+        "passages": {
+            "total": DocumentChunk.objects.filter(
+                organization=organization, document__deleted_at__isnull=True
+            ).count(),
+            "embedded": embedded,
+        },
+    }

@@ -301,3 +301,91 @@ class AIUsageEvent(models.Model):
 
     def delete(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, int]]:
         raise RuntimeError("AI usage events are append-only")
+
+
+# --- Embedding models (Phase 09, docs/architecture/vector-search.md) ---------------------------
+
+embedding_key_validator = RegexValidator(
+    r"^nexa-embed-[a-z0-9-]{2,36}$", "Embedding model keys look like 'nexa-embed-small'."
+)
+# The fields that decide which vectors are comparable. They never change on a row: a new
+# provider model, revision or size is a new embedding model, so stored vectors stay valid.
+EMBEDDING_SPACE_FIELDS = ("provider", "provider_model", "dimensions", "version", "distance")
+
+
+class AIEmbeddingModel(models.Model):
+    """A logical embedding model (its `key`) and the concrete model behind it.
+
+    Kept apart from the chat catalog: an embedding model is never a chat alias, and there is
+    no fallback between embedding models, because vectors from different models (or sizes, or
+    revisions) cannot be compared. Which one is in use is decided by `EMBEDDING_MODEL` and
+    `is_default` (nexa_ai.embeddings.registry.choose_model).
+    """
+
+    class Distance(models.TextChoices):
+        COSINE = "cosine"
+
+    id = models.UUIDField(primary_key=True, default=new_id, editable=False)
+    key = models.CharField(max_length=48, unique=True, validators=[embedding_key_validator])
+    display_name = models.CharField(max_length=80)
+    provider = models.CharField(max_length=32, choices=Provider.choices)
+    provider_model = models.CharField(max_length=128)
+    dimensions = models.PositiveIntegerField()
+    version = models.CharField(
+        max_length=64, blank=True, help_text="Provider revision, when the provider has one."
+    )
+    distance = models.CharField(max_length=16, choices=Distance.choices, default=Distance.COSINE)
+    max_batch_size = models.PositiveSmallIntegerField(default=64)
+    max_input_tokens = models.PositiveIntegerField(default=8_191)
+    input_micros_per_million = models.BigIntegerField(
+        null=True, blank=True, help_text="USD micros per million tokens; empty when unknown."
+    )
+    price_source = models.CharField(max_length=240, blank=True)
+    relevance_floor = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Vector results below this cosine similarity are dropped. A heuristic for "
+        "this model, not a confidence; empty keeps every result.",
+    )
+    is_active = models.BooleanField(default=True)
+    is_default = models.BooleanField(default=False)
+    use_cases = models.JSONField(default=list, blank=True)
+    notes = models.CharField(max_length=240, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ai_embedding_models"
+        ordering = ("key",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["is_default"],
+                condition=Q(is_default=True),
+                name="ai_embedding_models_one_default",
+            ),
+            models.CheckConstraint(
+                condition=Q(dimensions__gte=1, dimensions__lte=16_000),
+                name="ai_embedding_models_dimensions_chk",
+            ),
+            models.CheckConstraint(
+                condition=Q(distance__in=["cosine"]), name="ai_embedding_models_distance_chk"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return self.key
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        if not self._state.adding:
+            stored = type(self).objects.filter(pk=self.pk).values(*EMBEDDING_SPACE_FIELDS).first()
+            if stored and any(stored[f] != getattr(self, f) for f in EMBEDDING_SPACE_FIELDS):
+                raise ValueError(
+                    "An embedding model's provider, model, size, revision and distance are "
+                    "fixed; create a new embedding model instead."
+                )
+        super().save(*args, **kwargs)
+
+    @property
+    def space(self) -> str:
+        version = self.version or "unversioned"
+        return f"{self.provider}/{self.provider_model}@{version}:{self.dimensions}:{self.distance}"

@@ -22,7 +22,6 @@ from nexa_core.access.principal import OrganizationContext, load_organization_co
 from nexa_core.api import ok
 from nexa_core.documents import lifecycle, services
 from nexa_core.documents.extraction.sniff import EXTENSIONS
-from nexa_core.documents.indexing import index_payload
 from nexa_core.documents.models import Document
 from nexa_core.documents.serializers import (
     UpdateInput,
@@ -236,13 +235,18 @@ class DocumentRetryView(DocumentsView):
 class DocumentIndexView(DocumentsView):
     """Request a rebuild of the document's search index (Phase 08)."""
 
+    parser_classes = (JSONParser,)
+
     def post(self, request: Request, document_id: UUID) -> Response:
+        reembed = request.data.get("reembed", False) if isinstance(request.data, dict) else False
+        if not isinstance(reembed, bool):
+            raise _invalid("reembed", "Use true or false.")
         document = self.document(document_id, action="update")
-        services.request_reindex(self.context, document)
+        services.request_reindex(self.context, document, reembed=reembed)
         document = self.document(document_id)
         return ok(
-            index_payload(document.search_index),
-            message="Indexing has been queued.",
+            document_payload(document, self.context.principal)["index"],
+            message="Embedding has been queued." if reembed else "Indexing has been queued.",
             status=202,
         )
 
@@ -251,6 +255,17 @@ class DocumentIndexStatusView(DocumentsView):
     def get(self, request: Request, document_id: UUID) -> Response:
         document = self.document(document_id)
         return ok(document_payload(document, self.context.principal)["index"])
+
+
+class SearchStatusView(DocumentsView):
+    """The organization's search readiness, for administrators (`documents.manage_all`):
+    whether semantic search runs here and how many documents and passages are embedded.
+    Counts and codes only; no text, no vectors."""
+
+    def get(self, request: Request) -> Response:
+        if not self.context.principal.has("documents.manage_all"):
+            raise PermissionDenied
+        return ok(services.search_status(self.context))
 
 
 def upload_limits() -> dict[str, Any]:

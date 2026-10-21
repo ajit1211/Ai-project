@@ -53,6 +53,8 @@ class Feature(StrEnum):
     SUMMARY = "summary"
     # Set by the chat engine for a reply grounded in the user's documents (Phase 08).
     RAG = "rag"
+    # Set for embedding calls: document chunks (Core) and questions (Runtime), Phase 09.
+    EMBEDDING = "embedding"
 
 
 class FinishReason(StrEnum):

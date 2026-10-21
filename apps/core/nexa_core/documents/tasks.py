@@ -28,7 +28,7 @@ from django.utils import timezone
 
 from nexa_common.context import bind_request_context
 from nexa_common.logs import get_logger
-from nexa_core.documents import indexing, lifecycle
+from nexa_core.documents import embedding, indexing, lifecycle
 from nexa_core.documents.extraction import (
     PARSER_VERSION,
     Extraction,
@@ -271,6 +271,7 @@ def purge_documents() -> dict[str, int]:
         "purged": purged,
         "stalled": stalled,
         "indexes_stalled": indexing.fail_stalled(now),
+        "embeddings_stalled": embedding.fail_stalled(now),
     }
     log.info("documents.purge.completed", **counts)
     return counts
@@ -293,3 +294,28 @@ INDEX_TIMEOUT = indexing.timeout_seconds()
 )
 def index_document(document_id: str, generation: int) -> str:
     return indexing.run_indexing(UUID(document_id), int(generation))
+
+
+# --- Semantic index (Phase 09) -------------------------------------------------------------------
+
+EMBED_TIMEOUT = embedding.job_timeout()
+
+
+@shared_task(
+    bind=True,
+    name="core.documents.embed",
+    soft_time_limit=max(30, EMBED_TIMEOUT - 30),
+    time_limit=EMBED_TIMEOUT,
+    max_retries=settings.NEXA_EMBEDDING_TASK_RETRIES,
+)
+def embed_document(
+    self: Any, document_id: str, embedding_model_id: str, generation: int, force: bool = False
+) -> str:
+    outcome = embedding.run_embedding(
+        UUID(document_id), UUID(embedding_model_id), int(generation), force=bool(force)
+    )
+    if outcome == "retry" and not self.request.is_eager and self.request.retries < self.max_retries:
+        # A provider outage or rate limit outlasted the embedder's own retries: try the whole
+        # run again later. Finished batches are kept and reused.
+        raise self.retry(countdown=60 * (self.request.retries + 1))
+    return outcome

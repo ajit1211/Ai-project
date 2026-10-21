@@ -17,6 +17,7 @@ MAX_SOURCES = 12
 
 GroundingScopeKind = Literal["documents", "team", "library"]
 GroundingOutcome = Literal["pending", "answered", "uncited", "no_evidence", "failed", "cancelled"]
+RetrievalMode = Literal["auto", "lexical", "semantic", "hybrid"]
 
 
 class GroundingRequest(BaseModel):
@@ -30,6 +31,9 @@ class GroundingRequest(BaseModel):
     team_id: UUID | None = None
     all_documents: bool = False
     max_sources: int | None = Field(default=None, ge=1, le=MAX_SOURCES)
+    # Phase 09: how to search. "auto" uses the deployment's default (hybrid where semantic
+    # search runs, keyword search otherwise).
+    retrieval_mode: RetrievalMode = "auto"
 
 
 class GroundingOut(BaseModel):
@@ -47,6 +51,11 @@ class GroundingOut(BaseModel):
     invalid_citations: list[str] = Field(default_factory=list)
     retrieval_ms: int | None = None
     strategy: str = ""
+    # Phase 09: what was asked for, what ran ("lexical", "semantic", "hybrid"), and why it
+    # differs when it does (e.g. "query_embedding_failed", "semantic_pgvector_missing").
+    retrieval_requested: RetrievalMode = "auto"
+    retrieval_mode: Literal["lexical", "semantic", "hybrid"] = "lexical"
+    fallback: str | None = None
 
     @classmethod
     def from_record(cls, record: Any) -> "GroundingOut | None":

@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from nexa_ai.embeddings import Embedder, EmbeddingProvider, build_embedding_providers
 from nexa_ai.gateway import Gateway
 from nexa_ai.providers.base import AIProvider
 from nexa_common.logs import configure_logging
@@ -33,6 +34,7 @@ def create_app(
     *,
     jwks_client: JWKSClient | None = None,
     providers: Mapping[str, AIProvider] | None = None,
+    embedding_providers: Mapping[str, EmbeddingProvider] | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(
@@ -87,8 +89,27 @@ def create_app(
         )
         # Document-grounded answers (docs/architecture/rag.md): retrieval over the caller's
         # authorized documents, evidence for the model, validated citations.
+        # Question embeddings for semantic search (docs/architecture/vector-search.md):
+        # the same providers and model rule as Core's document embeddings.
+        app.state.embedder = Embedder(
+            embedding_providers
+            if embedding_providers is not None
+            else build_embedding_providers(
+                openai_api_key=settings.ai_openai_api_key.get_secret_value()
+                if settings.ai_openai_api_key
+                else None,
+                openai_base_url=settings.ai_openai_base_url,
+                mock_enabled=settings.mock_provider_enabled,
+            ),
+            timeout=settings.rag_query_embedding_timeout_seconds,
+            max_attempts=2,
+        )
         app.state.rag = RagEngine(
-            engine=app.state.engine, settings=settings, limiter=app.state.limiter
+            engine=app.state.engine,
+            settings=settings,
+            limiter=app.state.limiter,
+            embedder=app.state.embedder,
+            usage=app.state.gateway.usage,
         )
         app.state.chat = ChatService(
             engine=app.state.engine,
@@ -105,6 +126,7 @@ def create_app(
             # Finish message and usage writes for cancelled calls before the connections go away.
             await app.state.chat.drain()
             await app.state.gateway.aclose()
+            await app.state.embedder.aclose()
             await app.state.redis.aclose()
             await app.state.engine.dispose()
 

@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -114,6 +114,18 @@ class RuntimeSettings(BaseSettings):
     rag_queries_per_minute: int = 20
     rag_excerpt_chars: int = 400
     rag_source_detail_chars: int = 4_000
+
+    # Semantic and hybrid retrieval (docs/architecture/vector-search.md). EMBEDDING_ENABLED and
+    # EMBEDDING_MODEL must match Core's: questions and documents are embedded by the same model.
+    embedding_enabled: bool = True
+    embedding_model: str = ""
+    # Used when a question does not choose: hybrid where semantic search runs, else lexical.
+    rag_retrieval_mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
+    rag_vector_candidates: int = 40
+    rag_rrf_k: int = 60
+    rag_query_embedding_timeout_seconds: float = 10.0
+    rag_hnsw_ef_search: int = 100
+    rag_semantic_status_ttl_seconds: float = 30.0
 
     @property
     def async_database_url(self) -> URL:

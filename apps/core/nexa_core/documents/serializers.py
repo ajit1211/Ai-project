@@ -68,6 +68,7 @@ def document_payload(
     *,
     ingestions: list[DocumentIngestion] | None = None,
 ) -> dict[str, Any]:
+    from nexa_core.documents.embedding import semantic_payload
     from nexa_core.documents.indexing import index_payload
     from nexa_core.documents.services import can_retry, document_resource  # no import cycle
 
@@ -106,7 +107,11 @@ def document_payload(
         "editable": editable,
         "deletable": can(principal, "delete", resource),
         # The search index behind document-grounded answers (Phase 08), apart from extraction.
-        "index": index_payload(_search_index(document)),
+        "index": {
+            **index_payload(_search_index(document)),
+            # The semantic index (Phase 09): vectors for the active embedding model.
+            "semantic": semantic_payload(document),
+        },
         "can_reindex": document.status == lifecycle.COMPLETED and editable,
     }
     if ingestions is not None:

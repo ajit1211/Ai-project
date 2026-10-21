@@ -29,3 +29,14 @@ ALTER DEFAULT PRIVILEGES FOR ROLE nexa_core IN SCHEMA public
     GRANT SELECT ON TABLES TO nexa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE nexa_core IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO nexa_runtime;
+
+-- pgvector (Phase 09, docs/architecture/vector-search.md). Semantic search needs it, and only a
+-- superuser may create it, so it is created here, wherever the server has it installed: in
+-- `nexa`, and in `template1` so that test databases (created from template1) have it too.
+-- Without it NEXA runs with keyword search only and says so.
+SELECT 'CREATE EXTENSION IF NOT EXISTS vector'
+WHERE EXISTS (SELECT FROM pg_available_extensions WHERE name = 'vector')\gexec
+
+\connect template1
+SELECT 'CREATE EXTENSION IF NOT EXISTS vector'
+WHERE EXISTS (SELECT FROM pg_available_extensions WHERE name = 'vector')\gexec

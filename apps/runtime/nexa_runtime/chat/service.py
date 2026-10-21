@@ -735,7 +735,12 @@ class ChatService:
     async def _ground(self, gen: Generation) -> Grounded:
         if self._rag is None or gen.scope is None:  # pragma: no cover - send() checked both
             raise GroundingDisabled("Answers from documents are not available.")
-        return await self._rag.retrieve(gen.principal, gen.scope, question=gen.user_message.content)
+        return await self._rag.retrieve(
+            gen.principal,
+            gen.scope,
+            question=gen.user_message.content,
+            request_id=gen.request_id,
+        )
 
     def _sources_of(self, grounded: Grounded, check: CitationCheck | None) -> list[SourceOut]:
         return self._rag.sources_from(grounded, check) if self._rag is not None else []

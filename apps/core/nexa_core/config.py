@@ -79,6 +79,23 @@ class CoreSettings(BaseSettings):
     rag_index_timeout_seconds: int = 300
     rag_index_requests_per_hour: int = 30
 
+    # Embeddings for semantic search (docs/architecture/vector-search.md). Document text is sent
+    # to the embedding provider: EMBEDDING_ENABLED=false keeps it on the server (keyword search
+    # only). EMBEDDING_MODEL names an embedding model key; empty uses the registry's default.
+    embedding_enabled: bool = True
+    embedding_model: str = ""
+    embedding_batch_size: int = 64
+    embedding_max_batch_tokens: int = 100_000
+    embedding_timeout_seconds: float = 30.0
+    embedding_max_attempts: int = 3
+    embedding_task_retries: int = 3
+    embedding_job_timeout_seconds: int = 900
+    embedding_org_tokens_per_day: int = 2_000_000
+    # Provider credentials for document embeddings: the same variables Runtime reads.
+    ai_openai_api_key: SecretStr | None = None
+    ai_openai_base_url: str | None = None
+    ai_mock_provider: bool | None = None
+
     @property
     def allowed_hosts(self) -> list[str]:
         return _split(self.django_allowed_hosts)
@@ -87,8 +104,17 @@ class CoreSettings(BaseSettings):
     def cors_origins(self) -> list[str]:
         return _split(self.cors_allowed_origins)
 
+    @property
+    def mock_provider_enabled(self) -> bool:
+        """The mock embedding provider: development and test only, as in Runtime."""
+        if self.ai_mock_provider is None:
+            return self.nexa_env in ("development", "test")
+        return self.ai_mock_provider
+
     @model_validator(mode="after")
     def _refuse_unsafe_deployments(self) -> Self:
+        if self.ai_mock_provider and self.nexa_env not in ("development", "test"):
+            raise ValueError("AI_MOCK_PROVIDER may only be enabled in development and test")
         if self.nexa_env in ("staging", "production"):
             if self.django_debug:
                 raise ValueError("DJANGO_DEBUG must be false outside development")

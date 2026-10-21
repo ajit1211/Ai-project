@@ -111,7 +111,11 @@ def dispatch_indexing(document_id: UUID, generation: int) -> None:
 
 
 def forget_index(document: Document) -> None:
-    """Remove a document's chunks and index state (inside the caller's transaction)."""
+    """Remove a document's chunks, vectors and index state (inside the caller's
+    transaction)."""
+    from nexa_core.documents.embedding import forget_embeddings
+
+    forget_embeddings(document)
     DocumentChunk.objects.filter(document=document).delete()
     DocumentIndex.objects.filter(document=document).delete()
 
@@ -286,6 +290,11 @@ def _replace_chunks(
         index.finished_at = now
         index.indexed_at = now
         index.save()
+        # Semantic index (Phase 09): embed the new chunks once this commits; unchanged chunks
+        # keep their vectors. Does nothing where embedding is unavailable.
+        from nexa_core.documents.embedding import request_embedding
+
+        request_embedding(document)
     log.info(
         "documents.indexing.completed",
         chunks=len(chunks),

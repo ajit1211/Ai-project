@@ -544,7 +544,13 @@ class TestWorker:
             updated_at=timezone.now() - timedelta(days=1)
         )
         counts = purge_documents()
-        assert counts == {"files_removed": 0, "purged": 1, "stalled": 1, "indexes_stalled": 0}
+        assert counts == {
+            "files_removed": 0,
+            "purged": 1,
+            "stalled": 1,
+            "indexes_stalled": 0,
+            "embeddings_stalled": 0,
+        }
         assert not Document.objects.filter(id=gone["id"]).exists()
         stalled = Document.objects.get(id=stuck["id"])
         assert (stalled.status, stalled.error_code) == ("failed", "timeout")

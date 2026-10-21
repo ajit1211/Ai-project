@@ -17,7 +17,7 @@ import asyncio
 import time
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -26,6 +26,10 @@ from sqlalchemy import and_, insert, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from nexa_ai.embeddings import Embedder, EmbeddingModel, Embeddings
+from nexa_ai.errors import AIError
+from nexa_ai.gateway import UsageRecord, UsageSink
+from nexa_ai.types import Feature
 from nexa_common.access import Principal, ResourceRef, Visibility, can, require
 from nexa_common.errors import FieldError, NotFound, ValidationFailed
 from nexa_common.ids import new_id
@@ -40,6 +44,12 @@ from nexa_runtime.rag.errors import (
     RetrievalFailed,
 )
 from nexa_runtime.rag.evidence import CitationCheck, Evidence, build_evidence
+from nexa_runtime.rag.fusion import (
+    NoReranker,
+    Reranker,
+    reciprocal_rank_fusion,
+    rerank_safely,
+)
 from nexa_runtime.rag.retrieval import (
     DocumentFilter,
     LexicalRetriever,
@@ -56,6 +66,7 @@ from nexa_runtime.rag.schemas import (
     GroundingScopeKind,
     SourceOut,
 )
+from nexa_runtime.rag.vector import SemanticCatalog, VectorRetriever, count_semantic_ready
 from nexa_runtime.ratelimit import Limiter
 
 log = get_logger("nexa.runtime.rag")
@@ -69,6 +80,8 @@ class Scope:
     document_ids: tuple[UUID, ...] = ()
     team_id: UUID | None = None
     max_sources: int = 6
+    # Phase 09: "auto" (the deployment's default), "lexical", "semantic" or "hybrid".
+    retrieval_mode: str = "auto"
 
     def record(self) -> dict[str, Any]:
         """What is stored on the reply when it is created (`messages.grounding`)."""
@@ -78,6 +91,7 @@ class Scope:
             "document_ids": [str(i) for i in self.document_ids],
             "team_id": str(self.team_id) if self.team_id else None,
             "max_sources": self.max_sources,
+            "retrieval_requested": self.retrieval_mode,
             "outcome": "pending",
         }
 
@@ -94,6 +108,9 @@ class Scope:
             team_id=UUID(record["team_id"]) if kind == "team" and record.get("team_id") else None,
             all_documents=kind == "library",
             max_sources=_clamp_sources(record.get("max_sources")),
+            retrieval_mode=record.get("retrieval_requested")
+            if record.get("retrieval_requested") in RETRIEVAL_MODES
+            else "auto",
         )
 
 
@@ -108,6 +125,9 @@ class Grounded:
     searched_documents: int
     retrieval_ms: int
     strategy: str
+    # Phase 09: the retrieval that actually ran, and why it differs from the request, if it does.
+    retrieval_mode: str = "lexical"
+    fallback: str | None = None
 
     def record(self, status: str, check: CitationCheck | None) -> dict[str, Any]:
         """The reply's grounding record once it has finished."""
@@ -130,6 +150,8 @@ class Grounded:
             "invalid_citations": list(check.invalid) if check else [],
             "retrieval_ms": self.retrieval_ms,
             "strategy": self.strategy,
+            "retrieval_mode": self.retrieval_mode,
+            "fallback": self.fallback,
         }
 
 
@@ -146,11 +168,19 @@ class RagEngine:
         settings: RuntimeSettings,
         limiter: Limiter | None = None,
         retriever: Retriever | None = None,
+        embedder: Embedder | None = None,
+        usage: UsageSink | None = None,
+        reranker: Reranker | None = None,
     ) -> None:
         self._engine = engine
         self._settings = settings
         self._limiter = limiter or Limiter(None)
         self._retriever: Retriever = retriever or LexicalRetriever()
+        self._embedder = embedder or Embedder({})
+        self.semantic = SemanticCatalog(engine, settings, self._embedder)
+        self._vector = VectorRetriever(ef_search=settings.rag_hnsw_ef_search)
+        self._usage = usage
+        self._reranker: Reranker = reranker or NoReranker()
 
     @property
     def strategy(self) -> str:
@@ -198,6 +228,7 @@ class RagEngine:
             1, min(request.max_sources or settings.rag_top_k, settings.rag_max_top_k, MAX_SOURCES)
         )
         organization_id = _organization(principal)
+        mode = request.retrieval_mode
 
         if request.document_ids:
             ids = tuple(dict.fromkeys(request.document_ids))
@@ -224,7 +255,9 @@ class RagEngine:
                         for document_id in not_ready
                     ]
                 )
-            return Scope("documents", document_ids=ids, max_sources=max_sources)
+            return Scope(
+                "documents", document_ids=ids, max_sources=max_sources, retrieval_mode=mode
+            )
 
         if request.team_id is not None:
             allowed = request.team_id in principal.team_ids or principal.has("documents.manage_all")
@@ -232,9 +265,11 @@ class RagEngine:
                 allowed = await self._read(conn, _team_exists, organization_id, request.team_id)
             if not allowed:
                 raise DocumentUnavailable("The selected team is not available.")
-            return Scope("team", team_id=request.team_id, max_sources=max_sources)
+            return Scope(
+                "team", team_id=request.team_id, max_sources=max_sources, retrieval_mode=mode
+            )
 
-        return Scope("library", max_sources=max_sources)
+        return Scope("library", max_sources=max_sources, retrieval_mode=mode)
 
     async def _read(self, conn: AsyncConnection | None, query: Any, *args: Any) -> Any:
         """Run a lookup on the caller's connection when it has one (a caller holding a
@@ -256,36 +291,102 @@ class RagEngine:
 
     # --- Finding evidence ------------------------------------------------------------------------
 
-    async def retrieve(self, principal: Principal, scope: Scope, *, question: str) -> Grounded:
+    async def retrieve(
+        self,
+        principal: Principal,
+        scope: Scope,
+        *,
+        question: str,
+        request_id: str | None = None,
+    ) -> Grounded:
+        """Find the evidence for one question with the requested (or default) retrieval:
+        lexical, semantic, or both fused by RRF. A semantic side that cannot run falls back to
+        lexical retrieval, and the record says so (`fallback`)."""
         settings = self._settings
         terms = query_terms(question)
         documents = self.filter_for(principal, scope)
-        timeout_ms = int(settings.rag_retrieval_timeout_ms)
         started = time.perf_counter()
+        semantic = await self.semantic.status()
+        lexical_on, semantic_on, fallback = _methods(
+            scope.retrieval_mode, settings.rag_retrieval_mode, semantic.available, semantic.reason
+        )
+        vector: list[float] | None = None
+        embed_ms: int | None = None
+        if semantic_on and semantic.model is not None:
+            vector, embed_ms = await self._embed_question(
+                principal, question, semantic.model, request_id
+            )
+            if vector is None:
+                semantic_on, lexical_on, fallback = False, True, "query_embedding_failed"
+        timeout_ms = int(settings.rag_retrieval_timeout_ms)
+        lexical: list[Passage] = []
+        similar: list[Passage] = []
+        semantic_documents = 0
+        vector_failed = False
+        searched = 0
         try:
             async with asyncio.timeout(timeout_ms / 1000 + 1):
                 async with self._engine.connect() as conn, conn.begin():
                     # A runaway query is stopped by the database, not only abandoned here.
                     await conn.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
                     searched = await count_searchable(conn, documents)
-                    candidates: list[Passage] = []
-                    if terms and searched:
-                        candidates = await self._retriever.search(
-                            conn,
-                            RetrievalQuery(
-                                text=question,
-                                terms=terms,
-                                scope=documents,
-                                limit=max(settings.rag_candidates, scope.max_sources),
-                                min_matched_terms=min(settings.rag_min_matched_terms, len(terms)),
-                            ),
-                        )
+                    query = RetrievalQuery(
+                        text=question,
+                        terms=terms,
+                        scope=documents,
+                        limit=max(settings.rag_candidates, scope.max_sources),
+                        min_matched_terms=min(settings.rag_min_matched_terms, max(1, len(terms))),
+                    )
+                    if lexical_on and terms and searched:
+                        lexical = await self._retriever.search(conn, query)
+                    if (
+                        semantic_on
+                        and vector is not None
+                        and semantic.model is not None
+                        and searched
+                    ):
+                        try:
+                            # A savepoint: a failed vector query leaves the lexical results usable.
+                            async with conn.begin_nested():
+                                semantic_query = replace(
+                                    query,
+                                    vector=vector,
+                                    model=semantic.model,
+                                    limit=max(settings.rag_vector_candidates, scope.max_sources),
+                                )
+                                semantic_documents = await count_semantic_ready(
+                                    conn, semantic_query, semantic.model
+                                )
+                                similar = await self._vector.search(conn, semantic_query)
+                        except SQLAlchemyError as exc:
+                            log.error("rag.vector_search.failed", error=type(exc).__name__)
+                            vector_failed, semantic_on = True, False
+                            fallback = "vector_search_failed"
+                            if not lexical_on and terms:
+                                lexical_on = True
+                                lexical = await self._retriever.search(conn, query)
         except (TimeoutError, SQLAlchemyError) as exc:
             log.error("rag.retrieval.failed", scope=scope.kind, error=type(exc).__name__)
             raise RetrievalFailed from exc
+        if lexical_on and semantic_on:
+            mode = "hybrid"
+            candidates = reciprocal_rank_fusion(
+                {"lexical": lexical, "semantic": similar}, k=settings.rag_rrf_k
+            )
+            strategy = f"rrf(k={settings.rag_rrf_k}):{self._retriever.name}+{self._vector.name}"
+        elif semantic_on:
+            mode, candidates, strategy = "semantic", similar, self._vector.name
+        else:
+            mode, candidates, strategy = "lexical", lexical, self._retriever.name
         distinct = drop_near_duplicates(candidates)
+        ordered, reranked = await rerank_safely(
+            self._reranker,
+            question,
+            distinct[: max(settings.rag_candidates, scope.max_sources)],
+            timeout_seconds=settings.rag_query_embedding_timeout_seconds,
+        )
         evidence = build_evidence(
-            distinct[: scope.max_sources],
+            ordered[: scope.max_sources],
             budget_tokens=settings.rag_context_max_tokens,
             max_passage_chars=settings.rag_passage_max_chars,
         )
@@ -293,15 +394,24 @@ class RagEngine:
         log.info(
             "rag.retrieval.completed",
             scope=scope.kind,
+            requested=scope.retrieval_mode,
+            mode=mode,
+            fallback=fallback,
             terms=len(terms),
             searched_documents=searched,
-            candidates=len(candidates),
+            semantic_documents=semantic_documents,
+            lexical_candidates=len(lexical),
+            semantic_candidates=len(similar),
+            vector_failed=vector_failed,
+            query_embedding_ms=embed_ms,
+            embedding_model=semantic.model.key if mode != "lexical" and semantic.model else None,
             near_duplicates=len(candidates) - len(distinct),
+            reranked=reranked,
             supplied=len(evidence.passages),
             dropped_for_budget=evidence.dropped,
             evidence_tokens=evidence.estimated_tokens,
             retrieval_ms=retrieval_ms,
-            strategy=self._retriever.name,
+            strategy=strategy,
         )
         return Grounded(
             scope=scope,
@@ -310,8 +420,83 @@ class RagEngine:
             retrieved=len(distinct),
             searched_documents=searched,
             retrieval_ms=retrieval_ms,
-            strategy=self._retriever.name,
+            strategy=strategy,
+            retrieval_mode=mode,
+            fallback=fallback,
         )
+
+    async def _embed_question(
+        self,
+        principal: Principal,
+        question: str,
+        model: EmbeddingModel,
+        request_id: str | None,
+    ) -> tuple[list[float] | None, int]:
+        """The question's vector, or None when it cannot be made now (the caller falls back to
+        lexical retrieval). Only the question is sent to the provider, never document text."""
+        started = time.perf_counter()
+        try:
+            async with asyncio.timeout(self._settings.rag_query_embedding_timeout_seconds + 1):
+                result = await self._embedder.embed_query(question, model)
+        except (AIError, TimeoutError) as exc:
+            elapsed = _ms(started)
+            code = exc.error_code.value if isinstance(exc, AIError) else "AI_TIMEOUT"
+            log.warning("rag.query_embedding.failed", error_code=code, model=model.key)
+            await self._record_usage(principal, model, None, request_id, elapsed, error_code=code)
+            return None, elapsed
+        elapsed = _ms(started)
+        await self._record_usage(principal, model, result, request_id, elapsed)
+        return result.vectors[0], elapsed
+
+    async def _record_usage(
+        self,
+        principal: Principal,
+        model: EmbeddingModel,
+        result: Embeddings | None,
+        request_id: str | None,
+        latency_ms: int,
+        *,
+        error_code: str | None = None,
+    ) -> None:
+        """One usage-ledger row per question embedding (metadata only, never the question)."""
+        if self._usage is None or principal.organization_id is None:
+            return
+        tokens = result.input_tokens if result is not None else 0
+        record = UsageRecord(
+            id=new_id(),
+            created_at=datetime.now(UTC),
+            organization_id=principal.organization_id,
+            user_id=principal.user_id,
+            actor_type=principal.actor_type,
+            request_id=request_id,
+            source_type="rag_query",
+            source_id=None,
+            feature=Feature.EMBEDDING.value,
+            alias=model.key,
+            provider=model.provider,
+            provider_model=model.provider_model,
+            model_id=None,
+            price_id=None,
+            input_tokens=tokens,
+            output_tokens=0,
+            cached_input_tokens=0,
+            cache_write_input_tokens=0,
+            total_tokens=tokens,
+            cost_micros=result.cost_micros if result is not None else None,
+            latency_ms=latency_ms,
+            ttft_ms=None,
+            status="success" if result is not None else "error",
+            error_code=error_code,
+            attempts=result.requests if result is not None else 1,
+            fallback_used=False,
+            stream=False,
+            structured=False,
+            usage_source=result.usage_source if result is not None else "estimated",
+        )
+        try:
+            await self._usage.record(record)
+        except Exception as exc:
+            log.error("rag.query_embedding.usage_failed", error=type(exc).__name__)
 
     # --- Sources ----------------------------------------------------------------------------------
 
@@ -550,3 +735,28 @@ def _organization(principal: Principal) -> UUID:
     if principal.organization_id is None:  # pragma: no cover - CurrentPrincipal guarantees it
         raise NotFound
     return principal.organization_id
+
+
+RETRIEVAL_MODES = ("auto", "lexical", "semantic", "hybrid")
+
+
+def _methods(
+    requested: str, default: str, semantic_available: bool, semantic_reason: str
+) -> tuple[bool, bool, str | None]:
+    """(lexical, semantic, fallback) for a requested mode. "auto" follows the deployment's
+    default and quietly uses lexical retrieval where semantic search does not run here; an
+    explicit request for semantic or hybrid retrieval that cannot run is recorded as a
+    fallback (`semantic_<reason>`)."""
+    mode = default if requested == "auto" else requested
+    if mode == "lexical":
+        return True, False, None
+    if not semantic_available:
+        fallback = None if requested == "auto" else f"semantic_{semantic_reason}"
+        return True, False, fallback
+    if mode == "semantic":
+        return False, True, None
+    return True, True, None
+
+
+def _ms(started: float) -> int:
+    return max(0, int((time.perf_counter() - started) * 1000))

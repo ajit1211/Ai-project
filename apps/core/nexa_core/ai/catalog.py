@@ -20,7 +20,13 @@ from typing import Any
 
 from django.db import transaction
 
-from nexa_core.ai.models import AIAliasTarget, AIModel, AIModelAlias, AIModelPrice
+from nexa_core.ai.models import (
+    AIAliasTarget,
+    AIEmbeddingModel,
+    AIModel,
+    AIModelAlias,
+    AIModelPrice,
+)
 
 PRICES_EFFECTIVE_FROM = datetime(2026, 10, 8, tzinfo=UTC)
 PRICE_SOURCE = "Provider pricing pages, 2026-10-08"
@@ -106,6 +112,74 @@ ALIASES: tuple[SeedAlias, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class SeedEmbeddingModel:
+    key: str
+    display_name: str
+    provider: str
+    provider_model: str
+    dimensions: int
+    version: str = ""
+    max_batch_size: int = 64
+    max_input_tokens: int = 8_191
+    relevance_floor: float | None = None
+    is_default: bool = False
+    notes: str = ""
+
+
+# Phase 09 (docs/architecture/vector-search.md). No prices are seeded: none was verified for
+# this release, and costs are never invented; an operator records the current price in the
+# admin. The relevance floors are heuristics measured on the evaluation set (see the doc),
+# not confidences.
+EMBEDDING_MODELS: tuple[SeedEmbeddingModel, ...] = (
+    SeedEmbeddingModel(
+        "nexa-embed-small",
+        "NEXA Embed Small",
+        "openai",
+        "text-embedding-3-small",
+        1536,
+        max_batch_size=128,
+        relevance_floor=0.2,
+        is_default=True,
+        notes="Default. Needs AI_OPENAI_API_KEY; document text is sent to OpenAI.",
+    ),
+    SeedEmbeddingModel(
+        "nexa-embed-mock",
+        "Mock embeddings (development and tests)",
+        "mock",
+        "mock-embed-hash",
+        256,
+        version="hash-v1",
+        max_batch_size=64,
+        relevance_floor=0.15,
+        notes="Deterministic feature hashing: lexical, not semantic. Refused outside "
+        "development and test.",
+    ),
+)
+
+
+def sync_embedding_models() -> None:
+    """Create missing embedding models; never change existing rows (operators edit them)."""
+    has_default = AIEmbeddingModel.objects.filter(is_default=True).exists()
+    for seed in EMBEDDING_MODELS:
+        AIEmbeddingModel.objects.get_or_create(
+            key=seed.key,
+            defaults={
+                "display_name": seed.display_name,
+                "provider": seed.provider,
+                "provider_model": seed.provider_model,
+                "dimensions": seed.dimensions,
+                "version": seed.version,
+                "max_batch_size": seed.max_batch_size,
+                "max_input_tokens": seed.max_input_tokens,
+                "relevance_floor": seed.relevance_floor,
+                "is_default": seed.is_default and not has_default,
+                "use_cases": ["documents", "queries"],
+                "notes": seed.notes,
+            },
+        )
+
+
 def _micros(usd: str) -> int:
     return int((Decimal(usd) * 1_000_000).to_integral_value())
 
@@ -163,5 +237,9 @@ def sync_after_migrate(**_: Any) -> None:
     from django.db import connection
 
     # Also fires when the app is migrated back to zero, when the tables no longer exist.
-    if "ai_models" in connection.introspection.table_names():
+    tables = connection.introspection.table_names()
+    if "ai_models" in tables:
         sync_ai_catalog()
+    if "ai_embedding_models" in tables:
+        with transaction.atomic():
+            sync_embedding_models()
