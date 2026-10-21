@@ -44,6 +44,13 @@ NEXA_DOCUMENTS_MAX_ATTEMPTS = env.documents_max_attempts
 NEXA_DOCUMENTS_UPLOADS_PER_HOUR = env.documents_uploads_per_hour
 NEXA_DOCUMENTS_ORG_STORAGE_BYTES = env.documents_org_storage_bytes
 NEXA_DOCUMENTS_PURGE_AFTER_DAYS = env.documents_purge_after_days
+# The search index for document-grounded answers (docs/architecture/rag.md)
+NEXA_RAG_CHUNK_TARGET_CHARS = env.rag_chunk_target_chars
+NEXA_RAG_CHUNK_MAX_CHARS = env.rag_chunk_max_chars
+NEXA_RAG_CHUNK_OVERLAP_CHARS = env.rag_chunk_overlap_chars
+NEXA_RAG_MAX_CHUNKS_PER_DOCUMENT = env.rag_max_chunks_per_document
+NEXA_RAG_INDEX_TIMEOUT_SECONDS = env.rag_index_timeout_seconds
+NEXA_RAG_INDEX_REQUESTS_PER_HOUR = env.rag_index_requests_per_hour
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -144,6 +151,9 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
     "EXCEPTION_HANDLER": "nexa_core.exceptions.envelope_exception_handler",
     "UNAUTHENTICATED_USER": None,
+    # JSON is the only renderer, so `?format=` selects nothing; switched off so it stays free
+    # for filters (the document library filters on `format`).
+    "URL_FORMAT_OVERRIDE": None,
 }
 
 # Celery (doc 21.3): at-least-once delivery, one task prefetched at a time, results kept in
@@ -167,6 +177,7 @@ CELERY_TASK_ROUTES = {
     # never delays an email (doc 21.2). Its tasks carry their own time limits.
     "core.documents.process": {"queue": "core.documents"},
     "core.documents.purge": {"queue": "core.documents"},
+    "core.documents.index": {"queue": "core.documents"},
 }
 # Uploads above this size are streamed to a temporary file instead of memory.
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024

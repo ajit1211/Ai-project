@@ -30,4 +30,14 @@ urlpatterns = [
         views.DocumentRetryView.as_view(),
         name="document-retry",
     ),
+    path(
+        "documents/<uuid:document_id>/index/",
+        views.DocumentIndexView.as_view(),
+        name="document-index",
+    ),
+    path(
+        "documents/<uuid:document_id>/index-status/",
+        views.DocumentIndexStatusView.as_view(),
+        name="document-index-status",
+    ),
 ]

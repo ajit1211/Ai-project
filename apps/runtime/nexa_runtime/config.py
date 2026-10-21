@@ -99,6 +99,22 @@ class RuntimeSettings(BaseSettings):
     memory_candidate_ttl_days: int = 30
     memory_conversation_ttl_days: int = 30
 
+    # Document-grounded answers (docs/architecture/rag.md). Token figures are estimates
+    # (three characters per token); a request may ask for fewer sources, never more.
+    rag_enabled: bool = True
+    rag_max_documents: int = 20
+    rag_top_k: int = 6
+    rag_max_top_k: int = 12
+    rag_candidates: int = 40
+    rag_context_max_tokens: int = 3_000
+    rag_passage_max_chars: int = 2_400
+    rag_min_matched_terms: int = 1
+    rag_retrieval_timeout_ms: int = 5_000
+    rag_max_question_chars: int = 4_000
+    rag_queries_per_minute: int = 20
+    rag_excerpt_chars: int = 400
+    rag_source_detail_chars: int = 4_000
+
     @property
     def async_database_url(self) -> URL:
         return make_url(self.runtime_database_url).set(drivername="postgresql+asyncpg")

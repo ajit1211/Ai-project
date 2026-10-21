@@ -11,7 +11,8 @@
  *
  * `api()` is the JSON envelope call every page uses. `authorizedFetch()` is the same
  * token-and-refresh behaviour around a raw `fetch`, for responses that are not JSON
- * envelopes (the AI event stream).
+ * envelopes (the AI event stream, document downloads). Document uploads use XHR for its
+ * progress events and share the 401 handling through `recoverFromUnauthorized()`.
  */
 
 import type { TokenPayload } from "./types";
@@ -186,6 +187,20 @@ function sendRequest(path: string, init: RequestInit, auth: boolean): Promise<Re
 }
 
 /**
+ * What to do after a 401 whose body was `payload`: refresh the token, unless the session was
+ * revoked. True when the request may be replayed with the new token; false when the session
+ * is over (the token is cleared and `onSessionLost` is told). Requests that do not go through
+ * `authorizedFetch` (the XHR uploads) use this to behave the same way.
+ */
+export async function recoverFromUnauthorized(payload: unknown): Promise<boolean> {
+  const code = isEnvelope(payload) && !payload.success ? payload.error.code : "";
+  if (code !== "AUTH_SESSION_REVOKED" && (await refreshSession())) return true;
+  accessToken = null;
+  sessionLostHandler?.();
+  return false;
+}
+
+/**
  * `fetch` with the access token attached. A 401 (other than a revoked session) refreshes
  * the token once and replays the request; a failed refresh ends the session. The response
  * is returned as is, so callers decide how to read it (JSON envelope, event stream, ...).
@@ -197,13 +212,7 @@ export async function authorizedFetch(path: string, init: RequestInit = {}): Pro
       .clone()
       .json()
       .catch(() => null);
-    const code = isEnvelope(payload) && !payload.success ? payload.error.code : "";
-    if (code !== "AUTH_SESSION_REVOKED" && (await refreshSession())) {
-      response = await sendRequest(path, init, true);
-    } else {
-      accessToken = null;
-      sessionLostHandler?.();
-    }
+    if (await recoverFromUnauthorized(payload)) response = await sendRequest(path, init, true);
   }
   return response;
 }

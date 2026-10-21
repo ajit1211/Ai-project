@@ -179,6 +179,9 @@ class MockProvider:
             return json.dumps(example_for_schema(fmt.json_schema)), FinishReason.STOP
 
         visible = _last_user_text(call)
+        sources = _evidence(call)
+        if sources:
+            return _grounded_answer(sources, visible, prompt), FinishReason.STOP
         if "[[length]]" in prompt:
             words = _base_answer(call, visible).split()
             limit = max(1, min(len(words), call.max_output_tokens))
@@ -191,6 +194,72 @@ def _last_user_text(call: ProviderCall) -> str:
         if message.role is Role.USER:
             return message.text
     return ""
+
+
+# --- Document-grounded answers (nexa_runtime.rag) ---------------------------------------------
+#
+# When the chat engine supplies retrieved passages (a system message with <source id="S1">
+# blocks), the mock answers like a careful model would: it quotes the sentence that shares the
+# most words with the question, cites the passage it came from, and says the documents do not
+# contain the answer when no passage shares a word with it. Two control phrases misbehave on
+# purpose so citation validation can be tested: [[cite:S99]] adds a citation to a passage that
+# was never supplied, and [[no_cite]] answers without citing anything.
+
+_SOURCE = re.compile(r'<source id="(S\d{1,3})"[^>]*>\n?(.*?)\n?</source>', re.DOTALL)
+_WORDS = re.compile(r"[a-z0-9]{3,}")
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+_CITE = re.compile(r"\[\[cite:(S\d{1,3})\]\]")
+_STOP_WORD_TEXT = (
+    "the and for are was were what which who whom whose when where why how does did has have "
+    "had with from into about this that these those there their they them then than can could "
+    "should would will shall may might must not but any all our your you yours its"
+)
+_STOP_WORDS = frozenset(_STOP_WORD_TEXT.split())
+NO_EVIDENCE_ANSWER = (
+    "The selected documents do not contain enough information to answer this question."
+)
+
+
+def _evidence(call: ProviderCall) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    for message in call.request.messages:
+        if message.role is Role.SYSTEM and "<sources>" in message.text:
+            found.extend((m.group(1), m.group(2)) for m in _SOURCE.finditer(message.text))
+    return found
+
+
+def _terms(text: str) -> set[str]:
+    """Content words, crudely stemmed ("refunds" and "refund" match), as the search does."""
+    return {_stem(word) for word in _WORDS.findall(text.lower()) if word not in _STOP_WORDS}
+
+
+def _stem(word: str) -> str:
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _grounded_answer(sources: list[tuple[str, str]], question: str, prompt: str) -> str:
+    wanted = _terms(_CITE.sub("", question))
+    scored = sorted(
+        ((len(wanted & _terms(body)), index) for index, (_, body) in enumerate(sources)),
+        key=lambda pair: (-pair[0], pair[1]),
+    )
+    if not scored or scored[0][0] == 0:
+        return NO_EVIDENCE_ANSWER
+    label, body = sources[scored[0][1]]
+    sentences = [s.strip() for s in _SENTENCE.split(" ".join(body.split())) if s.strip()]
+    best = max(sentences, key=lambda s: (len(wanted & _terms(s)), -sentences.index(s)))
+    if "[[no_cite]]" in prompt:
+        return f"According to the selected documents: {best}"
+    answer = f"According to the selected documents: {best} [{label}]"
+    others = [sources[i][0] for score, i in scored[1:] if score > 0][:1]
+    if others:
+        answer += f" See also [{others[0]}]."
+    for fabricated in _CITE.findall(prompt):
+        answer += f" [{fabricated}]"
+    return answer
 
 
 # --- The memory engine's schemas -------------------------------------------------------------

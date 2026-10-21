@@ -8,7 +8,9 @@ The task reads everything by id, claims the attempt with a row lock so a redeliv
 duplicated task does nothing, writes outcomes to the document and its attempt (there is no
 result backend), and verifies the document is still there before writing. The worker uses
 the organization and owner stored on the document; the uploader's session is not involved.
-`core.documents.purge` is the retention task; it is scheduled by operations.
+A completed extraction queues `core.documents.index` (indexing.py), which builds the search
+index used for document-grounded answers. `core.documents.purge` is the retention task; it
+is scheduled by operations.
 """
 
 import tempfile
@@ -26,7 +28,7 @@ from django.utils import timezone
 
 from nexa_common.context import bind_request_context
 from nexa_common.logs import get_logger
-from nexa_core.documents import lifecycle
+from nexa_core.documents import indexing, lifecycle
 from nexa_core.documents.extraction import (
     PARSER_VERSION,
     Extraction,
@@ -154,6 +156,8 @@ def run_processing(document_id: UUID, ingestion_id: UUID) -> str:
         ingestion.duration_ms = duration_ms
         ingestion.finished_at = now
         ingestion.save()
+        if outcome == lifecycle.COMPLETED:
+            indexing.request_indexing(document)  # queued once this transaction commits
 
     log.info(
         "documents.processing.completed",
@@ -223,7 +227,8 @@ def purge_documents() -> dict[str, int]:
 
     1. remove the bytes of deleted documents whose removal failed earlier;
     2. hard-delete deleted documents once their bytes are gone and the grace period passed;
-    3. mark attempts that stalled (a worker died mid-way) as failed, so they can be retried.
+    3. mark attempts that stalled (a worker died mid-way) as failed, so they can be retried;
+    4. the same for indexing runs.
     """
     now = timezone.now()
     files_removed = sum(
@@ -234,9 +239,11 @@ def purge_documents() -> dict[str, int]:
         if remove_file(document)
     )
     grace = timedelta(days=settings.NEXA_DOCUMENTS_PURGE_AFTER_DAYS)
-    purged, _ = Document.objects.filter(
+    # `delete()` counts the cascaded rows too (attempts, text): report documents only.
+    _, deleted = Document.objects.filter(
         deleted_at__lt=now - grace, file_deleted_at__isnull=False
     ).delete()
+    purged = deleted.get(Document._meta.label, 0)
     stale_cutoff = now - 3 * timedelta(seconds=TIMEOUT)
     stalled = 0
     for document in Document.objects.filter(
@@ -259,7 +266,12 @@ def purge_documents() -> dict[str, int]:
                 finished_at=now,
             )
             stalled += 1
-    counts: dict[str, Any] = {"files_removed": files_removed, "purged": purged, "stalled": stalled}
+    counts: dict[str, Any] = {
+        "files_removed": files_removed,
+        "purged": purged,
+        "stalled": stalled,
+        "indexes_stalled": indexing.fail_stalled(now),
+    }
     log.info("documents.purge.completed", **counts)
     return counts
 
@@ -267,3 +279,17 @@ def purge_documents() -> dict[str, int]:
 @shared_task(name="core.documents.purge")
 def purge() -> dict[str, int]:
     return purge_documents()
+
+
+# --- Search index (Phase 08) -----------------------------------------------------------------
+
+INDEX_TIMEOUT = indexing.timeout_seconds()
+
+
+@shared_task(
+    name="core.documents.index",
+    soft_time_limit=max(30, INDEX_TIMEOUT - 30),
+    time_limit=INDEX_TIMEOUT,
+)
+def index_document(document_id: str, generation: int) -> str:
+    return indexing.run_indexing(UUID(document_id), int(generation))

@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from nexa_ai.cost import micros_to_usd
+from nexa_runtime.rag.schemas import GroundingOut, GroundingRequest, SourceOut
 
 MAX_CONTENT_CHARS = 100_000
 _MODEL_PATTERN = r"^[A-Za-z0-9_-]{1,48}$"
@@ -47,6 +48,8 @@ class SendMessage(BaseModel):
     content: NulFree = Field(min_length=1, max_length=MAX_CONTENT_CHARS)
     client_message_id: str = Field(default="", pattern=_CLIENT_ID_PATTERN)
     model: str = Field(default="", pattern=_MODEL_PATTERN)
+    # Answer from the user's documents (Phase 08); absent for an ordinary reply.
+    grounding: GroundingRequest | None = None
 
 
 class Regenerate(BaseModel):
@@ -102,6 +105,10 @@ class MessageOut(BaseModel):
     request_id: str
     created_at: datetime
     completed_at: datetime | None
+    # Document-grounded replies only: the scope and outcome, and the passages given to the
+    # model (re-authorized whenever messages are read).
+    grounding: GroundingOut | None = None
+    sources: list[SourceOut] = Field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: Any) -> "MessageOut":
@@ -126,6 +133,7 @@ class MessageOut(BaseModel):
             request_id=row.request_id,
             created_at=row.created_at,
             completed_at=row.completed_at,
+            grounding=GroundingOut.from_record(getattr(row, "grounding", None)),
         )
 
 

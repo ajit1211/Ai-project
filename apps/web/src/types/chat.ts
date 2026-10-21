@@ -28,6 +28,67 @@ export type MessageRole = "user" | "assistant";
 /** Always `completed` for user messages; any of these for assistant messages. */
 export type MessageStatus = "pending" | "streaming" | "completed" | "failed" | "cancelled";
 
+/**
+ * How a grounded reply went. "uncited": answered without citing the documents (unverified);
+ * "no_evidence": nothing relevant was found, so the model was not asked.
+ */
+export type GroundingOutcome = "pending" | "answered" | "uncited" | "no_evidence" | "failed" | "cancelled";
+
+/** How a reply was answered from documents (null on ordinary messages). */
+export interface Grounding {
+  mode: "documents";
+  scope: "documents" | "team" | "library";
+  document_ids: string[];
+  team_id: string | null;
+  outcome: GroundingOutcome;
+  searched_documents: number;
+  retrieved: number;
+  supplied: number;
+  cited: number;
+  /** Citation labels in the answer that match none of its sources. */
+  invalid_citations: string[];
+  retrieval_ms: number | null;
+  strategy: string;
+}
+
+/**
+ * A passage given to the model. When `available` is false (its document was deleted or is no
+ * longer shared) only `label`, `rank` and `cited` are set. The excerpt is untrusted text.
+ */
+export interface Source {
+  /** "S1", "S2", ...: what the answer cites as [S1]. */
+  label: string;
+  rank: number;
+  cited: boolean;
+  available: boolean;
+  score: number | null;
+  document_id: string | null;
+  chunk_id: string | null;
+  document_title: string | null;
+  filename: string | null;
+  format: string | null;
+  /** A heading path, when the document has headings. */
+  section: string | null;
+  page_start: number | null;
+  page_end: number | null;
+  row_start: number | null;
+  row_end: number | null;
+  char_start: number | null;
+  char_end: number | null;
+  excerpt: string | null;
+  excerpt_truncated: boolean;
+}
+
+/** What to answer from. Exactly one of the three scopes. */
+export type GroundingRequest = (
+  | { document_ids: string[] }
+  | { team_id: string }
+  | { all_documents: true }
+) & {
+  /** 1 to 12. */
+  max_sources?: number;
+};
+
 export interface Message {
   id: string;
   conversation_id: string;
@@ -54,6 +115,10 @@ export interface Message {
   request_id: string;
   created_at: string;
   completed_at: string | null;
+  /** How a reply was answered from documents; null (or absent) for ordinary messages. */
+  grounding?: Grounding | null;
+  /** The passages of a grounded reply; empty (or absent) for ordinary messages. */
+  sources?: Source[];
 }
 
 /** `meta` of `GET /conversations/`. */
@@ -117,6 +182,8 @@ export interface SendMessageBody {
   client_message_id?: string;
   /** Changes the conversation's model for this and later messages. */
   model?: string;
+  /** Answer from documents. Left out for ordinary chat. Grounded questions: 4 000 characters. */
+  grounding?: GroundingRequest;
 }
 
 export interface RegenerateBody {
@@ -149,6 +216,15 @@ export interface MessageStartEvent {
   user_message: Message;
   /** The reply, status `pending`. Every later event names its id. */
   assistant_message: Message;
+}
+
+/** A grounded reply only: what the search found, after `message_start` and before any text. */
+export interface SourcesEvent {
+  type: "sources";
+  message_id: string;
+  searched_documents: number;
+  /** May be empty: then a fixed "nothing found" sentence follows. */
+  sources: Source[];
 }
 
 export interface TextDeltaEvent {
@@ -191,6 +267,11 @@ export interface ChatErrorEvent {
 /** Exactly one of these ends every stream. */
 export type ChatTerminalEvent = MessageCompleteEvent | MessageCancelledEvent | ChatErrorEvent;
 
-export type ChatStreamEvent = MessageStartEvent | TextDeltaEvent | ChatUsageEvent | ChatTerminalEvent;
+export type ChatStreamEvent =
+  | MessageStartEvent
+  | SourcesEvent
+  | TextDeltaEvent
+  | ChatUsageEvent
+  | ChatTerminalEvent;
 
 export type ChatStreamEventName = ChatStreamEvent["type"];

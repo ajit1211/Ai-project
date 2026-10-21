@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 from django.conf import settings
+from django.db.models import Q
 from django.http import FileResponse, HttpResponse
 from rest_framework import serializers
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -21,6 +22,7 @@ from nexa_core.access.principal import OrganizationContext, load_organization_co
 from nexa_core.api import ok
 from nexa_core.documents import lifecycle, services
 from nexa_core.documents.extraction.sniff import EXTENSIONS
+from nexa_core.documents.indexing import index_payload
 from nexa_core.documents.models import Document
 from nexa_core.documents.serializers import (
     UpdateInput,
@@ -92,6 +94,18 @@ class DocumentCollectionView(DocumentsView):
             documents = documents.filter(team_id=_uuid("team_id", team))
         if conversation := params.get("conversation_id"):
             documents = documents.filter(conversation_id=_uuid("conversation_id", conversation))
+        if (searchable := params.get("searchable")) is not None:
+            # Documents a grounded question can use: processed and indexed at least once.
+            if searchable not in ("true", "false"):
+                raise _invalid("searchable", "Use true or false.")
+            ready = Q(
+                status=lifecycle.COMPLETED,
+                search_index__indexed_at__isnull=False,
+                search_index__chunk_count__gt=0,
+            )
+            documents = (
+                documents.filter(ready) if searchable == "true" else documents.exclude(ready)
+            )
         if query := params.get("q", "").strip():
             if "\x00" in query:
                 raise _invalid("q", "Search text cannot contain NUL characters.")
@@ -217,6 +231,26 @@ class DocumentRetryView(DocumentsView):
             message="Processing has been queued again.",
             status=202,
         )
+
+
+class DocumentIndexView(DocumentsView):
+    """Request a rebuild of the document's search index (Phase 08)."""
+
+    def post(self, request: Request, document_id: UUID) -> Response:
+        document = self.document(document_id, action="update")
+        services.request_reindex(self.context, document)
+        document = self.document(document_id)
+        return ok(
+            index_payload(document.search_index),
+            message="Indexing has been queued.",
+            status=202,
+        )
+
+
+class DocumentIndexStatusView(DocumentsView):
+    def get(self, request: Request, document_id: UUID) -> Response:
+        document = self.document(document_id)
+        return ok(document_payload(document, self.context.principal)["index"])
 
 
 def upload_limits() -> dict[str, Any]:

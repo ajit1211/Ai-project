@@ -20,6 +20,7 @@ import {
   type MessagePage,
   type RegenerateBody,
   type SendMessageBody,
+  type Source,
   type UpdateConversationBody,
 } from "../types/chat";
 import { ApiError, api } from "./client";
@@ -114,11 +115,14 @@ export async function cancelGeneration(id: string): Promise<CancelResult> {
 
 /**
  * Send a message and stream the reply. Yields the typed events of `nexa.chat.v1` in order:
- * `message_start`, then `text_delta` and `usage`, then exactly one terminal event
- * (`message_complete`, `message_cancelled` or `error`), after which the generator ends.
+ * `message_start`, then (grounded sends only) `sources`, then `text_delta` and `usage`, then
+ * exactly one terminal event (`message_complete`, `message_cancelled` or `error`), after
+ * which the generator ends. `body.grounding` answers from documents; leave it out otherwise.
  *
  * Throws `ApiError` when the send is refused before anything is stored (a JSON error
- * envelope with its real status: 404, 409 GENERATION_IN_PROGRESS, 409 CONFLICT, 422, 429),
+ * envelope with its real status: 404, 409 GENERATION_IN_PROGRESS, 409 CONFLICT, 422, 429;
+ * with grounding also 404 DOCUMENT_UNAVAILABLE, 409 DOCUMENT_NOT_INDEXED, 422
+ * RAG_INVALID_SCOPE and 503 when answers from documents are switched off),
  * `ApiError` NETWORK_ERROR when the connection closes before a terminal event, and the
  * fetch's AbortError when `signal` is aborted. Aborting, or leaving the loop early, closes
  * the stream, which also stops the reply on the server.
@@ -151,8 +155,25 @@ export function regenerate(
   return generation(`${conversationPath(id)}regenerate/`, body, control);
 }
 
+/**
+ * The passages of a grounded reply, re-authorized now, with whole passages (excerpts of up to
+ * 4 000 characters) rather than the stream's short ones.
+ */
+export async function listMessageSources(
+  conversationId: string,
+  messageId: string,
+  control: RequestControl = {},
+): Promise<Source[]> {
+  const { data } = await api<Source[]>(
+    `${conversationPath(conversationId)}messages/${encodeURIComponent(messageId)}/sources/`,
+    { signal: control.signal },
+  );
+  return data;
+}
+
 const EVENT_NAMES: ReadonlySet<string> = new Set<ChatStreamEventName>([
   "message_start",
+  "sources",
   "text_delta",
   "usage",
   "message_complete",

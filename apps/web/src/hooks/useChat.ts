@@ -1,6 +1,8 @@
 /**
  * The open conversation: its messages with "load older" paging, and sending, regenerating,
- * stopping and retrying replies.
+ * stopping and retrying replies. A send may answer from documents (`grounding`); its reply's
+ * `sources` event is shown as it streams, and a refusal about the documents can be handed to
+ * the page (`onGroundedSendRefused`). Without grounding everything works exactly as before.
  *
  * Replies are tracked per conversation. One keeps streaming when the user opens another
  * conversation, but only its own conversation shows it: its events are applied to the
@@ -30,6 +32,7 @@ import type {
   ChatErrorEvent,
   ChatStreamEvent,
   Conversation,
+  GroundingRequest,
   Message,
   MessageStartEvent,
 } from "../types/chat";
@@ -65,6 +68,12 @@ interface Run {
 export interface ChatOptions {
   /** Told whenever the hook learns something new about a conversation: title, model, activity. */
   onConversationChange?: (conversation: Conversation) => void;
+  /**
+   * A send that answers from documents was refused before anything was stored. Return true
+   * when the page shows the refusal itself (in the composer, with the text put back); the
+   * submission is then dropped instead of becoming an unsent message with Retry.
+   */
+  onGroundedSendRefused?: (conversationId: string, submission: Submission, error: ApiError) => boolean;
 }
 
 export interface ChatState {
@@ -80,8 +89,11 @@ export interface ChatState {
   /** A reply is being generated in the open conversation. */
   streaming: boolean;
   stopping: boolean;
-  /** Send to the open conversation, or to `conversationId`; false when it cannot start. */
-  send: (content: string, conversationId?: string) => boolean;
+  /**
+   * Send to the open conversation, or to `conversationId`; false when it cannot start. With
+   * `grounding` the reply answers from documents; without it, it is an ordinary message.
+   */
+  send: (content: string, conversationId?: string, grounding?: GroundingRequest) => boolean;
   regenerate: () => void;
   /** Retry the row with this key: an unsent submission is resent, a failed reply regenerated. */
   retry: (key: string) => void;
@@ -150,7 +162,7 @@ function omit<T>(record: Readonly<Record<string, T>>, key: string): Readonly<Rec
 
 export function useChat(
   conversationId: string | undefined,
-  { onConversationChange }: ChatOptions = {},
+  { onConversationChange, onGroundedSendRefused }: ChatOptions = {},
 ): ChatState {
   const [thread, setThread] = useState<Thread | null>(null);
   const [reloads, setReloads] = useState(0);
@@ -247,6 +259,7 @@ export function useChat(
         reply: null,
         text: "",
         usage: null,
+        found: null,
         stopping: false,
       },
     }));
@@ -282,7 +295,12 @@ export function useChat(
       const events = submission
         ? sendMessage(
             id,
-            { content: submission.content, client_message_id: submission.clientMessageId },
+            {
+              content: submission.content,
+              client_message_id: submission.clientMessageId,
+              // Ordinary chat sends exactly what it always did: no grounding key at all.
+              ...(submission.grounding ? { grounding: submission.grounding } : {}),
+            },
             { signal },
           )
         : regenerate(id, {}, { signal });
@@ -306,6 +324,11 @@ export function useChat(
         }
         if (start === null || replyIdOf(event) !== start.assistant_message.id) continue;
         switch (event.type) {
+          case "sources": {
+            const found = { searched: event.searched_documents, sources: event.sources };
+            patchLive((current) => ({ ...current, found }));
+            break;
+          }
           case "text_delta":
             text += event.text;
             patchLive((current) => ({ ...current, text: current.text + event.text }));
@@ -365,6 +388,14 @@ export function useChat(
         );
       } else {
         setLive((all) => omit(all, id));
+        const handled =
+          submission?.grounding !== undefined &&
+          err instanceof ApiError &&
+          onGroundedSendRefused?.(id, submission, err) === true;
+        if (handled) {
+          setAnnouncement(failure.message);
+          return;
+        }
         if (submission) setUnsent((all) => ({ ...all, [id]: { ...submission, error: failure } }));
         else setNotice({ conversationId: id, error: failure });
       }
@@ -375,12 +406,17 @@ export function useChat(
     }
   };
 
-  const send = (content: string, target: string | undefined = conversationId): boolean => {
+  const send = (
+    content: string,
+    target: string | undefined = conversationId,
+    grounding?: GroundingRequest,
+  ): boolean => {
     if (!target || runs.current.has(target) || !content.trim()) return false;
     const submission: Submission = {
       content,
       clientMessageId: newClientMessageId(),
       submittedAt: new Date().toISOString(),
+      ...(grounding ? { grounding } : {}),
     };
     // Sending is activity: the conversation moves to the top of the list right away.
     if (thread?.conversationId === target && thread.conversation) {
@@ -399,8 +435,13 @@ export function useChat(
     const failed = unsent[conversationId];
     if (failed && key === unsentKey(conversationId)) {
       // The same client_message_id: if the first attempt got through, the server replays it.
-      const { content, clientMessageId, submittedAt } = failed;
-      void generate(conversationId, { content, clientMessageId, submittedAt });
+      const { content, clientMessageId, submittedAt, grounding } = failed;
+      void generate(conversationId, {
+        content,
+        clientMessageId,
+        submittedAt,
+        ...(grounding ? { grounding } : {}),
+      });
     } else {
       void generate(conversationId, null);
     }

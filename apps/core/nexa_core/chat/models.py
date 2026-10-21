@@ -110,6 +110,9 @@ class Message(models.Model):
     request_id = models.CharField(max_length=128, blank=True)
     finish_reason = models.CharField(max_length=16, blank=True)
     error_code = models.CharField(max_length=48, blank=True)
+    # A reply grounded in the user's documents (Phase 08, docs/architecture/rag.md): the scope
+    # that was asked for and how retrieval and citation went. Null for ordinary replies.
+    grounding = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
@@ -126,6 +129,8 @@ class Message(models.Model):
                 name="messages_client_id_uniq",
             ),
             models.CheckConstraint(condition=Q(sequence__gte=1), name="messages_sequence_chk"),
+            # Target of the composite key that keeps a message's sources in its tenant.
+            models.UniqueConstraint(fields=["organization", "id"], name="messages_org_id_uniq"),
         ]
         indexes = [
             models.Index(fields=["organization", "created_at"], name="messages_org_created_idx"),
@@ -133,3 +138,43 @@ class Message(models.Model):
 
     def __str__(self) -> str:
         return f"{self.role} #{self.sequence} in {self.conversation_id}"
+
+
+class MessageSource(models.Model):
+    """A passage that was given to the model for a grounded reply, and whether the reply
+    cited it.
+
+    Only references are stored: the document and the chunk. The excerpt, page and section
+    are read from the chunk, and the document re-authorized, every time the source is shown,
+    so a deleted or no-longer-shared document stops appearing in old conversations. Runtime
+    writes these rows with the reply; deleting the message deletes them.
+    """
+
+    id = models.UUIDField(primary_key=True, default=new_id, editable=False)
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="+")
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="sources")
+    document = models.ForeignKey(
+        "documents.Document", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    # Not a foreign key: chunks are replaced when a document is re-indexed, and a citation of
+    # text that no longer exists must show as unavailable rather than disappear.
+    chunk_id = models.UUIDField()
+    label = models.CharField(max_length=8, help_text="The citation label given to the model.")
+    rank = models.PositiveSmallIntegerField(help_text="1 for the best-ranked passage.")
+    score = models.FloatField(default=0.0)
+    cited = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "message_sources"
+        ordering = ("message", "rank")
+        constraints = [
+            models.UniqueConstraint(fields=["message", "label"], name="message_sources_label_uniq"),
+            models.CheckConstraint(condition=Q(rank__gte=1), name="message_sources_rank_chk"),
+        ]
+        indexes = [
+            models.Index(fields=["document"], name="message_sources_document_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.label} of {self.message_id}"

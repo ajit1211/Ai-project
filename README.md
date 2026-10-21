@@ -4,14 +4,21 @@ AI Intelligence & Agent Platform. The architecture and the 20-phase plan are in
 [docs/architecture/NEXA-architecture.md](docs/architecture/NEXA-architecture.md); decisions
 made since are in [docs/adr/](docs/adr/).
 
-**Current phase: 06, conversation memory.** NEXA remembers selected things about you and
-your work across conversations: what you state (and approve) becomes a memory, relevant
-memories and your standing preferences are recalled into each reply's context, long
-conversations get a rolling summary, and everything is visible, editable and deletable at
-`/memories`, with automatic memory on or off. Memories are private, team or organization
-scoped, never cross a tenant, and never hold secrets. Details:
-[memory-engine.md](docs/architecture/memory-engine.md), [memory-security.md](docs/architecture/memory-security.md),
-endpoints in [docs/api/memories.md](docs/api/memories.md), decision in [ADR-034](docs/adr/034-memory-engine.md).
+**Current phase: 08, document-grounded answers (RAG).** In the chat, choose documents (or
+all documents you may read) and ask about them: the reply is built from passages retrieved
+from those documents and cites them (`[S1]`), with source cards that open the document at
+the right page. Retrieval is PostgreSQL full-text search over chunks built when a document is
+processed; it runs inside your access rights, and when nothing matches the reply says so
+instead of guessing. No embeddings or vector search yet (Phase 09). Details:
+[rag.md](docs/architecture/rag.md), the API in [docs/api/conversations.md](docs/api/conversations.md#document-grounded-answers),
+decision in [ADR-036](docs/adr/036-rag-in-chat-lexical-baseline.md).
+
+Phase 07, documents: upload PDF, Word, text, Markdown and CSV files at `/documents`; they are
+stored privately, their text is extracted in the background, and the library shows status,
+text, warnings and sharing ([documents.md](docs/architecture/documents.md),
+[docs/api/documents.md](docs/api/documents.md), [ADR-035](docs/adr/035-document-uploads-through-core.md)).
+Phase 06, conversation memory: selected memories and summaries, managed at `/memories`
+([memory-engine.md](docs/architecture/memory-engine.md), [ADR-034](docs/adr/034-memory-engine.md)).
 
 Earlier phases: the chat engine (Phase 05, [chat-engine.md](docs/architecture/chat-engine.md),
 [docs/api/conversations.md](docs/api/conversations.md), ADR-033; private conversations at
@@ -22,9 +29,11 @@ and identity and access (Phase 03, [authentication.md](docs/architecture/authent
 [security.md](docs/architecture/security.md)).
 
 ```text
-React (/chat, /memories) ──► edge (Vite proxy) ──► FastAPI /api/v1/conversations, /memories, /ai
-                                           └──► Django   /api/v1/auth, /users, /organizations, /ai/usage
-FastAPI ──► memory engine (recall, extraction, summaries) ──► AI Gateway ──► Anthropic | OpenAI | mock
+React (/chat, /documents, /memories) ──► edge (Vite proxy) ──► FastAPI /api/v1/conversations, /memories, /ai
+                                                       └──► Django   /api/v1/auth, /users, /organizations,
+                                                                     /documents, /ai/usage
+Django ──► Celery (core.documents): extraction, search index ──► private file storage
+FastAPI ──► memory engine + document retrieval (RAG) ──► AI Gateway ──► Anthropic | OpenAI | mock
                                                    (one PostgreSQL; Django owns the schema)
 ```
 
@@ -35,7 +44,8 @@ FastAPI ──► memory engine (recall, extraction, summaries) ──► AI Gat
 | FastAPI | http://localhost:8001 | `apps/runtime`: the AI plane (`/api/v1/conversations/*`, `/api/v1/memories/*`, `/api/v1/ai/*`) |
 | PostgreSQL | localhost:5433 (project-local) | One database, two roles: `nexa_core` and `nexa_runtime` |
 | Redis | localhost:6379 | Rate limits, AI quotas, Celery broker and pub/sub (db 0), cache (db 1) |
-| Celery | worker process | Emails and background jobs on `core.default` and `core.email` |
+| Celery | worker process | Emails and background jobs on `core.default`, `core.email` and `core.documents` (extraction, indexing, retention) |
+| File storage | `.local/documents` | Uploaded files, private, git-ignored (an object store when deployed) |
 
 In development the browser talks only to port 5173: Vite proxies `/api` to Django or FastAPI
 using the same path rules as the production edge.
@@ -85,6 +95,9 @@ as down. Without AI provider keys the mock provider answers; add `AI_ANTHROPIC_A
 | `uv run python scripts/e2e_ai.py` | Walks the AI gateway (models, chat, structured output, streaming, errors, usage) against the running stack |
 | `uv run python scripts/e2e_chat.py` | Walks the chat engine (conversation, streamed reply, history, retries, failures, isolation, deletion) against the running stack |
 | `uv run python scripts/e2e_memory.py` | Walks the memory engine (extraction, refusals, approval, manual memories, search, isolation, settings, clearing) against the running stack |
+| `uv run python scripts/e2e_documents.py` | Walks the document pipeline (uploads in every format, processing, indexing, text, preview, download, refusals, retry, isolation, deletion) against the running stack |
+| `uv run python scripts/e2e_rag.py` | Walks document-grounded chat (sources, citations, no-evidence, fabricated citations, isolation, deletion) against the running stack |
+| `uv run pytest -s apps/runtime/tests/test_rag_eval.py` | Prints the retrieval and citation evaluation on the synthetic set |
 | `uv run python apps/core/manage.py createsuperuser` | Creates an admin login for http://localhost:8000/admin/ |
 
 Emails in development are written to `.local/mail/`; open the newest file for the link.
@@ -97,3 +110,9 @@ Each service answers `GET /healthz` and `GET /readyz`.
 - The development JWT signing key is generated into `.secrets/` on first use; deployed
   environments provide `JWT_PRIVATE_KEY` from the secret store.
 - Install the git hooks once with `uv run pre-commit install`.
+- Without Redis, document processing and indexing run inside Core right after the upload
+  (the broker fallback), so the worker is optional locally. With Redis, the worker must
+  listen on `core.documents` (`pnpm dev` does).
+- Windows Defender's Controlled Folder Access protects `Documents`: if the repository lives
+  there, allow Python, uv, node, git and your editor through it, or writes (tests, formatting,
+  uploads, commits) fail with "file not found" errors.

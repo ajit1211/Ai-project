@@ -51,6 +51,8 @@ class Feature(StrEnum):
     # Set by the memory engine (Phase 06): extraction after a turn, and conversation summaries.
     MEMORY = "memory"
     SUMMARY = "summary"
+    # Set by the chat engine for a reply grounded in the user's documents (Phase 08).
+    RAG = "rag"
 
 
 class FinishReason(StrEnum):

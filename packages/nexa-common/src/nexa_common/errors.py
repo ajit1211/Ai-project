@@ -52,6 +52,11 @@ class ErrorCode(StrEnum):
     AI_OUTPUT_INVALID = "AI_OUTPUT_INVALID"
     AI_EMPTY_RESPONSE = "AI_EMPTY_RESPONSE"
     AI_INTERNAL_ERROR = "AI_INTERNAL_ERROR"
+    # Document-grounded answers (Phase 08, docs/architecture/rag.md).
+    DOCUMENT_UNAVAILABLE = "DOCUMENT_UNAVAILABLE"
+    DOCUMENT_NOT_INDEXED = "DOCUMENT_NOT_INDEXED"
+    RAG_INVALID_SCOPE = "RAG_INVALID_SCOPE"
+    RAG_RETRIEVAL_FAILED = "RAG_RETRIEVAL_FAILED"
 
 
 DEFAULT_MESSAGES: dict[ErrorCode, str] = {
@@ -89,6 +94,12 @@ DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.AI_OUTPUT_INVALID: "The AI answer did not match the requested format.",
     ErrorCode.AI_EMPTY_RESPONSE: "The AI model returned an empty answer. Please try again.",
     ErrorCode.AI_INTERNAL_ERROR: "Something went wrong while generating the answer.",
+    ErrorCode.DOCUMENT_UNAVAILABLE: "One or more of the selected documents are not available.",
+    ErrorCode.DOCUMENT_NOT_INDEXED: (
+        "One or more of the selected documents are still being prepared for search."
+    ),
+    ErrorCode.RAG_INVALID_SCOPE: "The document selection is not valid.",
+    ErrorCode.RAG_RETRIEVAL_FAILED: "Searching the documents failed. Please try again.",
 }
 
 

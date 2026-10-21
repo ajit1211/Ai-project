@@ -7,7 +7,12 @@ from typing import Any
 from django.contrib import admin
 from django.http import HttpRequest
 
-from nexa_core.documents.models import Document, DocumentIngestion, DocumentText
+from nexa_core.documents.models import (
+    Document,
+    DocumentIndex,
+    DocumentIngestion,
+    DocumentText,
+)
 
 _HIDDEN = ("filename", "title", "storage_key", "metadata")
 
@@ -67,3 +72,21 @@ class DocumentTextAdmin(ReadOnly):
     readonly_fields = tuple(
         f.name for f in DocumentText._meta.fields if f.name not in ("content", "pages")
     )
+
+
+@admin.register(DocumentIndex)
+class DocumentIndexAdmin(ReadOnly):
+    """Indexing state only; the chunks (document text) are not shown."""
+
+    list_display = (
+        "document",
+        "status",
+        "generation",
+        "chunk_count",
+        "strategy_version",
+        "error_code",
+        "indexed_at",
+    )
+    list_filter = ("status", "strategy_version")
+    search_fields = ("document__id",)
+    readonly_fields = tuple(f.name for f in DocumentIndex._meta.fields)

@@ -15,6 +15,7 @@ from nexa_core.documents.models import (
     MAX_CATEGORY_CHARS,
     MAX_TITLE_CHARS,
     Document,
+    DocumentIndex,
     DocumentIngestion,
 )
 
@@ -67,10 +68,12 @@ def document_payload(
     *,
     ingestions: list[DocumentIngestion] | None = None,
 ) -> dict[str, Any]:
+    from nexa_core.documents.indexing import index_payload
     from nexa_core.documents.services import can_retry, document_resource  # no import cycle
 
     resource = document_resource(document)
     owner = document.uploaded_by
+    editable = can(principal, "update", resource)
     payload: dict[str, Any] = {
         "id": str(document.id),
         "filename": document.filename,
@@ -99,9 +102,12 @@ def document_payload(
         "processing_started_at": _iso(document.processing_started_at),
         "processed_at": _iso(document.processed_at),
         "has_text": document.status == lifecycle.COMPLETED,
-        "can_retry": can_retry(document, now=timezone.now()) and can(principal, "update", resource),
-        "editable": can(principal, "update", resource),
+        "can_retry": can_retry(document, now=timezone.now()) and editable,
+        "editable": editable,
         "deletable": can(principal, "delete", resource),
+        # The search index behind document-grounded answers (Phase 08), apart from extraction.
+        "index": index_payload(_search_index(document)),
+        "can_reindex": document.status == lifecycle.COMPLETED and editable,
     }
     if ingestions is not None:
         payload["ingestions"] = [ingestion_payload(i) for i in ingestions]
@@ -143,3 +149,10 @@ def status_payload(document: Document) -> dict[str, Any]:
 
 def _iso(value: Any) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _search_index(document: Document) -> DocumentIndex | None:
+    try:
+        return document.search_index
+    except DocumentIndex.DoesNotExist:
+        return None

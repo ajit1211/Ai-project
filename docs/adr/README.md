@@ -23,5 +23,7 @@ ADR-00N"; they are filed under their NEXA numbers:
 | [032](032-fallback-retry-and-timeouts.md) | Fallback, retry and timeout strategy under one deadline | 04 / ADR-014 |
 | [033](033-conversations-in-runtime.md) | Conversations served by Runtime; Core owns their schema and permissions; no service-to-service calls | 05 |
 | [034](034-memory-engine.md) | Structured memory in PostgreSQL, team scope as project memory, in-process extraction | 06 |
+| [035](035-document-uploads-through-core.md) | Document uploads through Core, private storage behind an interface, processing on a dedicated queue | 07 |
+| [036](036-rag-in-chat-lexical-baseline.md) | Document-grounded answers inside the chat engine, lexical retrieval first, validated inline citations | 08 |
 
 Format: context, decision, alternatives, consequences. Status is *accepted* unless noted.

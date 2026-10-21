@@ -1,4 +1,7 @@
-/** The chat's line icons (24×24, drawn with the current text colour). Decorative: the button carries the name. */
+/**
+ * NEXA's line icons (24×24, drawn with the current text colour), first made for the chat and
+ * shared by the document pages. Decorative: the button or link carries the name.
+ */
 
 const PATHS = {
   menu: ["M3 6h18", "M3 12h18", "M3 18h18"],
@@ -13,6 +16,17 @@ const PATHS = {
   refresh: ["M21 12a9 9 0 1 1-3-6.7L21 8", "M21 3v5h-5"],
   stop: ["M7 7h10v10H7z"],
   send: ["M22 2 11 13", "M22 2 15 22l-4-9-9-4Z"],
+  upload: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "M17 8l-5-5-5 5", "M12 3v12"],
+  download: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "M7 10l5 5 5-5", "M12 15V3"],
+  file: [
+    "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z",
+    "M14 2v6h6",
+    "M16 13H8",
+    "M16 17H8",
+    "M10 9H8",
+  ],
+  search: ["M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z", "M21 21l-4.35-4.35"],
+  back: ["M19 12H5", "M12 19l-7-7 7-7"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type IconName = keyof typeof PATHS;

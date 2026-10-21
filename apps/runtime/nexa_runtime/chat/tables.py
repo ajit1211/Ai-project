@@ -60,6 +60,8 @@ messages = Table(
     Column("request_id", String, nullable=False),
     Column("finish_reason", String, nullable=False),
     Column("error_code", String, nullable=False),
+    # Null for ordinary replies; what a document-grounded reply used and how it went (Phase 08).
+    Column("grounding", JSONB),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True)),
 )

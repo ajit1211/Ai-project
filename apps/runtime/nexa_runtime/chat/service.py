@@ -6,6 +6,11 @@
     ──► build context ──► AI Gateway stream ──► relay deltas, flush partial text
     ──► completed | failed | cancelled, usage copied from the gateway, lock released
 
+A document-grounded message (Phase 08, docs/architecture/rag.md) has its scope authorized
+before anything is stored; its reply first retrieves passages (`sources` event), answers
+without calling the model when the documents have nothing, and stores which passages it
+cited, checked against the ones it was given.
+
 Everything here is scoped by the caller's principal (organization from the token, ownership
 checked with the shared policy). The gateway does authorization, quotas and metering for the
 model call itself; this service only persists what happened to it.
@@ -53,6 +58,7 @@ from nexa_runtime.chat.events import (
     MessageCancelled,
     MessageComplete,
     MessageStart,
+    SourcesFound,
     TextDelta,
     UsageReport,
 )
@@ -69,6 +75,16 @@ from nexa_runtime.chat.schemas import (
 )
 from nexa_runtime.config import RuntimeSettings
 from nexa_runtime.memory.service import MemoryEngine
+from nexa_runtime.rag.errors import GroundingDisabled
+from nexa_runtime.rag.evidence import (
+    NO_EVIDENCE_ANSWER,
+    NO_TERMS_ANSWER,
+    CitationCheck,
+    check_citations,
+    strip_citations,
+)
+from nexa_runtime.rag.schemas import GroundingRequest, SourceOut
+from nexa_runtime.rag.service import Grounded, RagEngine, Scope, failed_record
 from nexa_runtime.ratelimit import Limiter
 
 log = get_logger("nexa.runtime.chat")
@@ -115,11 +131,14 @@ class Generation:
     assistant_message: repo.MessageRow
     principal: Principal
     request_id: str | None
+    # Set for a document-grounded reply: the scope, authorized when the message was sent.
+    scope: Scope | None = None
 
 
 @dataclass
 class _Progress:
     started: float
+    grounded: Grounded | None = None
     parts: list[str] = field(default_factory=list)
     alias: str = ""
     provider: str = ""
@@ -158,9 +177,11 @@ class ChatService:
         settings: RuntimeSettings,
         limiter: Limiter | None = None,
         memory: MemoryEngine | None = None,
+        rag: RagEngine | None = None,
     ) -> None:
         self._engine = engine
         self._memory = memory
+        self._rag = rag
         self._gateway = gateway
         self._cancel = cancel
         self._limiter = limiter or Limiter(None)
@@ -253,7 +274,24 @@ class ChatService:
         async with self._engine.connect() as conn:
             row = await self._load(conn, principal, conversation_id, "view")
             rows, next_before = await repo.list_messages(conn, row.id, limit=limit, before=before)
-        return [MessageOut.from_row(m) for m in rows], next_before
+            messages = await self._with_sources(
+                conn, principal, [MessageOut.from_row(m) for m in rows]
+            )
+        return messages, next_before
+
+    async def message_sources(
+        self, principal: Principal, conversation_id: UUID, message_id: UUID
+    ) -> list[SourceOut]:
+        """The sources of one grounded reply, with whole passages rather than excerpts."""
+        async with self._engine.connect() as conn:
+            row = await self._load(conn, principal, conversation_id, "view")
+            message = await repo.message_by_id(conn, row.id, message_id)
+            if message is None:
+                raise NotFound
+            if message.grounding is None or self._rag is None:
+                return []
+            found = await self._rag.sources_for(conn, principal, [message.id], detail=True)
+        return found.get(message.id, [])
 
     # --- Sending and regenerating ------------------------------------------------------------
 
@@ -269,6 +307,10 @@ class ChatService:
         the client sends the same `client_message_id` again."""
         require(principal, "ai.chat")
         await self._check_model(principal, body.model)
+        scope: Scope | None = None
+        if body.grounding is not None:
+            # Authorized before anything is stored: a bad selection stores no message.
+            scope = await self._resolve_grounding(principal, body.grounding, body.content)
         async with self._engine.begin() as conn:
             conversation = await self._load(
                 conn, principal, conversation_id, "update", for_update=True
@@ -280,7 +322,7 @@ class ChatService:
                     conn, conversation.id, body.client_message_id
                 )
                 if earlier is not None:
-                    return await self._replay(conn, conversation, earlier)
+                    return await self._replay(conn, principal, conversation, earlier)
             assistant_id = new_id()
             await self._claim(conn, conversation, assistant_id)
             sequence = await repo.next_sequence(conn, conversation.id)
@@ -305,6 +347,7 @@ class ChatService:
                 status="pending",
                 model=model,
                 message_id=assistant_id,
+                grounding=scope.record() if scope is not None else None,
             )
             changes: dict[str, Any] = {
                 "message_count": conversation.message_count + 2,
@@ -315,7 +358,7 @@ class ChatService:
             if not conversation.title:
                 changes["title"] = self._title_from(body.content)
             conversation = await repo.update_conversation(conn, conversation.id, **changes)
-        return Generation(conversation, user, assistant, principal, request_id)
+        return Generation(conversation, user, assistant, principal, request_id, scope)
 
     async def regenerate(
         self,
@@ -348,6 +391,14 @@ class ChatService:
             else:
                 user = last
                 count += 1  # the reply that was never stored
+            # A grounded reply is regenerated from the same scope, authorized again now: a
+            # document unshared since then is not searched.
+            scope: Scope | None = None
+            request = Scope.request_from_record(
+                last.grounding if last.role == "assistant" else None
+            )
+            if request is not None:
+                scope = await self._resolve_grounding(principal, request, user.content)
             assistant_id = new_id()
             await self._claim(conn, conversation, assistant_id)
             if last.role == "assistant":
@@ -363,12 +414,13 @@ class ChatService:
                 status="pending",
                 model=model,
                 message_id=assistant_id,
+                grounding=scope.record() if scope is not None else None,
             )
             changes: dict[str, Any] = {"message_count": count}
             if body.model and body.model != conversation.model:
                 changes["model"] = body.model
             conversation = await repo.update_conversation(conn, conversation.id, **changes)
-        return Generation(conversation, user, assistant, principal, request_id)
+        return Generation(conversation, user, assistant, principal, request_id, scope)
 
     async def cancel(self, principal: Principal, conversation_id: UUID) -> CancelResult:
         async with self._engine.connect() as conn:
@@ -406,7 +458,24 @@ class ChatService:
                 user_message=MessageOut.from_row(gen.user_message),
                 assistant_message=MessageOut.from_row(gen.assistant_message),
             )
-            request, ctx = await self._prepare(gen)
+            if gen.scope is not None:
+                progress.grounded = await self._ground(gen)
+                yield SourcesFound(
+                    message_id=assistant_id,
+                    searched_documents=progress.grounded.searched_documents,
+                    sources=self._sources_of(progress.grounded, None),
+                )
+                if not progress.grounded.evidence.passages:
+                    # Nothing to answer from: say so instead of letting the model guess.
+                    done = True
+                    out, ok = await self._answer_without_evidence(gen, progress)
+                    if ok:
+                        yield TextDelta(message_id=assistant_id, text=out.content)
+                        yield MessageComplete(message=out)
+                    else:
+                        yield _error_event(AIInternalError(), out, gen.request_id)
+                    return
+            request, ctx = await self._prepare(gen, progress.grounded)
             # Marked before the gateway call: between opening the gateway stream (which holds
             # a quota reservation) and handing it to the pump nothing is awaited, so it cannot
             # be abandoned unclosed.
@@ -525,10 +594,16 @@ class ChatService:
         assistant_id: UUID = gen.assistant_message.id
         progress = _Progress(started=time.perf_counter())
         stop = self._cancel.start(assistant_id)
+        no_evidence = False
         try:
-            request, ctx = await self._prepare(gen)
-            await self._mark_streaming(assistant_id)
-            response = await _unless_stopped(self._gateway.chat(request, ctx), stop)
+            if gen.scope is not None:
+                progress.grounded = await self._ground(gen)
+                no_evidence = not progress.grounded.evidence.passages
+            response = None
+            if not no_evidence:
+                request, ctx = await self._prepare(gen, progress.grounded)
+                await self._mark_streaming(assistant_id)
+                response = await _unless_stopped(self._gateway.chat(request, ctx), stop)
         except NexaError as exc:
             if isinstance(exc, AIError) and exc.call_id is not None:
                 progress.usage_event_id = exc.call_id
@@ -545,7 +620,9 @@ class ChatService:
             raise internal from exc
         finally:
             self._cancel.finish(assistant_id)
-        if response is None:
+        if no_evidence:
+            out, ok = await self._answer_without_evidence(gen, progress)
+        elif response is None:
             out, ok = await self._settle(gen, progress, status="cancelled")
         else:
             progress.add_text(response.content)
@@ -626,7 +703,11 @@ class ChatService:
         return row
 
     async def _replay(
-        self, conn: Any, conversation: repo.ConversationRow, user: repo.MessageRow
+        self,
+        conn: Any,
+        principal: Principal,
+        conversation: repo.ConversationRow,
+        user: repo.MessageRow,
     ) -> Exchange:
         reply = await repo.message_at(conn, conversation.id, user.sequence + 1)
         if reply is None or reply.role != "assistant":
@@ -636,13 +717,57 @@ class ChatService:
                 raise GenerationInProgress("The reply to that message is still being generated.")
             # Its generation died with its process: report that, not a reply pending forever.
             reply = await self._interrupted(conn, reply.id) or reply
-        return Exchange(
-            user_message=MessageOut.from_row(user), assistant_message=MessageOut.from_row(reply)
-        )
+        [answer] = await self._with_sources(conn, principal, [MessageOut.from_row(reply)])
+        return Exchange(user_message=MessageOut.from_row(user), assistant_message=answer)
 
-    async def _prepare(self, gen: Generation) -> tuple[ChatRequest, AIRequestContext]:
-        """The gateway request: system instructions, relevant memories, the rolling summary
-        and the bounded recent history (docs/architecture/memory-engine.md#context)."""
+    # --- Document grounding (Phase 08) -------------------------------------------------------
+
+    async def _resolve_grounding(
+        self, principal: Principal, request: GroundingRequest, question: str
+    ) -> Scope:
+        if self._rag is None:
+            raise GroundingDisabled("Answers from documents are not available.")
+        return await self._rag.resolve(principal, request, question=question)
+
+    async def _ground(self, gen: Generation) -> Grounded:
+        if self._rag is None or gen.scope is None:  # pragma: no cover - send() checked both
+            raise GroundingDisabled("Answers from documents are not available.")
+        return await self._rag.retrieve(gen.principal, gen.scope, question=gen.user_message.content)
+
+    def _sources_of(self, grounded: Grounded, check: CitationCheck | None) -> list[SourceOut]:
+        return self._rag.sources_from(grounded, check) if self._rag is not None else []
+
+    async def _answer_without_evidence(
+        self, gen: Generation, progress: _Progress
+    ) -> tuple[MessageOut, bool]:
+        """The reply when retrieval found nothing: a fixed statement, no model call."""
+        grounded = progress.grounded
+        no_terms = grounded is not None and grounded.terms == 0
+        progress.add_text(NO_TERMS_ANSWER if no_terms else NO_EVIDENCE_ANSWER)
+        progress.ttft_ms = _elapsed_ms(progress.started)
+        progress.finish_reason = "stop"
+        progress.ended = True
+        return await self._settle(gen, progress, status="completed")
+
+    async def _with_sources(
+        self, conn: Any, principal: Principal, messages: list[MessageOut]
+    ) -> list[MessageOut]:
+        """Attach the sources of grounded replies, re-authorized for this reader now."""
+        grounded = [m.id for m in messages if m.grounding is not None]
+        if not grounded or self._rag is None:
+            return messages
+        found = await self._rag.sources_for(conn, principal, grounded)
+        return [
+            m.model_copy(update={"sources": found.get(m.id, [])}) if m.grounding else m
+            for m in messages
+        ]
+
+    async def _prepare(
+        self, gen: Generation, grounded: Grounded | None = None
+    ) -> tuple[ChatRequest, AIRequestContext]:
+        """The gateway request: system instructions, the evidence of a grounded reply,
+        relevant memories, the rolling summary and the bounded recent history
+        (docs/architecture/memory-engine.md#context, rag.md#evidence)."""
         model = gen.assistant_message.model
         registry = await self._gateway.catalog.registry()
         alias = registry.get(model) if model else registry.default_alias
@@ -659,7 +784,13 @@ class ChatService:
         memories, summary = await self._recall(gen)
         history = [
             HistoryItem(
-                role=row.role, content=row.content, status=row.status, sequence=row.sequence
+                role=row.role,
+                # Earlier answers' [S1] markers meant other passages: they would mislead.
+                content=strip_citations(row.content)
+                if grounded is not None and row.role == "assistant"
+                else row.content,
+                status=row.status,
+                sequence=row.sequence,
             )
             for row in rows
             if row.role in ("user", "assistant")
@@ -672,6 +803,7 @@ class ChatService:
             policy=self._policy,
             memories=memories,
             summary=summary,
+            evidence=grounded.evidence.message if grounded is not None else None,
         )
         log.info(
             "chat.context.built",
@@ -682,13 +814,15 @@ class ChatService:
             memories=built.memories_included,
             memories_dropped=built.memories_dropped,
             summary=built.summary_included,
+            evidence_passages=len(grounded.evidence.passages) if grounded else 0,
+            evidence_tokens=grounded.evidence.estimated_tokens if grounded else 0,
             estimated_tokens=built.estimated_tokens,
         )
         request = ChatRequest(
             model=model or None,
             messages=built.messages,
             max_output_tokens=self._settings.chat_max_output_tokens,
-            feature=Feature.CHAT,
+            feature=Feature.RAG if grounded is not None else Feature.CHAT,
         )
         ctx = replace(
             AIRequestContext.from_principal(gen.principal, request_id=gen.request_id),
@@ -759,11 +893,20 @@ class ChatService:
         reply failed and releases the conversation, so nothing stays locked, and the caller
         reports an internal error instead of the outcome it meant to."""
         code = error_code or (error.error_code.value if error else "")
+        # Citations are checked against the passages this reply was given, and nothing else.
+        check = (
+            check_citations(progress.text, progress.grounded.evidence.labels)
+            if progress.grounded is not None
+            else None
+        )
         try:
-            row = await self._finalize(gen, progress, status=status, code=code)
+            row = await self._finalize(gen, progress, status=status, code=code, check=check)
             if status == "completed":
                 self._after_turn(gen, row)
-            return MessageOut.from_row(row), True
+            out = MessageOut.from_row(row)
+            if progress.grounded is not None:
+                out = out.model_copy(update={"sources": self._sources_of(progress.grounded, check)})
+            return out, True
         except Exception as exc:
             log.error(
                 "chat.finalize_failed",
@@ -792,7 +935,13 @@ class ChatService:
         return unsaved, False
 
     async def _finalize(
-        self, gen: Generation, progress: _Progress, *, status: str, code: str
+        self,
+        gen: Generation,
+        progress: _Progress,
+        *,
+        status: str,
+        code: str,
+        check: CitationCheck | None = None,
     ) -> repo.MessageRow:
         usage = progress.usage
         values: dict[str, Any] = {
@@ -812,11 +961,36 @@ class ChatService:
             "error_code": code,
             "completed_at": repo.now(),
         }
+        grounded = progress.grounded
+        if gen.scope is not None:
+            values["grounding"] = (
+                grounded.record(status, check)
+                if grounded is not None
+                else failed_record(gen.scope, "cancelled" if status == "cancelled" else "failed")
+            )
         async with self._engine.begin() as conn:
             # The conversation row first (see the module docstring).
             await repo.update_conversation(conn, gen.conversation.id, last_message_at=repo.now())
             await repo.release_generation(conn, gen.conversation.id, gen.assistant_message.id)
             row = await repo.update_message(conn, gen.assistant_message.id, **values)
+            if grounded is not None and self._rag is not None:
+                await self._rag.store_sources(
+                    conn,
+                    organization_id=gen.conversation.organization_id,
+                    message_id=gen.assistant_message.id,
+                    grounded=grounded,
+                    check=check,
+                )
+        if gen.scope is not None:
+            record = values["grounding"]
+            log.info(
+                "rag.answer.completed",
+                message_id=str(gen.assistant_message.id),
+                outcome=record["outcome"],
+                supplied=record.get("supplied", 0),
+                cited=record.get("cited", 0),
+                invalid_citations=len(record.get("invalid_citations", [])),
+            )
         log.info(
             "chat.generation.completed",
             conversation_id=str(gen.conversation.id),
@@ -867,6 +1041,9 @@ class ChatService:
                     user_message=gen.user_message,
                     assistant_message=reply,
                     request_id=gen.request_id,
+                    # A grounded reply carries document text: memories are never made from
+                    # documents (Phase 07 rule), so only the conversation summary runs.
+                    extract=gen.scope is None,
                 )
             )
         )

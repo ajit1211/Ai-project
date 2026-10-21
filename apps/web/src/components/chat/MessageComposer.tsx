@@ -12,6 +12,7 @@ import {
   useLayoutEffect,
   useRef,
   type KeyboardEvent,
+  type ReactNode,
   type Ref,
 } from "react";
 
@@ -33,6 +34,9 @@ export interface MessageComposerProps {
   stopping: boolean;
   /** Nothing can be sent right now (the conversation is loading or could not be). */
   disabled?: boolean;
+  /** Shown above the text field (the document controls). */
+  header?: ReactNode;
+  placeholder?: string;
   ref?: Ref<ComposerHandle>;
 }
 
@@ -44,6 +48,8 @@ export function MessageComposer({
   streaming,
   stopping,
   disabled = false,
+  header,
+  placeholder = "Message NEXA…",
   ref,
 }: MessageComposerProps) {
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -84,6 +90,7 @@ export function MessageComposer({
         if (canSend) onSend();
       }}
     >
+      {header}
       <div className="chat-composer-inner">
         <label htmlFor={id} className="visually-hidden">
           Message
@@ -93,7 +100,7 @@ export function MessageComposer({
           id={id}
           rows={1}
           value={value}
-          placeholder="Message NEXA…"
+          placeholder={placeholder}
           readOnly={locked}
           aria-disabled={locked}
           aria-describedby={hintId}

@@ -24,6 +24,7 @@ from nexa_runtime.errors import register_exception_handlers
 from nexa_runtime.health import router as health_router
 from nexa_runtime.memory.service import MemoryEngine
 from nexa_runtime.middleware import RequestContextMiddleware
+from nexa_runtime.rag.service import RagEngine
 from nexa_runtime.ratelimit import Limiter
 
 
@@ -84,6 +85,11 @@ def create_app(
         app.state.memory = MemoryEngine(
             engine=app.state.engine, gateway=app.state.gateway, settings=settings
         )
+        # Document-grounded answers (docs/architecture/rag.md): retrieval over the caller's
+        # authorized documents, evidence for the model, validated citations.
+        app.state.rag = RagEngine(
+            engine=app.state.engine, settings=settings, limiter=app.state.limiter
+        )
         app.state.chat = ChatService(
             engine=app.state.engine,
             gateway=app.state.gateway,
@@ -91,6 +97,7 @@ def create_app(
             limiter=app.state.limiter,
             settings=settings,
             memory=app.state.memory,
+            rag=app.state.rag,
         )
         try:
             yield

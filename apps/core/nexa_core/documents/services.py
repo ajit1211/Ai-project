@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import time
 import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -43,7 +42,7 @@ from nexa_core.access.principal import OrganizationContext
 from nexa_core.audit.actions import AuditAction
 from nexa_core.audit.service import record
 from nexa_core.chat.models import Conversation
-from nexa_core.documents import lifecycle
+from nexa_core.documents import indexing, lifecycle, queue
 from nexa_core.documents.extraction import (
     HEAD_BYTES,
     MEDIA_TYPES,
@@ -68,11 +67,6 @@ from nexa_core.organizations.models import Team
 from nexa_core.security import ratelimit
 
 log = get_logger("nexa.core.documents")
-
-# Enqueueing after commit. When the broker is down, the task runs here and now rather than
-# never (the same choice the email flow makes); the breaker spares every upload the timeout.
-_BROKER_RETRY_SECONDS = 30.0
-_broker_down_until = 0.0
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 PREVIEW_CHARS = 10_000
@@ -99,7 +93,7 @@ def visible_documents(context: OrganizationContext) -> QuerySet[Document]:
     principal = context.principal
     documents = Document.objects.filter(
         organization=context.organization, deleted_at__isnull=True
-    ).select_related("uploaded_by")
+    ).select_related("uploaded_by", "search_index")
     if principal.has("documents.manage_all"):
         return documents
     allowed = Q(visibility=Document.Visibility.ORGANIZATION) | Q(uploaded_by_id=principal.user_id)
@@ -114,7 +108,7 @@ def get_document(
     """The document, if the caller may `action` it: 404 when it is in another organization,
     deleted, or invisible to them; 403 when visible but beyond their role."""
     document = (
-        Document.objects.select_related("uploaded_by")
+        Document.objects.select_related("uploaded_by", "search_index")
         .filter(organization=context.organization, id=document_id, deleted_at__isnull=True)
         .first()
     )
@@ -352,21 +346,12 @@ def _new_attempt(document: Document) -> DocumentIngestion:
 
 def dispatch_processing(document_id: UUID, ingestion_id: UUID) -> None:
     """Hand the attempt to the worker, or run it here when the broker is unreachable."""
-    global _broker_down_until
     from nexa_core.documents.tasks import process_document
 
-    kwargs = {"document_id": str(document_id), "ingestion_id": str(ingestion_id)}
-    if time.monotonic() < _broker_down_until:
-        process_document.run(**kwargs)
-        return
-    try:
-        process_document.apply_async(kwargs=kwargs, retry=False)
-    except Exception as exc:  # broker unreachable: process now rather than never
-        _broker_down_until = time.monotonic() + _BROKER_RETRY_SECONDS
-        log.warning(
-            "documents.queue_unavailable", document_id=str(document_id), error=type(exc).__name__
-        )
-        process_document.run(**kwargs)
+    queue.dispatch(
+        process_document,
+        {"document_id": str(document_id), "ingestion_id": str(ingestion_id)},
+    )
 
 
 # --- Retry, update, delete -------------------------------------------------------------------
@@ -468,6 +453,7 @@ def delete_document(context: OrganizationContext, document: Document) -> None:
         if not updated:
             raise NotFound
         DocumentText.objects.filter(document=document).delete()
+        indexing.forget_index(document)  # its passages leave search with it
         DocumentIngestion.objects.filter(
             document=document, status__in=list(lifecycle.IN_FLIGHT)
         ).update(status=lifecycle.CANCELLED, finished_at=now)
@@ -481,6 +467,34 @@ def delete_document(context: OrganizationContext, document: Document) -> None:
         )
     if remove_file(document):
         log.info("documents.deleted", document_id=str(document.id))
+
+
+def _index_limit() -> ratelimit.Limit:
+    return ratelimit.Limit(
+        "document_index_requests_user", settings.NEXA_RAG_INDEX_REQUESTS_PER_HOUR, 60 * 60
+    )
+
+
+def request_reindex(context: OrganizationContext, document: Document) -> Document:
+    """Rebuild a document's search index (after a chunking upgrade, or a failed run)."""
+    authorize(context.principal, "update", document_resource(document))
+    ratelimit.consume(_index_limit(), str(context.principal.user_id))
+    with transaction.atomic():
+        locked = Document.objects.select_for_update().get(id=document.id)
+        if locked.deleted_at is not None:
+            raise NotFound
+        if locked.status != lifecycle.COMPLETED:
+            raise Conflict("The document has no extracted text to index yet.")
+        index = indexing.request_indexing(locked)
+        record(
+            AuditAction.DOCUMENT_INDEX_REQUESTED,
+            actor_id=context.principal.user_id,
+            organization_id=context.organization.id,
+            resource_type="document",
+            resource_id=document.id,
+            metadata={"generation": index.generation},
+        )
+    return document
 
 
 def remove_file(document: Document) -> bool:

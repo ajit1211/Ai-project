@@ -354,9 +354,11 @@ class MemoryEngine:
         user_message: Any,
         assistant_message: Any,
         request_id: str | None,
+        extract: bool = True,
     ) -> None:
         """Extraction and summarization after a completed reply. Runs in its own task; every
-        failure is logged and swallowed, because the reply has already succeeded."""
+        failure is logged and swallowed, because the reply has already succeeded. `extract`
+        is off for document-grounded replies: no memory is ever made from a document."""
         if not self._settings.memory_enabled:
             return
         try:
@@ -364,7 +366,7 @@ class MemoryEngine:
                 settings = await repo.get_settings(
                     conn, _organization(principal), principal.user_id
                 )
-            if settings is None or settings.extraction_enabled:
+            if extract and (settings is None or settings.extraction_enabled):
                 await self._extract(
                     principal,
                     conversation=conversation,

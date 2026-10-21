@@ -5,17 +5,22 @@
                        ├─ team           (team visibility)
                        ├─ conversation   (an optional association)
                        ├─< DocumentIngestion (one row per processing attempt)
-                       └─ DocumentText        (one row, once processed)
+                       ├─ DocumentText        (one row, once processed)
+                       ├─ DocumentIndex       (search index state, Phase 08)
+                       └─< DocumentChunk      (searchable passages, Phase 08)
 
 Core owns everything here and is its only writer: the API and the Celery worker are both
-Django, so no other database role needs a grant. The bytes are not in the database;
-`storage_key` names them in the private document storage (storage.py). A document is
-private to its uploader unless shared with a team or the whole organization, which is an
-explicit act. Deletion is soft: the row keeps its metadata until the purge removes it, while
-the bytes and the extracted text go at once.
+Django, so no other database role needs a grant (Runtime reads the chunks to answer
+questions; reading needs none). The bytes are not in the database; `storage_key` names them
+in the private document storage (storage.py). A document is private to its uploader unless
+shared with a team or the whole organization, which is an explicit act. Deletion is soft:
+the row keeps its metadata until the purge removes it, while the bytes, the extracted text
+and the chunks go at once.
 """
 
 from django.conf import settings
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVector, SearchVectorField
 from django.db import models
 from django.db.models import Q
 
@@ -220,3 +225,133 @@ class DocumentText(models.Model):
 
     def __str__(self) -> str:
         return f"Text of {self.document_id} ({self.char_count} characters)"
+
+
+# --- Search index (Phase 08, docs/architecture/rag.md) -----------------------------------------
+
+SEARCH_CONFIG = "english"
+INDEX_STATUSES = ("pending", "indexing", "indexed", "failed")
+
+
+class DocumentIndex(models.Model):
+    """Where the search index of one document stands.
+
+    `generation` counts indexing requests; a task carries the generation it was queued for
+    and does nothing once a newer request exists. The chunks in the table always come from
+    one complete run (`indexed_generation`): a run replaces them in a single transaction, so
+    a failed re-index leaves the previous chunks searchable and never a mixture.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        INDEXING = "indexing"
+        INDEXED = "indexed"
+        FAILED = "failed"
+
+    document = models.OneToOneField(
+        Document, on_delete=models.CASCADE, primary_key=True, related_name="search_index"
+    )
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="+")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    generation = models.PositiveIntegerField(default=0)
+    indexed_generation = models.PositiveIntegerField(null=True, blank=True)
+    # How the current chunks were made, and from which text.
+    strategy_version = models.CharField(max_length=32, blank=True)
+    source_sha256 = models.CharField(max_length=64, blank=True)
+    chunk_count = models.PositiveIntegerField(default=0)
+    token_estimate = models.PositiveIntegerField(default=0)
+    attempt_count = models.PositiveSmallIntegerField(default=0)
+    error_code = models.CharField(max_length=48, blank=True)
+    error_message = models.CharField(max_length=MAX_ERROR_MESSAGE_CHARS, blank=True)
+    warnings = models.JSONField(default=list, blank=True)
+    duration_ms = models.PositiveIntegerField(default=0)
+    requested_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    # When the current chunks were stored; null until a run has succeeded once.
+    indexed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "document_indexes"
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(status__in=INDEX_STATUSES), name="document_indexes_status_chk"
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["organization", "status"], name="document_indexes_status_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"Index of {self.document_id}: {self.status}"
+
+    @property
+    def searchable(self) -> bool:
+        return self.indexed_at is not None and self.chunk_count > 0
+
+
+class DocumentChunk(models.Model):
+    """One searchable passage of a document's extracted text (chunking.py).
+
+    The id is derived from the document, the chunking strategy, the position and the text, so
+    re-indexing unchanged text keeps every id and old citations keep resolving. The search
+    column weighs the section path above the passage itself.
+    """
+
+    class Kind(models.TextChoices):
+        TEXT = "text"
+        TABLE = "table"
+
+    id = models.UUIDField(primary_key=True, editable=False)
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="+")
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="chunks")
+    chunk_index = models.PositiveIntegerField()
+    kind = models.CharField(max_length=8, choices=Kind.choices, default=Kind.TEXT)
+    content = models.TextField()
+    section = models.CharField(max_length=300, blank=True)
+    page_start = models.PositiveIntegerField(null=True, blank=True)
+    page_end = models.PositiveIntegerField(null=True, blank=True)
+    row_start = models.PositiveIntegerField(null=True, blank=True)
+    row_end = models.PositiveIntegerField(null=True, blank=True)
+    # Offsets into DocumentText.content (for a table chunk: its rows, without the header).
+    char_start = models.PositiveIntegerField()
+    char_end = models.PositiveIntegerField()
+    char_count = models.PositiveIntegerField()
+    token_estimate = models.PositiveIntegerField()
+    content_sha256 = models.CharField(max_length=64)
+    strategy_version = models.CharField(max_length=32)
+    created_at = models.DateTimeField(auto_now_add=True)
+    search = models.GeneratedField(
+        expression=(
+            SearchVector("section", weight="A", config=SEARCH_CONFIG)
+            + SearchVector("content", weight="B", config=SEARCH_CONFIG)
+        ),
+        output_field=SearchVectorField(),
+        db_persist=True,
+    )
+
+    class Meta:
+        db_table = "document_chunks"
+        ordering = ("document", "chunk_index")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["document", "chunk_index"], name="document_chunks_position_uniq"
+            ),
+            models.CheckConstraint(
+                condition=Q(char_end__gte=models.F("char_start")),
+                name="document_chunks_offsets_chk",
+            ),
+            models.CheckConstraint(
+                condition=Q(page_start__isnull=True) | Q(page_end__gte=models.F("page_start")),
+                name="document_chunks_pages_chk",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["organization", "document"], name="document_chunks_scope_idx"),
+            GinIndex(fields=["search"], name="document_chunks_search_gin"),
+        ]
+
+    def __str__(self) -> str:
+        return f"Chunk {self.chunk_index} of {self.document_id}"

@@ -1,7 +1,9 @@
 """The `nexa.chat.v1` streaming protocol (docs/api/conversations.md#streaming).
 
 Terminal events, exactly one per stream: `message_complete`, `message_cancelled` or `error`.
-Every event after `message_start` names the assistant message it is about.
+Every event after `message_start` names the assistant message it is about. A grounded reply
+sends `sources` once retrieval is done, before any text (Phase 08; clients ignore event types
+they do not know, so the addition keeps the protocol version).
 """
 
 from typing import Literal
@@ -10,6 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from nexa_runtime.chat.schemas import MessageOut
+from nexa_runtime.rag.schemas import SourceOut
 
 PROTOCOL = "nexa.chat.v1"
 PROTOCOL_HEADER = "X-NEXA-Stream-Protocol"
@@ -22,6 +25,15 @@ class MessageStart(BaseModel):
     request_id: str | None
     user_message: MessageOut
     assistant_message: MessageOut
+
+
+class SourcesFound(BaseModel):
+    """The passages found for a grounded reply (empty when the documents had nothing)."""
+
+    type: Literal["sources"] = "sources"
+    message_id: UUID
+    searched_documents: int
+    sources: list[SourceOut]
 
 
 class TextDelta(BaseModel):
@@ -63,5 +75,11 @@ class GenerationError(BaseModel):
 
 
 ChatEvent = (
-    MessageStart | TextDelta | UsageReport | MessageComplete | MessageCancelled | GenerationError
+    MessageStart
+    | SourcesFound
+    | TextDelta
+    | UsageReport
+    | MessageComplete
+    | MessageCancelled
+    | GenerationError
 )

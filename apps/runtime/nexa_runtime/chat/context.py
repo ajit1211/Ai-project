@@ -5,9 +5,12 @@ token budget (docs/architecture/chat-engine.md#context, memory-engine.md#context
 The order is fixed, most stable first (architecture doc 10.2):
 
 1. NEXA's system instructions. Protected: nothing below can replace or extend them.
-2. Relevant memories, as one delimited block of data with their scope and date.
-3. The rolling summary of the messages before the recent window, if there is one.
-4. The recent messages, oldest first, ending with the message being answered.
+2. For a document-grounded reply (Phase 08): the grounding rules and the retrieved passages,
+   as one delimited block of data (nexa_runtime.rag.evidence). The RAG engine has already
+   bounded it to its own budget; it is placed whole or the request is refused.
+3. Relevant memories, as one delimited block of data with their scope and date.
+4. The rolling summary of the messages before the recent window, if there is one.
+5. The recent messages, oldest first, ending with the message being answered.
 
 Budget: the memory block gets at most `memory_budget` tokens, the summary at most
 `summary_budget`, the recent messages the rest; the message being answered is always
@@ -96,6 +99,7 @@ def build_context(
     policy: ContextPolicy = DEFAULT_POLICY,
     memories: Sequence[MemoryItem] = (),
     summary: SummaryItem | None = None,
+    evidence: Message | None = None,
 ) -> BuiltContext:
     """`history` is in conversation order and ends with the user message to answer."""
     system = system_message(prompt_version)
@@ -121,8 +125,12 @@ def build_context(
     if newest_cost > budget:
         raise AIContextTooLarge("The message is too long for this model.")
 
-    # Memories and the summary take their shares; whatever the newest message needs wins.
+    # Evidence, memories and the summary take their shares; the newest message always fits.
     room = budget - newest_cost
+    evidence_cost = estimate_message_tokens([evidence]) if evidence is not None else 0
+    if evidence_cost > room:
+        raise AIContextTooLarge("The document passages do not fit this model's context window.")
+    room -= evidence_cost
     memory_message, memories_included, memories_dropped = _memory_block(
         memories, min(policy.memory_budget, room)
     )
@@ -145,7 +153,7 @@ def build_context(
     while len(chosen) > 1 and chosen[0].role is Role.ASSISTANT:
         used -= estimate_message_tokens([chosen.pop(0)])
 
-    preamble = [m for m in (memory_message, summary_message) if m is not None]
+    preamble = [m for m in (evidence, memory_message, summary_message) if m is not None]
     return BuiltContext(
         messages=[system, *preamble, *chosen],
         included=len(chosen),

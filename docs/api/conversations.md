@@ -19,6 +19,7 @@ from the token; the request body cannot name a user, an organization or an owner
 | POST `/conversations/{id}/messages/` | conversation.update + ai.chat | Send a message and generate the reply |
 | POST `/conversations/{id}/regenerate/` | conversation.update + ai.chat | Generate the last reply again |
 | POST `/conversations/{id}/cancel/` | conversation.update | Stop the reply being generated |
+| GET `/conversations/{id}/messages/{message_id}/sources/` | conversation.view | Whole passages behind a document-grounded reply (Phase 08) |
 
 ## Error codes
 
@@ -33,6 +34,11 @@ Besides the codes in [authentication.md](authentication.md) and the `AI_*` codes
 | VALIDATION_FAILED | 422 | A field is invalid; see `details` |
 | AI_MODEL_UNAVAILABLE | 422 | The conversation's model is not available to this organization |
 | RATE_LIMITED | 429 | Too many new conversations in a minute; see `Retry-After` |
+| DOCUMENT_UNAVAILABLE | 404 | A selected document or team does not exist for you (deleted, another organization, not shared, or a guessed id); nothing was stored |
+| DOCUMENT_NOT_INDEXED | 409 | A selected document is not searchable yet; `details` lists which |
+| RAG_INVALID_SCOPE | 422 | `grounding` must name exactly one of: documents, a team, all documents |
+| SERVICE_UNAVAILABLE | 503 | Answers from documents are switched off (`RAG_ENABLED=false`) |
+| RAG_RETRIEVAL_FAILED | — | (stream `error` event only) Searching the documents failed; regenerate to retry |
 | AI_EMPTY_RESPONSE | — | (stream `error` event only) The model finished without any text; retryable |
 | GENERATION_INTERRUPTED | — | (stored `error_code` only) The process generating the reply died; regenerate to retry |
 
@@ -80,9 +86,14 @@ Message:
   "error_code": null,
   "request_id": "req_0199...",
   "created_at": "2026-10-09T08:05:09+00:00",
-  "completed_at": "2026-10-09T08:05:12+00:00"
+  "completed_at": "2026-10-09T08:05:12+00:00",
+  "grounding": null,
+  "sources": []
 }
 ```
+
+`grounding` and `sources` are set only on document-grounded replies (see
+[below](#document-grounded-answers)); they are `null` and `[]` everywhere else.
 
 `role` is `user` or `assistant`. `status` is `completed` for user messages and one of
 `pending`, `streaming`, `completed`, `failed`, `cancelled` for assistant messages. A failed or
@@ -229,7 +240,70 @@ not shown.
 
 The reply is generated from NEXA's system instructions plus the most recent messages of the
 same conversation: at most 40 messages and a token budget that fits the model's context
-window (estimated at three characters per token, with the output budget reserved). Older
-messages are left out, not summarized; summarization and memory arrive in Phase 06. Failed
+window (estimated at three characters per token, with the output budget reserved). Since
+Phase 06, relevant memories and a rolling summary of older messages are added
+([memory-engine.md](../architecture/memory-engine.md)); since Phase 08, a grounded reply also
+gets the retrieved passages ([rag.md](../architecture/rag.md#evidence-and-prompt)). Failed
 assistant messages are skipped; cancelled ones contribute the text they have. The window
 always starts with a user message.
+
+## Document-grounded answers
+
+Phase 08 ([rag.md](../architecture/rag.md)). Send a message with `grounding` to have the reply
+answered from documents you may read, with citations. Without `grounding` nothing changes.
+
+```json
+{
+  "content": "How long do customers have to request a refund?",
+  "grounding": {"document_ids": ["0199...", "0199..."], "max_sources": 6}
+}
+```
+
+`grounding` names exactly one of: `document_ids` (1 to 20 documents), `team_id` (documents
+shared with a team you belong to), or `all_documents: true` (every document you may read).
+`max_sources` (optional, 1 to 12, default 6) bounds the passages given to the model. The
+question is at most 4 000 characters. The scope is checked before anything is stored: 404
+`DOCUMENT_UNAVAILABLE` for a document or team that does not exist for you, 409
+`DOCUMENT_NOT_INDEXED` for one that is not searchable yet, 422 `RAG_INVALID_SCOPE`, 429 when
+too many grounded questions were asked this minute. Regenerating a grounded reply grounds it
+again with the same scope, checked again.
+
+The stream gains one event, after `message_start` and before any text:
+
+```text
+event: sources
+data: {"message_id":"0199...","searched_documents":2,"sources":[
+        {"label":"S1","rank":1,"cited":false,"available":true,"score":1.2412,
+         "document_id":"0199...","chunk_id":"6f1e...","document_title":"Employee handbook",
+         "filename":"handbook.pdf","format":"pdf","section":"Handbook > Refunds",
+         "page_start":3,"page_end":3,"row_start":null,"row_end":null,
+         "char_start":10230,"char_end":11405,"excerpt":"Customers may request a refund ...",
+         "excerpt_truncated":true}]}
+```
+
+The answer text cites passages as `[S1]`, `[S1][S3]` or `[S1, S2]`. `message_complete`
+carries the reply with its final `grounding` and `sources` (now with `cited` set):
+
+```json
+"grounding": {
+  "mode": "documents", "scope": "documents", "document_ids": ["0199..."], "team_id": null,
+  "outcome": "answered", "searched_documents": 2, "retrieved": 5, "supplied": 5, "cited": 1,
+  "invalid_citations": [], "retrieval_ms": 18, "strategy": "postgres-fts/v1"
+}
+```
+
+`outcome` is `answered` (at least one valid citation), `uncited` (the answer cites none of the
+passages: treat it as unverified), `no_evidence` (nothing matched; the model was not called and
+the reply says so), `failed` or `cancelled`. `invalid_citations` lists labels the answer used
+that were never given to it; they never become sources. A clean failure of the search is an
+`error` event with code `RAG_RETRIEVAL_FAILED`.
+
+When messages are listed, `sources` are read again and the documents re-authorized for the
+reader: a source whose document was deleted, is no longer shared, or whose passage changed is
+`{"label": "S1", "rank": 1, "cited": true, "available": false, ...}` with every other field
+`null`.
+
+### GET /conversations/{id}/messages/{message_id}/sources/
+
+The sources of one grounded reply with whole passages (`excerpt` up to 4 000 characters),
+re-authorized now. `[]` for an ordinary message; 404 for a message not in the conversation.

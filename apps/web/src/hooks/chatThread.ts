@@ -5,7 +5,14 @@
 
 import { describeErrorCode, hintForCode } from "../services/ai/errors";
 import type { Usage } from "../types/ai";
-import type { Conversation, Message, MessageStatus } from "../types/chat";
+import type {
+  Conversation,
+  Grounding,
+  GroundingRequest,
+  Message,
+  MessageStatus,
+  Source,
+} from "../types/chat";
 
 /** What the UI says about a failure. */
 export interface ChatError {
@@ -26,7 +33,17 @@ export interface Submission {
   clientMessageId: string;
   /** ISO time of the first attempt. */
   submittedAt: string;
+  /** The documents to answer from; absent for ordinary chat. */
+  grounding?: GroundingRequest;
 }
+
+/**
+ * Where the document search of a grounded reply stands while it streams: searching (how many
+ * documents, when known), then what it found, until the answer's text arrives.
+ */
+export type Retrieval =
+  | { state: "searching"; documents: number | null }
+  | { state: "found"; searched: number; found: number };
 
 /** A submission the server refused or never received: an unsent bubble with Retry. */
 export interface UnsentSubmission extends Submission {
@@ -58,6 +75,8 @@ export interface LiveReply {
   text: string;
   /** From the `usage` event; the terminal event's message has the final numbers. */
   usage: Usage | null;
+  /** From the `sources` event of a grounded reply. */
+  found: { searched: number; sources: Source[] } | null;
   stopping: boolean;
 }
 
@@ -72,6 +91,15 @@ export interface ChatItem {
   streaming: boolean;
   delivery: Delivery;
   error: ChatError | null;
+  /** Set on a grounded reply while it streams and has no text yet. */
+  retrieval?: Retrieval;
+}
+
+/** How many documents a grounded send names, or null when its scope is wider. */
+function documentCount(grounding: GroundingRequest | Grounding | null | undefined): number | null {
+  if (!grounding) return null;
+  if ("scope" in grounding) return grounding.scope === "documents" ? grounding.document_ids.length : null;
+  return "document_ids" in grounding ? grounding.document_ids.length : null;
 }
 
 const UNFINISHED: ReadonlySet<MessageStatus> = new Set<MessageStatus>(["pending", "streaming"]);
@@ -195,6 +223,7 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
     isUnfinished(message) ? (finished[message.id] ?? message) : message,
   );
   let streamingId: string | null = null;
+  let retrieval: Retrieval | undefined;
   const tail: ChatItem[] = [];
 
   if (live?.userMessage && live.reply) {
@@ -202,9 +231,15 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
       ...live.reply,
       content: live.text,
       status: live.text ? "streaming" : "pending",
+      ...(live.found ? { sources: live.found.sources } : {}),
     };
     messages = withExchange(messages, live.userMessage, reply);
     streamingId = reply.id;
+    if (reply.grounding && !live.text) {
+      retrieval = live.found
+        ? { state: "found", searched: live.found.searched, found: live.found.sources.length }
+        : { state: "searching", documents: documentCount(reply.grounding) };
+    }
   } else if (live) {
     // Until message_start: the submission as typed and a placeholder for the reply.
     if (live.kind === "regenerate" && messages.at(-1)?.role === "assistant") {
@@ -215,6 +250,10 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
       tail.push(submissionItem(thread.conversationId, live.submission, last + 1, "sending", null));
     }
     const key = `pending-reply:${thread.conversationId}`;
+    const grounding = live.submission?.grounding;
+    const searching: Retrieval | undefined = grounding
+      ? { state: "searching", documents: documentCount(grounding) }
+      : undefined;
     tail.push({
       key,
       message: localMessage(thread.conversationId, {
@@ -228,6 +267,7 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
       streaming: true,
       delivery: "sent",
       error: null,
+      ...(searching ? { retrieval: searching } : {}),
     });
   }
 
@@ -237,6 +277,7 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
     streaming: message.id === streamingId,
     delivery: "sent",
     error: failureOf(message, failures),
+    ...(message.id === streamingId && retrieval ? { retrieval } : {}),
   }));
   // An unsent submission the server turns out to have stored is shown by its stored copy.
   const stored = (submission: Submission) =>

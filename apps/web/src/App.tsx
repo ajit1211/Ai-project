@@ -5,6 +5,8 @@ import { ProtectedRoute, PublicOnlyRoute } from "./auth/routes";
 import { AppShell } from "./components/AppShell";
 import { ChatRoute } from "./pages/ChatRoute";
 import { DashboardPage } from "./pages/DashboardPage";
+import { DocumentDetailPage } from "./pages/DocumentDetailPage";
+import { DocumentsPage } from "./pages/DocumentsPage";
 import { MemoriesPage } from "./pages/MemoriesPage";
 import { InvitationPage } from "./pages/InvitationPage";
 import { OrganizationPage } from "./pages/OrganizationPage";
@@ -50,6 +52,8 @@ export function App() {
               <Route path="/dashboard" element={<DashboardPage />} />
               {/* One route for both URLs, so opening a conversation does not remount the page. */}
               <Route path="/chat/:conversationId?" element={<ChatRoute />} />
+              <Route path="/documents" element={<DocumentsPage />} />
+              <Route path="/documents/:id" element={<DocumentDetailPage />} />
               <Route path="/memories" element={<MemoriesPage />} />
               <Route path="/playground" element={<PlaygroundPage />} />
               <Route path="/organizations/:organizationId" element={<OrganizationPage />} />

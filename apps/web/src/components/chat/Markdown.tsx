@@ -10,6 +10,8 @@
  * - links open in a new tab that cannot reach back into this one;
  * - images are shown as links instead of being loaded, so a reply cannot make the browser
  *   fetch an arbitrary address (a known way to leak conversation text through a URL).
+ *
+ * With `cite`, a grounded reply's citation markers become buttons (see citations.tsx).
  */
 
 import "highlight.js/styles/github.css";
@@ -18,6 +20,8 @@ import { memo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
+
+import { CitationMarker, rehypeCitations } from "./citations";
 
 const SAFE_PROTOCOLS: ReadonlySet<string> = new Set(["http:", "https:", "mailto:"]);
 
@@ -65,15 +69,26 @@ const components: Components = {
 const remarkPlugins = [remarkGfm];
 const rehypePlugins = [rehypeHighlight];
 
+// A grounded reply also turns its citation markers into buttons (citations.tsx). Ordinary
+// replies never go through this step.
+const citedRehypePlugins = [rehypeCitations, rehypeHighlight];
+const citedComponents: Components = { ...components, cite: CitationMarker };
+
+export interface MarkdownProps {
+  text: string;
+  /** Make [S1]-style markers citation buttons (a grounded reply, inside a CitationContext). */
+  cite?: boolean;
+}
+
 /** Memoized: while a reply streams, only that reply is parsed again. */
-export const Markdown = memo(function Markdown({ text }: { text: string }) {
+export const Markdown = memo(function Markdown({ text, cite = false }: MarkdownProps) {
   return (
     <div className="markdown">
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
-        rehypePlugins={rehypePlugins}
+        rehypePlugins={cite ? citedRehypePlugins : rehypePlugins}
         urlTransform={safeUrl}
-        components={components}
+        components={cite ? citedComponents : components}
       >
         {text}
       </ReactMarkdown>

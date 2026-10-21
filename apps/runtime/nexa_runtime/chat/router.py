@@ -29,6 +29,7 @@ from nexa_runtime.chat.schemas import (
     UpdateConversation,
 )
 from nexa_runtime.chat.service import ChatService, Generation
+from nexa_runtime.rag.schemas import SourceOut
 from nexa_runtime.responses import Envelope, ok
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -109,6 +110,14 @@ async def list_messages(
     return Envelope[list[MessageOut]](
         data=items, meta={"next_before": next_before, "has_more": next_before is not None}
     )
+
+
+@router.get("/{conversation_id}/messages/{message_id}/sources/")
+async def message_sources(
+    conversation_id: UUID, message_id: UUID, principal: CurrentPrincipal, service: Service
+) -> Envelope[list[SourceOut]]:
+    """The passages a grounded reply was given, whole, re-authorized for the caller now."""
+    return ok(await service.message_sources(principal, conversation_id, message_id))
 
 
 @router.post("/{conversation_id}/messages/", response_model=None)

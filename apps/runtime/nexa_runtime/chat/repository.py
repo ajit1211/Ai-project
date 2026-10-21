@@ -196,6 +196,17 @@ async def message_by_client_id(
     return result.first()
 
 
+async def message_by_id(
+    conn: AsyncConnection, conversation_id: UUID, message_id: UUID
+) -> MessageRow | None:
+    result = await conn.execute(
+        select(t.messages).where(
+            t.messages.c.conversation_id == conversation_id, t.messages.c.id == message_id
+        )
+    )
+    return result.first()
+
+
 async def message_at(
     conn: AsyncConnection, conversation_id: UUID, sequence: int
 ) -> MessageRow | None:
@@ -239,10 +250,12 @@ async def insert_message(
     client_message_id: str = "",
     model: str = "",
     message_id: UUID | None = None,
+    grounding: dict[str, Any] | None = None,
 ) -> MessageRow:
     result = await conn.execute(
         insert(t.messages)
         .values(
+            grounding=grounding,
             id=message_id or new_id(),
             organization_id=organization_id,
             conversation_id=conversation_id,

@@ -1,12 +1,14 @@
 /**
  * One message. The user's text is shown as typed (line breaks kept); a reply is rendered as
- * Markdown, with its status, its details (tokens, cost, latency) and its actions.
+ * Markdown, with its status, its details (tokens, cost, latency) and its actions. A reply
+ * answered from documents adds its citations and sources (GroundedReply.tsx).
  */
 
 import { useEffect, useState } from "react";
 
 import type { ChatItem } from "../../hooks/chatThread";
 import type { Message } from "../../types/chat";
+import { GroundedReply, RetrievalStatus } from "./GroundedReply";
 import { Icon } from "./Icon";
 import { Markdown } from "./Markdown";
 import { StreamingIndicator } from "./StreamingIndicator";
@@ -147,15 +149,18 @@ export function MessageBubble({ item, canRegenerate, canRetry, onRegenerate, onR
     delivery === "sent" &&
     (message.status === "completed" || message.status === "failed" || message.status === "cancelled");
 
+  const grounding = isUser ? null : (message.grounding ?? null);
   let body = null;
   if (isUser) body = <p className="message-text">{message.content}</p>;
+  else if (grounding) body = <GroundedReply message={message} grounding={grounding} streaming={streaming} />;
   else if (message.content) body = <Markdown text={message.content} />;
 
   return (
-    <li className={`message message-${message.role} message-${delivery}`}>
+    <li className={`message message-${message.role} message-${delivery}${grounding ? " message-grounded" : ""}`}>
       <div className="message-bubble">
         <span className="visually-hidden">{isUser ? "You said:" : "NEXA replied:"}</span>
         {body}
+        {item.retrieval && <RetrievalStatus retrieval={item.retrieval} />}
         {streaming && <StreamingIndicator />}
       </div>
       <StatusLine item={item} />

@@ -70,6 +70,15 @@ class CoreSettings(BaseSettings):
     documents_org_storage_bytes: int = 5 * 1024 * 1024 * 1024
     documents_purge_after_days: int = 30
 
+    # The search index behind document-grounded answers (docs/architecture/rag.md). Sizes
+    # are characters; a token is estimated at three characters.
+    rag_chunk_target_chars: int = 1_200
+    rag_chunk_max_chars: int = 2_000
+    rag_chunk_overlap_chars: int = 200
+    rag_max_chunks_per_document: int = 20_000
+    rag_index_timeout_seconds: int = 300
+    rag_index_requests_per_hour: int = 30
+
     @property
     def allowed_hosts(self) -> list[str]:
         return _split(self.django_allowed_hosts)
