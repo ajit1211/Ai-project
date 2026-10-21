@@ -46,9 +46,9 @@ Phase 07 bugs were fixed. Missing dependencies: none; no vector store, no new se
 
 | Brief item | Tests |
 | --- | --- |
-| Chunks and metadata, pages and sections, size and overlap, empty and malformed text | `test_document_chunking.py` (21), including the hand-off from real PDF and DOCX extraction |
-| Idempotent indexing, re-indexing, failed and retried runs | `test_document_indexing.py` (18): duplicate, superseded, stable ids on re-index, failure keeps the previous chunks, deleted during indexing, live and dead runs, stale strategy, the search column, the index API and its authorization, rate limit, `searchable` filter, deletion |
-| Retrieval, filters, limits and ordering, insufficient evidence | `test_rag_unit.py` (17) and `test_rag_chat.py` (25): terms, near-duplicates, budget, scopes (documents, team, all), no evidence, no searchable words |
+| Chunks and metadata, pages and sections, size and overlap, empty and malformed text | `test_document_chunking.py` (26), including the hand-off from real PDF and DOCX extraction |
+| Idempotent indexing, re-indexing, failed and retried runs | `test_document_indexing.py` (20): duplicate, superseded, stable ids on re-index, failure keeps the previous chunks, a store failure recorded as failed, deleted during indexing (before and between claim and store), live and dead runs, stale strategy, the search column, the index API and its authorization, rate limit, `searchable` filter, deletion |
+| Retrieval, filters, limits and ordering, insufficient evidence | `test_rag_unit.py` (18) and `test_rag_chat.py` (27): terms, near-duplicates, budget, scopes (documents, team, all), no evidence, no searchable words |
 | Gateway integration with mocks, structured answer validation, fabricated citations | Mock provider grounded answers; `[[cite:S99]]` recorded as invalid and never a source; `[[no_cite]]` marked uncited |
 | Citation authorization, cross-user and cross-tenant isolation | Unreadable, foreign and guessed ids refused with nothing stored; library scope never returns hidden or foreign passages; sources become unavailable when a document is unshared or deleted; regenerate re-authorizes; SQL visibility equals the shared policy over a role and sharing matrix |
 | Prompt injection in documents | Passages confined to the source block, block-breaking text escaped, NEXA's instructions byte-for-byte unchanged |
@@ -62,9 +62,9 @@ Phase 07 bugs were fixed. Missing dependencies: none; no vector store, no new se
 | --- | --- | --- |
 | Python: `packages/nexa-common` | 17 | pass |
 | Python: `packages/nexa-ai` | 167 | pass |
-| Python: `apps/core` (103 new in Phases 07 and 08) | 240 | pass |
-| Python: `apps/runtime` (45 new) | 205 | pass |
-| Python total | 629 | pass |
+| Python: `apps/core` (110 new in Phases 07 and 08) | 247 | pass |
+| Python: `apps/runtime` (48 new) | 208 | pass |
+| Python total | 639 | pass |
 | Web: Vitest | 189 in 18 files (89 new in Phases 07 and 08) | pass |
 | `scripts/e2e_rag.py` against the running stack (mock provider) | 31 checks | 31 pass |
 | `scripts/e2e_documents.py` | 75 checks | 75 pass |
@@ -91,6 +91,22 @@ own words, the set is tiny, and the mock provider is not a language model.
 - Phase 07's `?format=` filter and purge count (see the Phase 07 report).
 - Near-duplicate removal collapsed two test documents with nearly the same text; the test
   data was wrong, the behaviour is intended.
+
+An independent review of the committed code (no high-severity findings) found ten defects;
+all were fixed, each with a regression test, and every suite above was run again after:
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| Heading regex backtracked cubically on a `#` line with thousands of spaces (a 3 KB upload held a worker for 24 s) | medium | Linear pattern; closing hashes removed in Python |
+| A table header over half a chunk was dropped, so wide CSVs lost their column names | medium | The header becomes a passage of its own |
+| Deleting a document while it was being indexed could leave its chunks behind, and opposite lock orders could deadlock | medium | Indexing locks the document before its index, like every other writer; a failed store is recorded as `failed` |
+| Regenerate resolved the scope on a second pooled connection while holding the conversation lock | low | Resolution uses the transaction's own connection |
+| `< /source>` (a space after `<`) was not escaped in passages | low | Every `<` in a passage is escaped |
+| Overlap could push a chunk past the maximum (2 190 characters) | low | The overlap is dropped when it would not fit |
+| A heading with no text of its own was not searchable | low | It becomes a short passage |
+| An interrupted grounded reply kept `outcome: pending` | low | Marking a reply failed also marks its grounding failed; ordinary replies now store SQL NULL |
+| `RAG_TOP_K` above 12 made regenerating fail validation | low | Source counts are clamped to 1..12 |
+| A retried grounded send was re-authorized before the idempotent replay | low | The replay check comes first |
 
 ## Known limitations
 

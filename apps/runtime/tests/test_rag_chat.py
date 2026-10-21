@@ -802,8 +802,71 @@ class TestReauthorization:
         assert len(rag_calls(provider)) == 2
         assert MessageSource.objects.count() == len(stream[-1][1]["message"]["sources"])
 
+    def test_a_retried_send_replays_even_if_the_document_is_gone(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        handbook = indexed_document(acme(), owner, HANDBOOK, filename="handbook.md")
+        headers = auth(owner)
+        conversation = new_conversation(runtime, headers)
+        body = {
+            "content": REFUND_QUESTION,
+            "client_message_id": "retry-1",
+            "grounding": documents([handbook.id]),
+        }
+        first = runtime.post(
+            f"/api/v1/conversations/{conversation}/messages/", json=body, headers=headers
+        )
+        assert first.status_code == 201
+        Document.objects.filter(id=handbook.id).update(deleted_at=timezone.now())
+        again = runtime.post(
+            f"/api/v1/conversations/{conversation}/messages/", json=body, headers=headers
+        )
+        assert again.status_code == 200  # the stored exchange, not a 404
+        reply = again.json()["data"]["assistant_message"]
+        assert reply["id"] == first.json()["data"]["assistant_message"]["id"]
+        assert reply["sources"][0]["available"] is False
+
 
 class TestFailures:
+    def test_an_interrupted_grounded_reply_records_the_failure(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        handbook = indexed_document(acme(), owner, HANDBOOK, filename="handbook.md")
+        conversation_id = UUID(new_conversation(runtime, auth(owner)))
+        principal = principal_for(owner, acme())
+        service: ChatService = runtime.app.state.chat  # type: ignore[attr-defined]
+
+        async def scenario() -> None:
+            from nexa_runtime.chat import repository as repo
+
+            gen = await service.send(
+                principal,
+                conversation_id,
+                SendMessage(
+                    content=REFUND_QUESTION,
+                    grounding=GroundingRequest(document_ids=[handbook.id]),
+                ),
+                request_id=None,
+            )
+            assert isinstance(gen, Generation)
+            # The process "dies" before generating: the reply is taken over as interrupted.
+            async with service._engine.begin() as conn:
+                await repo.fail_message(
+                    conn, gen.assistant_message.id, error_code="GENERATION_INTERRUPTED"
+                )
+                await repo.release_generation(conn, conversation_id, gen.assistant_message.id)
+
+        runtime.portal.call(scenario)  # type: ignore[union-attr]
+        reply = Message.objects.get(role="assistant")
+        assert reply.status == "failed"
+        assert reply.grounding is not None
+        assert reply.grounding["outcome"] == "failed"
+        plain = new_conversation(runtime, auth(owner))
+        assert events(ask(runtime, auth(owner), plain, "Hello").text)[-1][0] == "message_complete"
+        drain(runtime)
+        ordinary = Message.objects.filter(conversation_id=plain, role="assistant").get()
+        assert ordinary.grounding is None
+
     def test_a_retrieval_failure_fails_the_reply_safely(
         self, runtime: TestClient, owner: User
     ) -> None:

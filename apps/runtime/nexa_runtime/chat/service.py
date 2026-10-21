@@ -308,9 +308,6 @@ class ChatService:
         require(principal, "ai.chat")
         await self._check_model(principal, body.model)
         scope: Scope | None = None
-        if body.grounding is not None:
-            # Authorized before anything is stored: a bad selection stores no message.
-            scope = await self._resolve_grounding(principal, body.grounding, body.content)
         async with self._engine.begin() as conn:
             conversation = await self._load(
                 conn, principal, conversation_id, "update", for_update=True
@@ -323,6 +320,12 @@ class ChatService:
                 )
                 if earlier is not None:
                     return await self._replay(conn, principal, conversation, earlier)
+            if body.grounding is not None:
+                # Authorized before anything is stored (a bad selection stores no message),
+                # on this transaction's connection rather than a second pooled one.
+                scope = await self._resolve_grounding(
+                    principal, body.grounding, body.content, conn=conn
+                )
             assistant_id = new_id()
             await self._claim(conn, conversation, assistant_id)
             sequence = await repo.next_sequence(conn, conversation.id)
@@ -398,7 +401,7 @@ class ChatService:
                 last.grounding if last.role == "assistant" else None
             )
             if request is not None:
-                scope = await self._resolve_grounding(principal, request, user.content)
+                scope = await self._resolve_grounding(principal, request, user.content, conn=conn)
             assistant_id = new_id()
             await self._claim(conn, conversation, assistant_id)
             if last.role == "assistant":
@@ -723,11 +726,11 @@ class ChatService:
     # --- Document grounding (Phase 08) -------------------------------------------------------
 
     async def _resolve_grounding(
-        self, principal: Principal, request: GroundingRequest, question: str
+        self, principal: Principal, request: GroundingRequest, question: str, *, conn: Any
     ) -> Scope:
         if self._rag is None:
             raise GroundingDisabled("Answers from documents are not available.")
-        return await self._rag.resolve(principal, request, question=question)
+        return await self._rag.resolve(principal, request, question=question, conn=conn)
 
     async def _ground(self, gen: Generation) -> Grounded:
         if self._rag is None or gen.scope is None:  # pragma: no cover - send() checked both

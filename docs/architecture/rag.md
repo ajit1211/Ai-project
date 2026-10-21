@@ -48,8 +48,12 @@ text and settings always give the same chunks.
 4. Where a block had to be split, the next chunk repeats up to `overlap` characters of whole
    sentences from the end of the previous one.
 5. Table chunks (Word tables, every CSV) repeat the header row and record the data rows they
-   hold, so a passage from row 4 000 still says what its columns are.
-6. Empty chunks and exact repeats (the same footer on every page) are dropped.
+   hold, so a passage from row 4 000 still says what its columns are. A header too wide to
+   repeat (over half a chunk) becomes a passage of its own, so column names stay searchable.
+6. A heading with no text of its own (followed by a sibling or parent heading) becomes a
+   short passage of its own.
+7. Empty chunks and exact repeats (the same footer on every page) are dropped; no chunk is
+   longer than the maximum, overlap included.
 
 Headings are recognized only where the extractor wrote them (`#` lines from Markdown and Word
 headings). Plain text and PDF text carry no reliable structure, so their chunks have no
@@ -147,7 +151,7 @@ those labels meant other passages), then the question.
 
 Passages are added best first until `RAG_CONTEXT_MAX_TOKENS` (estimated) is spent; a single
 passage is cut at `RAG_PASSAGE_MAX_CHARS`. Never a whole document. Document text cannot close
-its `<source>` block or open another (tag-like sequences are escaped), and document names and
+its `<source>` block or open another (every `<` in a passage is escaped), and document names and
 sections are escaped as attribute values. When nothing was retrieved, the model is not called:
 the reply states that the selected documents contain nothing matching, and the outcome is
 `no_evidence`.

@@ -152,16 +152,19 @@ def run_indexing(document_id: UUID, generation: int) -> str:
     return _store(document_id, generation, chunks, warnings, source_sha256, started)
 
 
+def _lock(document_id: UUID) -> tuple[Document | None, DocumentIndex | None]:
+    """Lock the document, then its index row: the order every writer uses (deleting,
+    processing and re-index requests lock the document first), so they cannot deadlock."""
+    document = Document.objects.select_for_update().filter(id=document_id).first()
+    index = DocumentIndex.objects.select_for_update().filter(document_id=document_id).first()
+    return document, index
+
+
 def _claim(document_id: UUID, generation: int) -> Document | str:
     now = timezone.now()
     with transaction.atomic():
-        index = (
-            DocumentIndex.objects.select_for_update()
-            .select_related("document")
-            .filter(document_id=document_id)
-            .first()
-        )
-        if index is None:
+        document, index = _lock(document_id)
+        if index is None or document is None:
             return "cancelled"  # the document was deleted, and its index with it
         if index.generation != generation:
             return "superseded"
@@ -169,7 +172,6 @@ def _claim(document_id: UUID, generation: int) -> Document | str:
             return "skipped"
         if is_running(index, now=now):
             return "skipped"
-        document = index.document
         if document.deleted_at is not None:
             return "cancelled"
         if document.status != lifecycle.COMPLETED:
@@ -211,12 +213,37 @@ def _store(
     source_sha256: str,
     started: float,
 ) -> str:
+    try:
+        return _replace_chunks(document_id, generation, chunks, warnings, source_sha256, started)
+    except Exception as exc:
+        # Nothing was stored (the transaction rolled back); record why, so the run does not
+        # stay "indexing" until the stalled-run sweep.
+        log.error("documents.indexing.store_failed", error=type(exc).__name__)
+        return _fail(
+            document_id,
+            generation,
+            "indexing_failed",
+            "The document could not be indexed.",
+            started,
+        )
+
+
+def _replace_chunks(
+    document_id: UUID,
+    generation: int,
+    chunks: list[Chunk],
+    warnings: list[str],
+    source_sha256: str,
+    started: float,
+) -> str:
     now = timezone.now()
     duration_ms = _elapsed_ms(started)
     with transaction.atomic():
-        index = DocumentIndex.objects.select_for_update().filter(document_id=document_id).first()
-        document = Document.objects.filter(id=document_id, deleted_at__isnull=True).first()
-        if index is None or document is None:
+        # Locking the document first also orders this run with a concurrent delete: either
+        # the delete waits and then removes the chunks stored here, or this run waits and
+        # finds the document deleted.
+        document, index = _lock(document_id)
+        if index is None or document is None or document.deleted_at is not None:
             return "cancelled"
         if index.generation != generation:
             return "superseded"  # the newer request rebuilds it

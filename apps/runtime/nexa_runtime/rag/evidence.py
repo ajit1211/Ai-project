@@ -61,8 +61,6 @@ NO_TERMS_ANSWER = (
 # [S1], [S1, S3], [S1; S2]: the forms a model uses when told to cite with [S1].
 _CITATION = re.compile(r"\[\s*(S\d{1,3}(?:\s*[,;]\s*S\d{1,3})*)\s*\]")
 _LABEL = re.compile(r"S\d{1,3}")
-# Anything that could close or open the block the passage sits in.
-_TAG = re.compile(r"<(/?\s*sources?\b)", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,8 +152,9 @@ def render_source(label: str, passage: Passage, *, max_chars: int) -> str:
 
 
 def neutralize(text: str) -> str:
-    """Document text as inert data: it cannot end its <source> block or start another."""
-    return _TAG.sub(r"&lt;\1", text)
+    """Document text as inert data: every `<` is escaped, so no spelling of a tag (`< /source>`,
+    `<​/source>`, ...) can end its <source> block or start another."""
+    return text.replace("<", "&lt;")
 
 
 def _attribute(value: str) -> str:

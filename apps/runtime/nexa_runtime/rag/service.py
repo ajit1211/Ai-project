@@ -50,7 +50,12 @@ from nexa_runtime.rag.retrieval import (
     drop_near_duplicates,
     query_terms,
 )
-from nexa_runtime.rag.schemas import GroundingRequest, GroundingScopeKind, SourceOut
+from nexa_runtime.rag.schemas import (
+    MAX_SOURCES,
+    GroundingRequest,
+    GroundingScopeKind,
+    SourceOut,
+)
 from nexa_runtime.ratelimit import Limiter
 
 log = get_logger("nexa.runtime.rag")
@@ -88,7 +93,7 @@ class Scope:
             else [],
             team_id=UUID(record["team_id"]) if kind == "team" and record.get("team_id") else None,
             all_documents=kind == "library",
-            max_sources=record.get("max_sources"),
+            max_sources=_clamp_sources(record.get("max_sources")),
         )
 
 
@@ -154,7 +159,12 @@ class RagEngine:
     # --- Authorizing a scope -------------------------------------------------------------------
 
     async def resolve(
-        self, principal: Principal, request: GroundingRequest, *, question: str
+        self,
+        principal: Principal,
+        request: GroundingRequest,
+        *,
+        question: str,
+        conn: AsyncConnection | None = None,
     ) -> Scope:
         """Check the requested scope for this principal, or raise: 404 for a document (or team)
         that does not exist for them, 409 for one they may read that is not indexed yet."""
@@ -184,15 +194,16 @@ class RagEngine:
             limit=settings.rag_queries_per_minute,
             window_seconds=60,
         )
-        max_sources = min(request.max_sources or settings.rag_top_k, settings.rag_max_top_k)
+        max_sources = max(
+            1, min(request.max_sources or settings.rag_top_k, settings.rag_max_top_k, MAX_SOURCES)
+        )
         organization_id = _organization(principal)
 
         if request.document_ids:
             ids = tuple(dict.fromkeys(request.document_ids))
             if len(ids) > settings.rag_max_documents:
                 raise InvalidScope(f"Select at most {settings.rag_max_documents} documents.")
-            async with self._engine.connect() as conn:
-                rows = await _documents(conn, organization_id, ids)
+            rows = await self._read(conn, _documents, organization_id, ids)
             not_ready: list[UUID] = []
             for document_id in ids:
                 row = rows.get(document_id)
@@ -218,13 +229,20 @@ class RagEngine:
         if request.team_id is not None:
             allowed = request.team_id in principal.team_ids or principal.has("documents.manage_all")
             if allowed:
-                async with self._engine.connect() as conn:
-                    allowed = await _team_exists(conn, organization_id, request.team_id)
+                allowed = await self._read(conn, _team_exists, organization_id, request.team_id)
             if not allowed:
                 raise DocumentUnavailable("The selected team is not available.")
             return Scope("team", team_id=request.team_id, max_sources=max_sources)
 
         return Scope("library", max_sources=max_sources)
+
+    async def _read(self, conn: AsyncConnection | None, query: Any, *args: Any) -> Any:
+        """Run a lookup on the caller's connection when it has one (a caller holding a
+        conversation lock must not wait for a second pooled connection)."""
+        if conn is not None:
+            return await query(conn, *args)
+        async with self._engine.connect() as own:
+            return await query(own, *args)
 
     def filter_for(self, principal: Principal, scope: Scope) -> DocumentFilter:
         return DocumentFilter(
@@ -518,6 +536,14 @@ async def _team_exists(conn: AsyncConnection, organization_id: UUID, team_id: UU
         )
     )
     return result.first() is not None
+
+
+def _clamp_sources(value: Any) -> int | None:
+    """Within 1..MAX_SOURCES whatever the settings say, so a stored scope always
+    validates again when the reply is regenerated."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    return max(1, min(value, MAX_SOURCES))
 
 
 def _organization(principal: Principal) -> UUID:

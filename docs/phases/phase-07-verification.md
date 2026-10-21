@@ -55,7 +55,7 @@ processing in Runtime): ADR-035.
 | --- | --- | --- |
 | Python: `apps/core/tests/test_document_extraction.py` | 26 | pass |
 | Python: `apps/core/tests/test_documents_api.py` | 38 | pass |
-| Python: whole suite (all phases, including Phase 08) | 629 | pass |
+| Python: whole suite (all phases, including Phase 08) | 639 | pass |
 | Web: Vitest (all phases, including Phase 08) | 189 in 18 files | pass |
 | `scripts/e2e_documents.py` against the running stack | 75 checks | 75 pass |
 | ruff, ruff format, mypy (strict), ESLint, `tsc --noEmit`, `vite build` | | clean |

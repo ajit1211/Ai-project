@@ -61,7 +61,8 @@ messages = Table(
     Column("finish_reason", String, nullable=False),
     Column("error_code", String, nullable=False),
     # Null for ordinary replies; what a document-grounded reply used and how it went (Phase 08).
-    Column("grounding", JSONB),
+    # none_as_null: an ordinary reply stores SQL NULL, not the JSON value null.
+    Column("grounding", JSONB(none_as_null=True)),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True)),
 )

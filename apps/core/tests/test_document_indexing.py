@@ -224,6 +224,40 @@ class TestRuns:
         index.refresh_from_db()
         assert (index.status, index.error_code) == ("failed", "timeout")
 
+    def test_a_document_deleted_between_claim_and_store_keeps_no_chunks(
+        self, org: Organization, owner: User
+    ) -> None:
+        from django.utils import timezone
+
+        document = indexed_document(org, owner, HANDBOOK, filename="h.md", index=False)
+        DocumentIndex.objects.create(document=document, organization=org, generation=1)
+        claimed = indexing._claim(document.id, 1)
+        assert isinstance(claimed, Document)
+        chunks, warnings, digest = indexing._chunks_for(claimed)
+        # The delete, as delete_document does it: hide the row, then drop chunks and index.
+        with transaction.atomic():
+            Document.objects.filter(id=document.id).update(deleted_at=timezone.now())
+            indexing.forget_index(document)
+        assert indexing._store(document.id, 1, chunks, warnings, digest, 0.0) == "cancelled"
+        assert not DocumentChunk.objects.filter(document=document).exists()
+
+    def test_a_store_failure_is_recorded_not_left_indexing(
+        self, org: Organization, owner: User, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        document = indexed_document(org, owner, HANDBOOK, filename="h.md")
+        before = chunk_ids(document.id)
+
+        def broken(*args: Any, **kwargs: Any) -> str:
+            raise RuntimeError("database went away")
+
+        monkeypatch.setattr(indexing, "_replace_chunks", broken)
+        with transaction.atomic():
+            index = indexing.request_indexing(document)
+        assert indexing.run_indexing(document.id, index.generation) == "failed"
+        index.refresh_from_db()
+        assert (index.status, index.error_code) == ("failed", "indexing_failed")
+        assert chunk_ids(document.id) == before
+
     def test_stale_strategy_is_reported(self, org: Organization, owner: User) -> None:
         document = indexed_document(org, owner, HANDBOOK, filename="h.md")
         DocumentIndex.objects.filter(document=document).update(strategy_version="old/v0")

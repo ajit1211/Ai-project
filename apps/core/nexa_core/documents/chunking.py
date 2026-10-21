@@ -15,8 +15,12 @@ Rules, most important first:
 4. Where a block had to be split, the next chunk repeats up to `overlap_chars` of whole
    sentences from the end of the previous one, so a passage never starts mid-thought.
 5. Table chunks repeat the table's header row, so every chunk of a CSV still says what its
-   columns are; they record which data rows they hold.
-6. Empty chunks and exact repeats (boilerplate on every page) are dropped.
+   columns are; they record which data rows they hold. A header too wide to repeat (over
+   half a chunk) becomes a passage of its own instead.
+6. A heading with no text of its own (the next heading is a sibling or a parent) becomes a
+   short passage, so its words stay searchable.
+7. Empty chunks and exact repeats (boilerplate on every page) are dropped. No chunk is
+   longer than `max_chars`.
 
 Prose chunks are exact slices of the text: `text[char_start:char_end] == content`. Table chunks
 are the header row plus the slice of their rows (`char_start:char_end` covers the rows).
@@ -41,7 +45,9 @@ MAX_SECTION_CHARS = 300
 
 ChunkKind = Literal["text", "table"]
 
-_HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
+# Linear on any line (no nested or adjacent ambiguous quantifiers): optional closing hashes
+# are removed in Python, see `_heading_title`. Document text is untrusted input.
+_HEADING = re.compile(r"^(#{1,6})[ \t]+(\S.*)$")
 _FENCE = re.compile(r"^[ \t]*(```|~~~)")
 _TABLE_SEPARATOR = re.compile(r"^\|(?:[ \t]*:?-{3,}:?[ \t]*\|)+[ \t]*$")
 # A sentence ends at . ! or ? (optionally followed by closing quotes or brackets) and space.
@@ -144,6 +150,15 @@ def _lines(text: str) -> Iterator[_Line]:
         start = end + 1
 
 
+def _heading_title(raw: str) -> str:
+    """The heading text without a closing `###` (only when separated by a space: "C#" stays)."""
+    title = raw.rstrip()
+    unhashed = title.rstrip("#")
+    if unhashed != title and (not unhashed or unhashed[-1] in " \t"):
+        title = unhashed.rstrip()
+    return " ".join(title.split())
+
+
 def _blocks(text: str, fmt: str) -> list[_Block]:
     """Paragraphs, headings, tables and code blocks, in reading order."""
     structured = fmt in _STRUCTURED
@@ -176,7 +191,7 @@ def _blocks(text: str, fmt: str) -> list[_Block]:
             continue
         if structured and (match := _HEADING.match(raw)):
             flush()
-            title = " ".join(match.group(2).split())
+            title = _heading_title(match.group(2))
             blocks.append(_Block("heading", [line], level=len(match.group(1)), title=title))
             continue
         if tabular and raw.lstrip().startswith("|"):
@@ -339,8 +354,11 @@ class _Builder:
                 at_boundary = first and current >= target * 0.6
                 if size > target or at_boundary:
                     self.emit_slice(chunk, section)
-                    # Repeat the end of the previous chunk only when a block was split.
+                    # Repeat the end of the previous chunk only when a block was split, and
+                    # only when the repeat and the next unit still fit the maximum.
                     chunk = [] if first else self.tail(chunk, overlap, limit=start)
+                    if chunk and end - chunk[0][0] > self.config.max_chars:
+                        chunk = []
             chunk.append(unit)
         if chunk:
             self.emit_slice(chunk, section)
@@ -367,12 +385,20 @@ class _Builder:
             header_lines = lines[:2]
         rows = lines[len(header_lines) :]
         header = "\n".join(self.text[ln.start : ln.end] for ln in header_lines)
-        # A header that would crowd out its rows is shown once, not repeated.
+        # A header that would crowd out its rows is not repeated: it becomes a passage of its
+        # own (split if it is longer than a chunk), so its column names stay searchable.
         repeat = header if len(header) <= self.config.max_chars // 2 else ""
-        budget = self.config.target_chars - len(repeat)
+        if header and (not repeat or not rows):
+            header_end = header_lines[-1].end
+            for start, end in _hard_split(
+                self.text, header_lines[0].start, header_end, self.config.max_chars
+            ):
+                self.emit(self.text[start:end], start, end, section, kind="table")
         if not rows:
-            self.emit(header, block.start, block.end, section, kind="table")
             return
+        budget = self.config.target_chars - len(repeat)
+        # Room for one row next to the repeated header and the newline between them.
+        row_room = self.config.max_chars - len(repeat) - (1 if repeat else 0)
         group: list[tuple[int, _Line]] = []
 
         def flush() -> None:
@@ -393,10 +419,11 @@ class _Builder:
 
         for number, line in enumerate(rows, start=1):
             length = line.end - line.start
-            if length > self.config.max_chars - len(repeat):
+            if length > row_room:
                 flush()
-                limit = max(100, self.config.max_chars - len(repeat))
-                for piece_start, piece_end in _hard_split(self.text, line.start, line.end, limit):
+                for piece_start, piece_end in _hard_split(
+                    self.text, line.start, line.end, row_room
+                ):
                     piece = self.text[piece_start:piece_end]
                     content = f"{repeat}\n{piece}" if repeat else piece
                     self.emit(
@@ -434,22 +461,33 @@ def chunk_text(
     section = ""
     run: list[_Block] = []
     run_page: int | None = None
+    # A heading with nothing under it yet. If the next heading is a sibling or a parent (not
+    # a child), the heading had no content of its own: it becomes a passage, so its words
+    # stay searchable ("## Escalation matrix" followed by "## Refunds").
+    empty_heading: _Block | None = None
 
     def flush_run() -> None:
         if run:
             builder.prose(list(run), section)
             run.clear()
 
+    def emit_heading(block: _Block) -> None:
+        builder.emit(text[block.start : block.end], block.start, block.end, section)
+
     for block in _blocks(text, fmt):
         if builder.full:
             break
         if block.kind == "heading":
             flush_run()
+            if empty_heading is not None and block.level <= empty_heading.level:
+                emit_heading(empty_heading)
+            empty_heading = block
             while headings and headings[-1][0] >= block.level:
                 headings.pop()
             headings.append((block.level, block.title))
             section = " > ".join(title for _, title in headings)[:MAX_SECTION_CHARS]
             continue
+        empty_heading = None
         page = page_index.at(block.start) if page_index else None
         if run and page != run_page:
             flush_run()  # a chunk never crosses a page
@@ -460,6 +498,8 @@ def chunk_text(
             continue
         run.append(block)
     flush_run()
+    if empty_heading is not None and not builder.full:
+        emit_heading(empty_heading)
     if not result.chunks and "no_text" not in result.warnings:
         result.warnings.append("no_text")
     return result

@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import delete, func, insert, or_, select, tuple_, update
+from sqlalchemy import case, delete, func, insert, literal_column, or_, select, tuple_, update
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -298,11 +298,27 @@ async def fail_message(
     conn: AsyncConnection, message_id: UUID, *, error_code: str
 ) -> MessageRow | None:
     """Mark an unfinished reply failed, leaving its text as it is. None when the reply is gone
-    or already finished."""
+    or already finished. A grounded reply's record (a JSON object) says "failed" too; an
+    ordinary reply's empty grounding is left as it is."""
     result = await conn.execute(
         update(t.messages)
         .where(t.messages.c.id == message_id, t.messages.c.status.in_(("pending", "streaming")))
-        .values(status="failed", error_code=error_code, completed_at=now())
+        .values(
+            status="failed",
+            error_code=error_code,
+            completed_at=now(),
+            grounding=case(
+                (
+                    func.jsonb_typeof(t.messages.c.grounding) == "object",
+                    func.jsonb_set(
+                        t.messages.c.grounding,
+                        literal_column("ARRAY['outcome']"),
+                        literal_column("'\"failed\"'::jsonb"),
+                    ),
+                ),
+                else_=t.messages.c.grounding,
+            ),
+        )
         .returning(t.messages)
     )
     return cast("Row[Any] | None", result.one_or_none())

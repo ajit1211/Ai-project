@@ -155,6 +155,60 @@ class TestSections:
         assert "# install" in result.chunks[0].content
 
 
+class TestReviewFindings:
+    """Regressions for the Phase 08 code review."""
+
+    def test_a_hostile_heading_line_is_linear(self) -> None:
+        import time
+
+        line = "# x" + " " * 20_000 + "y"
+        started = time.perf_counter()
+        result = chunk_text(line + "\n\nBody.", fmt="md")
+        assert time.perf_counter() - started < 1.0
+        assert result.chunks[0].section == "x y"
+
+    def test_closing_hashes_are_removed_but_not_from_words(self) -> None:
+        result = chunk_text("## Refunds ##\n\nText.\n\n## C#\n\nMore.", fmt="md")
+        assert [c.section for c in result.chunks] == ["Refunds", "C#"]
+
+    def test_a_wide_table_header_is_kept_as_its_own_passage(self) -> None:
+        columns = [f"column_name_{i:02d}" for i in range(80)]
+        text = markdown_table(columns, [[str(i) for i in range(80)] for _ in range(3)])
+        result = chunk_text(text, fmt="csv")
+        joined = "\n".join(c.content for c in result.chunks)
+        assert "column_name_79" in joined
+        assert all(len(c.content) <= ChunkingConfig().max_chars for c in result.chunks)
+        assert result.chunks[0].row_start is None  # the header passage
+
+    def test_no_chunk_exceeds_the_maximum_after_overlap(self) -> None:
+        import random
+
+        rng = random.Random(8)  # noqa: S311 - a seeded, reproducible test input
+        config = ChunkingConfig()
+        for _ in range(40):
+            sentences = [
+                ("w" * rng.choice([5, 50, 190, 999, 1_000, 1_999])).replace("w", "word ", 1) + "."
+                for _ in range(rng.randint(2, 12))
+            ]
+            text = " ".join(sentences)
+            result = chunk_text(text, fmt="txt", config=config)
+            assert all(len(c.content) <= config.max_chars for c in result.chunks)
+            table = markdown_table(["A", "B"], [[s, "x"] for s in sentences])
+            for chunk in chunk_text(table, fmt="csv", config=config).chunks:
+                assert len(chunk.content) <= config.max_chars
+
+    def test_headings_without_text_stay_searchable(self) -> None:
+        text = "# Glossary\n\n## Escalation matrix\n\n## Refund window\n\nThirty days."
+        result = chunk_text(text, fmt="md")
+        assert [(c.section, c.content) for c in result.chunks] == [
+            ("Glossary > Escalation matrix", "## Escalation matrix"),
+            ("Glossary > Refund window", "Thirty days."),
+        ]
+        only_headings = chunk_text("# One\n\n## Two\n\n# Three", fmt="md")
+        assert [c.content for c in only_headings.chunks] == ["## Two", "# Three"]
+        assert only_headings.warnings == []
+
+
 class TestPages:
     def test_pdf_chunks_keep_their_page_and_never_cross_one(self) -> None:
         pages = ["Page one talks about refunds.", "Page two talks about travel.", "Page three."]

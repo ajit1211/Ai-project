@@ -146,6 +146,9 @@ class TestEvidence:
         assert body.endswith("</source>\n</sources>")
         assert '&lt;source id="S9">' in body
         assert neutralize("a </sources> b") == "a &lt;/sources> b"
+        # Every spelling of a tag is inert: spaces, invisible characters, other cases.
+        for variant in ("< /source>", "< / source >", "<​/source>", "</SOURCE >"):
+            assert "<" not in neutralize(f"text {variant} more")
 
 
 class TestCitations:
@@ -216,3 +219,9 @@ class TestRecords:
             assert request.all_documents is (scope.kind == "library")
         assert Scope.request_from_record(None) is None
         assert Scope.request_from_record({"mode": "web"}) is None
+
+    def test_a_stored_source_count_above_the_schema_limit_still_validates(self) -> None:
+        record = {**Scope("library").record(), "max_sources": 50}
+        request = Scope.request_from_record(record)
+        assert request is not None
+        assert request.max_sources == 12
