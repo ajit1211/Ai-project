@@ -1,14 +1,21 @@
 import { describe, expect, it } from "vitest";
 
 import { ApiError } from "../../api/client";
+import type { SemanticStatus } from "../../types/document";
 import { checkFile, extensionOf, formatBytes } from "./files";
 import {
   describeDocumentError,
+  describeEmbeddingFailure,
   describeFailure,
   describeIndexFailure,
+  describeSemanticUnavailable,
   describeWarning,
   indexLabel,
   indexTone,
+  isEmbedding,
+  isEmbeddingNow,
+  semanticLabel,
+  semanticTone,
   statusLabel,
   statusTone,
 } from "./labels";
@@ -77,6 +84,56 @@ describe("statuses", () => {
       "Indexing took too long and was stopped.",
     );
     expect(describeIndexFailure({ ...failed, status: "indexed" })).toBeNull();
+  });
+});
+
+describe("the semantic index", () => {
+  it.each<[SemanticStatus, string, string, boolean, boolean]>([
+    // status, label, tone, polled, re-embed disabled
+    ["unavailable", "Semantic search unavailable", "neutral", false, false],
+    ["none", "Not embedded", "neutral", false, false],
+    ["pending", "Embedding queued", "waiting", true, true],
+    ["embedding", "Embedding…", "waiting", true, true],
+    ["ready", "Semantic search ready", "up", false, false],
+    ["failed", "Embedding failed", "down", false, false],
+    ["stale", "Updating embeddings", "waiting", true, false],
+  ])("%s is “%s”", (status, label, tone, polled, busy) => {
+    expect(semanticLabel(status)).toBe(label);
+    expect(semanticTone(status)).toBe(tone);
+    expect(isEmbedding(status)).toBe(polled);
+    expect(isEmbeddingNow(status)).toBe(busy);
+  });
+
+  it("passes an unknown status through, uncoloured and not polled", () => {
+    expect([semanticLabel("archived"), semanticTone("archived"), isEmbedding("archived")]).toEqual([
+      "archived",
+      "neutral",
+      false,
+    ]);
+    expect(semanticLabel("constructor")).toBe("constructor");
+  });
+
+  it("explains a failure with the server's message, else its code", () => {
+    const failed = { status: "failed", error_code: "provider_error", error_message: null };
+    expect(describeEmbeddingFailure({ ...failed, error_message: "The embedding provider refused the request." })).toBe(
+      "The embedding provider refused the request.",
+    );
+    expect(describeEmbeddingFailure({ ...failed, error_code: "timeout" })).toBe(
+      "Embedding took too long and was stopped.",
+    );
+    expect(describeEmbeddingFailure(failed)).toBe("The document could not be prepared for semantic search.");
+    expect(describeEmbeddingFailure({ status: "ready" })).toBeNull();
+  });
+
+  it("says why semantic search is unavailable without naming its internals", () => {
+    expect(describeSemanticUnavailable("disabled")).toBe(
+      "Semantic search is turned off here; documents are found by their keywords.",
+    );
+    for (const reason of ["pgvector_missing", "provider_not_configured", "no_model", null]) {
+      expect(describeSemanticUnavailable(reason)).toBe(
+        "Semantic search is not available here right now; documents are found by their keywords.",
+      );
+    }
   });
 });
 

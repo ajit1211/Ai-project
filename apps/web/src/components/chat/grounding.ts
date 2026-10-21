@@ -1,11 +1,12 @@
 /**
  * Answering from documents in the chat: what the user selected, the `grounding` a send
- * carries for it, and what to say when the server refuses a grounded send. The refusals of
- * these codes carry messages written for users, so they are shown, with what to do next.
+ * carries for it (with how to search, when the user chose), the words for the ways of
+ * searching, and what to say when the server refuses a grounded send. The refusals of these
+ * codes carry messages written for users, so they are shown, with what to do next.
  */
 
 import type { ApiError } from "../../api/client";
-import type { GroundingRequest } from "../../types/chat";
+import type { Grounding, GroundingRequest, RetrievalChoice, RetrievalMode } from "../../types/chat";
 
 /** The server's limit on documents per question. */
 export const MAX_DOCUMENTS = 20;
@@ -22,11 +23,48 @@ export type DocumentSelection =
   | { kind: "documents"; documents: PickedDocument[] }
   | { kind: "all" };
 
-export function groundingFor(selection: DocumentSelection): GroundingRequest {
-  return selection.kind === "all"
-    ? { all_documents: true }
-    : { document_ids: selection.documents.map((document) => document.id) };
+/** The `grounding` of a send. "auto" is the server's default, so it is left out. */
+export function groundingFor(
+  selection: DocumentSelection,
+  retrieval: RetrievalChoice = "auto",
+): GroundingRequest {
+  const scope: GroundingRequest =
+    selection.kind === "all"
+      ? { all_documents: true }
+      : { document_ids: selection.documents.map((document) => document.id) };
+  return retrieval === "auto" ? scope : { ...scope, retrieval_mode: retrieval };
 }
+
+const RETRIEVAL_LABELS = {
+  auto: "Automatic",
+  hybrid: "Hybrid (keywords + meaning)",
+  semantic: "Meaning (semantic)",
+  lexical: "Keywords",
+} satisfies Record<RetrievalChoice, string>;
+
+/** The search control's words for a way of searching. */
+export function retrievalLabel(choice: RetrievalChoice): string {
+  return RETRIEVAL_LABELS[choice];
+}
+
+const RETRIEVAL_METHODS = {
+  hybrid: "Passages found by keywords and meaning.",
+  semantic: "Passages found by meaning.",
+  lexical: "Passages found by keywords.",
+} satisfies Record<RetrievalMode, string>;
+
+/**
+ * How a grounded reply's passages were found, or null when that is not worth saying: on
+ * replies from before semantic search, and when the fallback notice says it already.
+ */
+export function retrievalMethod(grounding: Grounding): string | null {
+  const mode = grounding.retrieval_mode;
+  if (!mode || grounding.fallback || !Object.hasOwn(RETRIEVAL_METHODS, mode)) return null;
+  return RETRIEVAL_METHODS[mode];
+}
+
+/** Said under a reply that was searched by keywords because semantic search could not run. */
+export const FALLBACK_NOTICE = "Searched by keywords: semantic search was unavailable for this answer.";
 
 export function selectionSummary(selection: DocumentSelection): string {
   if (selection.kind === "all") return "Answering from all your documents";

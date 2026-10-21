@@ -79,6 +79,9 @@ def make_settings(**overrides: Any) -> RuntimeSettings:
         "ai_registry_ttl_seconds": 0.0,
         "memory_enabled": True,
         "memory_model": "nexa-fast",
+        # Phase 08 behaviour: keyword retrieval, whatever the database supports. Semantic and
+        # hybrid retrieval are tested in test_rag_vector.py.
+        "rag_retrieval_mode": "lexical",
     }
     values.update(overrides)
     return RuntimeSettings(**values)
@@ -435,7 +438,7 @@ class TestEvidenceAndCitations:
         assert message["grounding"]["outcome"] == "no_evidence"
         assert message["sources"] == []
         assert rag_calls(provider) == []
-        assert not AIUsageEvent.objects.exists()
+        assert not AIUsageEvent.objects.exclude(feature="embedding").exists()
 
     def test_a_question_without_searchable_words(
         self, runtime: TestClient, provider: MockProvider, owner: User

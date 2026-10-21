@@ -1470,6 +1470,20 @@ button:focus-visible {
   font-size: 13px;
 }
 
+.grounding-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.grounding-mode select {
+  width: auto;
+  padding: 3px 8px;
+  font-size: 13px;
+}
+
 .grounding-chips {
   display: flex;
   flex-wrap: wrap;
@@ -2110,6 +2124,10 @@ button:focus-visible {
 
 .doc-toolbar select {
   width: auto;
+}
+
+.doc-library-note {
+  margin: -4px 0 12px;
 }
 
 .doc-search {

@@ -11,6 +11,7 @@ import type {
   DocumentVisibility,
   IndexStatus,
   IngestionStatus,
+  SemanticStatus,
 } from "../../types/document";
 
 /** The badge colours of styles.css: `.badge-up`, `.badge-down`, `.badge-waiting`, `.badge-neutral`. */
@@ -103,6 +104,63 @@ export function describeIndexFailure(index: {
   return index.error_code === "timeout"
     ? "Indexing took too long and was stopped."
     : "The document could not be indexed.";
+}
+
+const SEMANTIC_LABELS = {
+  unavailable: "Semantic search unavailable",
+  none: "Not embedded",
+  pending: "Embedding queued",
+  embedding: "Embedding…",
+  ready: "Semantic search ready",
+  failed: "Embedding failed",
+  stale: "Updating embeddings",
+} satisfies Record<SemanticStatus, string>;
+
+const SEMANTIC_TONES = {
+  unavailable: "neutral",
+  none: "neutral",
+  pending: "waiting",
+  embedding: "waiting",
+  ready: "up",
+  failed: "down",
+  stale: "waiting",
+} satisfies Record<SemanticStatus, StatusTone>;
+
+const EMBEDDING: ReadonlySet<string> = new Set<SemanticStatus>(["pending", "embedding", "stale"]);
+const EMBEDDING_NOW: ReadonlySet<string> = new Set<SemanticStatus>(["pending", "embedding"]);
+
+/** The passages are being embedded (or embedded again): the status changes on its own, so it is polled. */
+export const isEmbedding = (status: string): boolean => EMBEDDING.has(status);
+
+/** Embedding is queued or running: asking for it again is pointless until it ends. */
+export const isEmbeddingNow = (status: string): boolean => EMBEDDING_NOW.has(status);
+
+export function semanticLabel(status: string): string {
+  return lookup(SEMANTIC_LABELS, status) ?? status;
+}
+
+export function semanticTone(status: string): StatusTone {
+  return lookup(SEMANTIC_TONES, status) ?? "neutral";
+}
+
+/** Why semantic search does not run here, without its internals (the reason is a code for operators). */
+export function describeSemanticUnavailable(reason: string | null): string {
+  return reason === "disabled"
+    ? "Semantic search is turned off here; documents are found by their keywords."
+    : "Semantic search is not available here right now; documents are found by their keywords.";
+}
+
+/** Why embedding failed: the server's message (written for users), else wording for its code. */
+export function describeEmbeddingFailure(semantic: {
+  status: string;
+  error_code?: string | null;
+  error_message?: string | null;
+}): string | null {
+  if (semantic.status !== "failed") return null;
+  if (semantic.error_message) return semantic.error_message;
+  return semantic.error_code === "timeout"
+    ? "Embedding took too long and was stopped."
+    : "The document could not be prepared for semantic search.";
 }
 
 const FORMAT_NAMES = {

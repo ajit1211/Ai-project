@@ -1,6 +1,6 @@
 /**
- * One document's page state. `useDocument` holds the record (polled while it is processed or
- * indexed) and the actions on it; `useDocumentText` holds its extracted text: the first slice and the
+ * One document's page state. `useDocument` holds the record (polled while it is processed,
+ * indexed or embedded) and the actions on it; `useDocumentText` holds its extracted text: the first slice and the
  * ones appended after it, a slice from a given character, or a single page. The text is
  * untrusted data and stays a plain string all the way to the screen.
  */
@@ -13,6 +13,7 @@ import {
   downloadDocument,
   getDocument,
   getDocumentContent,
+  requestReembed,
   requestReindex,
   retryDocument,
   updateDocument,
@@ -136,6 +137,22 @@ export function useDocument(id: string) {
     }
   };
 
+  /** Embeds the passages again for semantic search; the keyword index stays as it is. */
+  const reembed = async (): Promise<boolean> => {
+    setActionError(null);
+    try {
+      const index = await requestReembed(id);
+      setState((current) =>
+        current?.record ? { ...current, record: { ...current.record, index } } : current,
+      );
+      setNotice("Embedding has been queued.");
+      return true;
+    } catch (err) {
+      setActionError(describeDocumentError(err));
+      return false;
+    }
+  };
+
   const remove = async (): Promise<boolean> => {
     setActionError(null);
     try {
@@ -173,6 +190,7 @@ export function useDocument(id: string) {
     save,
     retry,
     reindex,
+    reembed,
     remove,
     download,
     /** The last outcome, for the live region. */

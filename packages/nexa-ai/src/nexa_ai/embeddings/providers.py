@@ -28,6 +28,20 @@ from nexa_ai.errors import AIError, AIProviderError, AIRateLimited, AITimeout
 from nexa_ai.tokens import estimate_text_tokens
 
 _WORD = re.compile(r"[^\W_]+")
+# English function words (snowball english.stop): the mock hashes content words, as a
+# lexical feature extractor would, so unrelated texts do not look alike for sharing "the".
+_STOP_WORD_TEXT = (
+    "i me my myself we our ours ourselves you your yours yourself yourselves he him his "
+    "himself she her hers herself it its itself they them their theirs themselves what "
+    "which who whom this that these those am is are was were be been being have has had "
+    "having do does did doing a an the and but if or because as until while of at by for "
+    "with about against between into through during before after above below to from up "
+    "down in out on off over under again further then once here there when where why how "
+    "all any both each few more most other some such no nor not only own same so than too "
+    "very s t can will just don should now"
+)
+_STOP_WORDS = frozenset(_STOP_WORD_TEXT.split())
+MOCK_VERSION = "hash-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,10 +169,13 @@ class MockEmbeddingProvider:
 
 
 def hash_embedding(text: str, dimensions: int) -> list[float]:
-    """Signed feature hashing of lowercased words (weight 1) and their character trigrams
-    (weight 0.5), L2-normalized. Deterministic across processes and platforms."""
+    """Signed feature hashing (version `MOCK_VERSION`) of lowercased content words (weight 1)
+    and their character trigrams (weight 0.5), L2-normalized; a text made only of function
+    words hashes all its words. Deterministic across processes and platforms."""
     vector = [0.0] * dimensions
-    for word in _WORD.findall(text.lower()):
+    words = _WORD.findall(text.lower())
+    words = [w for w in words if w not in _STOP_WORDS] or words
+    for word in words:
         features = [(word, 1.0)]
         padded = f"#{word}#"
         features.extend((padded[i : i + 3], 0.5) for i in range(len(padded) - 2))

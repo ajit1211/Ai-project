@@ -18,8 +18,11 @@ import {
   documentIndex,
   documentPage,
   documentRecord,
+  NOT_EMBEDDED,
   NO_INDEX,
   queuedRecord,
+  semanticIndex,
+  semanticUnavailable,
   signedIn,
 } from "../test/documentFixtures";
 import type { DocumentRecord, DocumentStatus } from "../types/document";
@@ -430,6 +433,87 @@ describe("DocumentsPage", () => {
     await flush(20_000);
     expect(getDocumentStatus).toHaveBeenCalledTimes(2);
     expect(getIndexStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows where each document's semantic index stands, leaving out what says nothing", async () => {
+    const embedding = documentRecord({
+      id: "d4",
+      filename: "plan.md",
+      format: "md",
+      index: documentIndex({ semantic: semanticIndex({ status: "embedding", ready: false, ready_at: null }) }),
+    });
+    const failedEmbedding = documentRecord({
+      id: "d5",
+      filename: "slides.pdf",
+      index: documentIndex({
+        semantic: semanticIndex({ status: "failed", ready: false, error_message: "Embedding took too long." }),
+      }),
+    });
+    const notEmbedded = documentRecord({ id: "d6", filename: "old.pdf", index: documentIndex({ semantic: NOT_EMBEDDED }) });
+    vi.mocked(listDocuments).mockResolvedValue(documentPage([report, embedding, failedEmbedding, notEmbedded, notes]));
+    vi.mocked(getIndexStatus).mockResolvedValue(documentIndex());
+    renderPage();
+    await screen.findByRole("list", { name: "Documents" });
+
+    const expected: [string, string, string][] = [
+      ["q4-report.pdf", "Semantic search ready", "badge-up"],
+      ["plan.md", "Embedding…", "badge-waiting"],
+      ["slides.pdf", "Embedding failed", "badge-down"],
+      ["old.pdf", "Not embedded", "badge-neutral"],
+    ];
+    for (const [name, label, tone] of expected) {
+      expect(within(itemFor(name)).getByText(label, { selector: ".badge" }).classList.contains(tone)).toBe(true);
+    }
+    // Not extracted, so nothing to embed yet: no semantic badge at all.
+    expect(itemFor("Meeting notes").querySelectorAll(".badge")).toHaveLength(1);
+    expect(screen.queryByText(/documents are found by their keywords/)).toBeNull();
+  });
+
+  it("says once, not on every document, that semantic search does not run here", async () => {
+    const unavailable = documentIndex({ semantic: semanticUnavailable("disabled") });
+    vi.mocked(listDocuments).mockResolvedValue(
+      documentPage([
+        documentRecord({ index: unavailable }),
+        documentRecord({ id: "d2", filename: "notes.txt", index: unavailable }),
+      ]),
+    );
+    renderPage();
+    await screen.findByRole("list", { name: "Documents" });
+    expect(
+      screen.getAllByText("Semantic search is turned off here; documents are found by their keywords."),
+    ).toHaveLength(1);
+    expect(screen.queryByText("Semantic search unavailable")).toBeNull();
+    expect(within(itemFor("notes.txt")).getByText("Searchable")).toBeTruthy();
+  });
+
+  it("polls a document being embedded until it can be found by meaning, then stops", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stale = documentRecord({
+      id: "d4",
+      filename: "plan.md",
+      index: documentIndex({ semantic: semanticIndex({ status: "stale", ready: false }) }),
+    });
+    vi.mocked(listDocuments).mockResolvedValue(documentPage([stale, notes]));
+    vi.mocked(getIndexStatus)
+      .mockResolvedValueOnce(documentIndex({ semantic: semanticIndex({ status: "embedding", ready: false }) }))
+      .mockResolvedValue(documentIndex());
+    renderPage();
+    await flush();
+    const item = () => itemFor("plan.md");
+    expect(within(item()).getByText("Updating embeddings", { selector: ".badge" })).toBeTruthy();
+    expect(getIndexStatus).not.toHaveBeenCalled();
+
+    await flush(2_500);
+    expect(getIndexStatus).toHaveBeenCalledWith("d4", { signal: expect.any(AbortSignal) as AbortSignal });
+    expect(within(item()).getByText("Embedding…", { selector: ".badge" })).toBeTruthy();
+
+    await flush(2_500);
+    expect(within(item()).getByText("Semantic search ready", { selector: ".badge" })).toBeTruthy();
+    expect(liveRegion()).toBe("plan.md can now be found by meaning.");
+
+    await flush(20_000);
+    expect(getIndexStatus).toHaveBeenCalledTimes(2);
+    expect(getDocumentStatus).not.toHaveBeenCalled();
   });
 
   it("polls a few documents at a time, and stops when the page goes away", async () => {

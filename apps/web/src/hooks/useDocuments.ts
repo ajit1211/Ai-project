@@ -23,6 +23,7 @@ import { checkFile, DEFAULT_ACCEPTED_EXTENSIONS, type UploadRules } from "../com
 import {
   describeDocumentError,
   displayName,
+  isEmbedding,
   isInFlight,
   isIndexing,
 } from "../components/documents/labels";
@@ -33,6 +34,7 @@ import type {
   DocumentStatus,
   DocumentStatusInfo,
   ListDocumentsParams,
+  SemanticIndex,
   UploadLimits,
 } from "../types/document";
 
@@ -54,13 +56,26 @@ export type PollOutcome =
   /** It was deleted meanwhile (or is no longer visible). */
   | { kind: "gone"; id: string };
 
-/** What to ask the server about a document: its extraction, its index, or nothing. */
+/**
+ * What to ask the server about a document: its extraction, or its index (which also tells
+ * where the semantic index stands), or nothing.
+ */
 type PollKind = "status" | "index";
 
 function pollKind(record: DocumentRecord): PollKind | null {
   if (isInFlight(record.status)) return "status";
-  if (isIndexing(record.index.status)) return "index";
+  if (isIndexing(record.index.status) || isEmbedding(record.index.semantic.status)) return "index";
   return null;
+}
+
+function sameSemantic(a: SemanticIndex, b: SemanticIndex): boolean {
+  return (
+    a.status === b.status &&
+    a.ready === b.ready &&
+    a.chunk_count === b.chunk_count &&
+    a.error_code === b.error_code &&
+    a.ready_at === b.ready_at
+  );
 }
 
 function sameIndex(a: DocumentIndex, b: DocumentIndex): boolean {
@@ -69,7 +84,8 @@ function sameIndex(a: DocumentIndex, b: DocumentIndex): boolean {
     a.attempt_count === b.attempt_count &&
     a.requested_at === b.requested_at &&
     a.started_at === b.started_at &&
-    a.finished_at === b.finished_at
+    a.finished_at === b.finished_at &&
+    sameSemantic(a.semantic, b.semantic)
   );
 }
 
@@ -87,14 +103,15 @@ function withStatus(record: DocumentRecord, info: DocumentStatusInfo): DocumentR
 }
 
 /**
- * Follows the documents still being processed (uploaded, queued, processing) and the ones
- * whose search index is being built (pending, indexing). Every POLL_INTERVAL_MS,
- * MAX_PARALLEL_POLLS of them at most, taking turns, are asked where they stand: the status
- * endpoint during extraction, the index-status endpoint during indexing. Rounds are skipped
- * while the tab is hidden. A change is reported merged into the document; a finished
- * extraction is fetched again in full, for its counts, warnings, attempts and index (whose
- * building then starts, and is followed in turn). Polling stops when nothing is in flight
- * and when the component unmounts.
+ * Follows the documents still being processed (uploaded, queued, processing), the ones whose
+ * search index is being built (pending, indexing) and the ones being embedded for semantic
+ * search (pending, embedding, stale). Every POLL_INTERVAL_MS, MAX_PARALLEL_POLLS of them at
+ * most, taking turns, are asked where they stand: the status endpoint during extraction, the
+ * index-status endpoint during indexing and embedding. Rounds are skipped while the tab is
+ * hidden. A change is reported merged into the document; a finished extraction is fetched
+ * again in full, for its counts, warnings, attempts and index (whose building then starts,
+ * and is followed in turn, embedding included). Polling stops when nothing is in flight and
+ * when the component unmounts.
  */
 export function useProcessingPoll(
   documents: readonly DocumentRecord[],
@@ -184,6 +201,11 @@ export function changeNotice(previous: DocumentRecord, next: DocumentRecord): st
     return next.index.searchable
       ? `Re-indexing ${name} failed; its previous index can still be searched.`
       : `${name} could not be indexed.`;
+  }
+  const semantic = next.index.semantic.status;
+  if (isEmbedding(previous.index.semantic.status) && !isEmbedding(semantic)) {
+    if (semantic === "ready") return `${name} can now be found by meaning.`;
+    if (semantic === "failed") return `${name} could not be prepared for semantic search.`;
   }
   return null;
 }

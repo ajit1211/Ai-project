@@ -10,10 +10,10 @@ import { Link, useLocation, useNavigate } from "react-router";
 import { useAuth } from "../auth/AuthContext";
 import { Banner } from "../components/chat/Banner";
 import { Icon } from "../components/chat/Icon";
-import { FormatIcon, SearchableMark, StatusBadge } from "../components/documents/badges";
+import { FormatIcon, SearchableMark, SemanticBadge, StatusBadge } from "../components/documents/badges";
 import { ConfirmDelete } from "../components/documents/ConfirmDelete";
 import { formatBytes, listExtensions } from "../components/documents/files";
-import { describeFailure, displayName } from "../components/documents/labels";
+import { describeFailure, describeSemanticUnavailable, displayName } from "../components/documents/labels";
 import { Alert } from "../components/forms";
 import {
   DEFAULT_FILTERS,
@@ -126,6 +126,7 @@ function Library() {
           Your documents
         </h2>
         <Toolbar library={library} />
+        <SemanticNote items={library.items} />
         <DocumentList library={library} userId={user?.id ?? null} heading={heading} />
       </section>
 
@@ -353,6 +354,20 @@ function Toolbar({ library }: { library: DocumentLibrary }) {
   );
 }
 
+/**
+ * Said once above the list, rather than on every document, when semantic search does not run
+ * here (a deployment-wide state).
+ */
+function SemanticNote({ items }: { items: readonly DocumentRecord[] }) {
+  const unavailable = items.find((item) => item.index.semantic.status === "unavailable");
+  if (!unavailable) return null;
+  return (
+    <p className="muted small doc-library-note">
+      {describeSemanticUnavailable(unavailable.index.semantic.reason)}
+    </p>
+  );
+}
+
 function DocumentList({
   library,
   userId,
@@ -458,6 +473,9 @@ function DocumentItem({
   const link = useRef<HTMLAnchorElement>(null);
   const name = displayName(record);
   const failure = describeFailure(record);
+  const semantic = record.index.semantic.status;
+  // "Not embedded" says something only once the keyword index has passages to embed.
+  const showSemantic = semantic !== "unavailable" && (semantic !== "none" || record.index.searchable);
 
   const retry = () => {
     setRetrying(true);
@@ -492,6 +510,7 @@ function DocumentItem({
       <div className="doc-item-status">
         <StatusBadge status={record.status} />
         {record.index.searchable && <SearchableMark />}
+        {showSemantic && <SemanticBadge status={semantic} />}
       </div>
       <div className="doc-item-actions">
         {record.can_retry && (

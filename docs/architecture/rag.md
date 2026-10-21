@@ -252,7 +252,9 @@ accuracy.
 
 ## Known limitations
 
-- **Lexical, not semantic.** A question has to share words with the passage: "car" does not
+- **Lexical, not semantic** (this retriever; Phase 09 adds semantic and hybrid retrieval
+  where pgvector and an embedding provider are available). A question has to share words with
+  the passage: "car" does not
   find "automobile", paraphrases and synonyms are missed, and one shared common word can pull
   in an unrelated passage (the model is told to say when the evidence does not answer).
 - English stemming and stop words only; other languages match exact words.
@@ -268,6 +270,10 @@ accuracy.
 Phase 08 delivers: chunking, the index lifecycle, lexical retrieval, bounded evidence,
 grounded chat, validated citations, the UI and the evaluation set. It does **not** implement
 embeddings, vector similarity search, a vector database, hybrid retrieval or reranking.
-Phase 09 can add an embedding column (or table) per chunk and a vector `Retriever`
-implementation next to `LexicalRetriever`, combine them, and keep authorization (the same
-visibility predicate), chunking, citations, sources and the chat integration as they are.
+Phase 09 added this: embeddings in a `chunk_embeddings` table (pgvector), a vector retriever
+next to `LexicalRetriever` using the same visibility predicate, and hybrid retrieval by
+reciprocal rank fusion, selectable per question (`retrieval_mode`) and falling back to this
+lexical retrieval wherever semantic search is not available. Chunking, evidence, citations,
+sources and the chat integration are unchanged. See [vector-search.md](vector-search.md).
+Everything in this document still describes the keyword path, which remains the default where
+pgvector or an embedding provider is missing.

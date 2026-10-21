@@ -8,6 +8,7 @@ import {
   getIndexStatus,
   isAbortError,
   listDocuments,
+  requestReembed,
   requestReindex,
   REVOKE_DOWNLOAD_URL_MS,
   uploadDocument,
@@ -180,7 +181,18 @@ describe("text, index and status endpoints", () => {
     expect(await getIndexStatus("d1")).toEqual({ status: "indexing" });
     expect(calls[0]?.url).toBe("/api/v1/documents/d1/index/");
     expect(calls[0]?.init.method).toBe("POST");
+    expect(calls[0]?.init.body).toBeUndefined();
     expect(calls[1]?.url).toBe("/api/v1/documents/d1/index-status/");
+  });
+
+  it("asks for the passages to be embedded again, and only that", async () => {
+    const queued = { status: "indexed", semantic: { status: "pending", reason: null, model: "nexa-embed-small", ready: false } };
+    responses.push(json(202, { success: true, data: queued, message: "Embedding has been queued." }));
+    expect(await requestReembed("d 1")).toEqual(queued);
+    expect(calls[0]?.url).toBe("/api/v1/documents/d%201/index/");
+    expect(calls[0]?.init.method).toBe("POST");
+    expect(calls[0]?.init.body).toBe('{"reembed":true}');
+    expect((calls[0]?.init.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
   });
 });
 

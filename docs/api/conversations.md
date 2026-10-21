@@ -261,7 +261,11 @@ answered from documents you may read, with citations. Without `grounding` nothin
 
 `grounding` names exactly one of: `document_ids` (1 to 20 documents), `team_id` (documents
 shared with a team you belong to), or `all_documents: true` (every document you may read).
-`max_sources` (optional, 1 to 12, default 6) bounds the passages given to the model. The
+`max_sources` (optional, 1 to 12, default 6) bounds the passages given to the model.
+`retrieval_mode` (Phase 09, optional): `auto` (default: the deployment's choice, hybrid where
+semantic search runs), `lexical` (keywords), `semantic` (meaning, by embeddings) or `hybrid`
+(both, fused); see [vector-search.md](../architecture/vector-search.md#retrieval) and
+[Retrieval options](#retrieval-options). The
 question is at most 4 000 characters. The scope is checked before anything is stored: 404
 `DOCUMENT_UNAVAILABLE` for a document or team that does not exist for you, 409
 `DOCUMENT_NOT_INDEXED` for one that is not searchable yet, 422 `RAG_INVALID_SCOPE`, 429 when
@@ -288,9 +292,18 @@ carries the reply with its final `grounding` and `sources` (now with `cited` set
 "grounding": {
   "mode": "documents", "scope": "documents", "document_ids": ["0199..."], "team_id": null,
   "outcome": "answered", "searched_documents": 2, "retrieved": 5, "supplied": 5, "cited": 1,
-  "invalid_citations": [], "retrieval_ms": 18, "strategy": "postgres-fts/v1"
+  "invalid_citations": [], "retrieval_ms": 18,
+  "strategy": "rrf(k=60):postgres-fts/v1+pgvector-cosine/v1",
+  "retrieval_requested": "auto", "retrieval_mode": "hybrid", "fallback": null
 }
 ```
+
+`retrieval_requested` is the mode asked for, `retrieval_mode` what ran (`lexical`, `semantic`
+or `hybrid`), and `fallback` why they differ, when they do: `semantic_disabled`,
+`semantic_pgvector_missing`, `semantic_no_model`, `semantic_provider_not_configured` (semantic
+search does not run here), `query_embedding_failed` or `vector_search_failed` (it failed for
+this question). A fallback answers by keywords; it is not an error. Replies from before Phase
+09 have `retrieval_mode: "lexical"` and no fallback.
 
 `outcome` is `answered` (at least one valid citation), `uncited` (the answer cites none of the
 passages: treat it as unverified), `no_evidence` (nothing matched; the model was not called and
@@ -302,6 +315,22 @@ When messages are listed, `sources` are read again and the documents re-authoriz
 reader: a source whose document was deleted, is no longer shared, or whose passage changed is
 `{"label": "S1", "rank": 1, "cited": true, "available": false, ...}` with every other field
 `null`.
+
+### Retrieval options
+
+`GET /api/v1/ai/retrieval/` (Phase 09; members with `documents.view`) tells a client which
+retrieval modes it can offer:
+
+```json
+{"data": {"modes": ["hybrid", "semantic", "lexical"], "default_mode": "hybrid",
+          "semantic_available": true, "semantic_unavailable_reason": null,
+          "embedding_model": "nexa-embed-small"}}
+```
+
+Without semantic search: `"modes": ["lexical"]`, `"default_mode": "lexical"`,
+`"semantic_available": false` and the reason (`disabled`, `pgvector_missing`, `no_model`,
+`provider_not_configured`). Requesting a mode that is not listed is allowed and falls back as
+described above.
 
 ### GET /conversations/{id}/messages/{message_id}/sources/
 

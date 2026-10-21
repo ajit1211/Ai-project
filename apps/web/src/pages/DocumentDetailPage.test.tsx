@@ -9,6 +9,7 @@ import {
   getDocument,
   getDocumentContent,
   getIndexStatus,
+  requestReembed,
   requestReindex,
   retryDocument,
   updateDocument,
@@ -20,9 +21,11 @@ import {
   ingestion,
   NO_INDEX,
   queuedRecord,
+  semanticIndex,
+  semanticUnavailable,
   signedIn,
 } from "../test/documentFixtures";
-import type { DocumentContent } from "../types/document";
+import type { DocumentContent, SemanticStatus } from "../types/document";
 import { DocumentDetailPage } from "./DocumentDetailPage";
 
 vi.mock("../api/documents", async (importOriginal) => {
@@ -39,6 +42,7 @@ vi.mock("../api/documents", async (importOriginal) => {
     deleteDocument: vi.fn(),
     retryDocument: vi.fn(),
     requestReindex: vi.fn(),
+    requestReembed: vi.fn(),
     downloadDocument: vi.fn(),
   };
 });
@@ -272,10 +276,16 @@ describe("DocumentDetailPage", () => {
     renderPage();
     const processing = await screen.findByRole("region", { name: "Processing" });
     const rows = within(processing).getAllByRole("term").map((term) => term.parentElement as HTMLElement);
-    expect(rows.map((row) => within(row).getByRole("term").textContent)).toEqual(["Text extraction", "Search index"]);
+    expect(rows.map((row) => within(row).getByRole("term").textContent)).toEqual([
+      "Text extraction",
+      "Search index",
+      "Semantic search",
+    ]);
     expect(within(rows[0] as HTMLElement).getByText("Ready")).toBeTruthy();
     expect(within(rows[1] as HTMLElement).getByText("Indexed")).toBeTruthy();
     expect(within(rows[1] as HTMLElement).getByText(/^14 passages, about 5,200 tokens; indexed/)).toBeTruthy();
+    expect(within(rows[2] as HTMLElement).getByText("Semantic search ready")).toBeTruthy();
+    expect(within(rows[2] as HTMLElement).getByText(/^14 passages can be found by meaning; ready/)).toBeTruthy();
 
     fireEvent.click(within(processing).getByRole("button", { name: "Re-index" }));
     await waitFor(() => {
@@ -320,6 +330,119 @@ describe("DocumentDetailPage", () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
     expect(getIndexStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it.each<SemanticStatus>(["pending", "embedding", "stale"])(
+    "polls the index status while the passages are %s, until they can be found by meaning",
+    async (status) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const semantic = semanticIndex({ status, ready: false, ready_at: null });
+      vi.mocked(getDocument).mockResolvedValue(documentRecord({ index: documentIndex({ semantic }) }));
+      vi.mocked(getIndexStatus).mockResolvedValue(documentIndex());
+      renderPage();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const processing = screen.getByRole("region", { name: "Processing" });
+      expect(within(processing).queryByText("Semantic search ready", { selector: ".badge" })).toBeNull();
+      expect(getIndexStatus).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_500);
+      });
+      expect(getIndexStatus).toHaveBeenCalledWith("d1", signal);
+      expect(within(processing).getByText("Semantic search ready", { selector: ".badge" })).toBeTruthy();
+      expect(liveRegion()).toBe("q4-report.pdf can now be found by meaning.");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(getIndexStatus).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("re-embeds the passages without re-indexing, and waits while they are embedded", async () => {
+    vi.mocked(requestReembed).mockResolvedValue(
+      documentIndex({ semantic: semanticIndex({ status: "pending", ready: false, ready_at: null }) }),
+    );
+    renderPage();
+    const processing = await screen.findByRole("region", { name: "Processing" });
+    const row = within(processing).getByText("Semantic search").parentElement as HTMLElement;
+    expect(within(row).getByText("Semantic search ready", { selector: ".badge" })).toBeTruthy();
+
+    fireEvent.click(within(processing).getByRole("button", { name: "Re-embed" }));
+    await waitFor(() => {
+      expect(requestReembed).toHaveBeenCalledWith("d1");
+    });
+    expect(requestReindex).not.toHaveBeenCalled();
+    expect(await within(row).findByText("Embedding queued", { selector: ".badge" })).toBeTruthy();
+    expect(within(row).getByText("Waiting for its turn.")).toBeTruthy();
+    expect(within(processing).getByRole("button", { name: "Embedding…" }).hasAttribute("disabled")).toBe(true);
+    // The keyword index is untouched.
+    expect(within(processing).getByRole("button", { name: "Re-index" }).hasAttribute("disabled")).toBe(false);
+    expect(liveRegion()).toBe("Embedding has been queued.");
+    expect(document.activeElement).toBe(within(processing).getByRole("heading", { name: "Processing" }));
+  });
+
+  it("explains a failed embedding and offers to retry it when that may help", async () => {
+    const failed = semanticIndex({
+      status: "failed",
+      ready: false,
+      error_code: "provider_unavailable",
+      error_message: "The embedding service is unavailable; it will be retried.",
+      retryable: true,
+      ready_at: null,
+    });
+    vi.mocked(getDocument).mockResolvedValue(documentRecord({ index: documentIndex({ semantic: failed }) }));
+    vi.mocked(requestReembed).mockResolvedValue(
+      documentIndex({ semantic: semanticIndex({ status: "pending", ready: false, ready_at: null }) }),
+    );
+    renderPage();
+    const processing = await screen.findByRole("region", { name: "Processing" });
+    expect(within(processing).getByText("Embedding failed", { selector: ".badge" })).toBeTruthy();
+    expect(within(processing).getByText("The embedding service is unavailable; it will be retried.")).toBeTruthy();
+    expect(within(processing).getByText("It is still found by its keywords.")).toBeTruthy();
+
+    fireEvent.click(within(processing).getByRole("button", { name: "Retry embedding" }));
+    await waitFor(() => {
+      expect(requestReembed).toHaveBeenCalledWith("d1");
+    });
+    expect(await within(processing).findByText("Embedding queued", { selector: ".badge" })).toBeTruthy();
+    expect(within(processing).queryByText("The embedding service is unavailable; it will be retried.")).toBeNull();
+  });
+
+  it("offers Re-embed, not Retry, after a failure that retrying will not fix", async () => {
+    const failed = semanticIndex({ status: "failed", ready: false, error_code: "provider_error", retryable: false });
+    vi.mocked(getDocument).mockResolvedValue(documentRecord({ index: documentIndex({ semantic: failed }) }));
+    renderPage();
+    const processing = await screen.findByRole("region", { name: "Processing" });
+    expect(within(processing).getByText("The document could not be prepared for semantic search.")).toBeTruthy();
+    expect(within(processing).getByRole("button", { name: "Re-embed" })).toBeTruthy();
+    expect(within(processing).queryByRole("button", { name: "Retry embedding" })).toBeNull();
+  });
+
+  it("says quietly when semantic search does not run here, and offers no Re-embed", async () => {
+    vi.mocked(getDocument).mockResolvedValue(
+      documentRecord({ index: documentIndex({ semantic: semanticUnavailable("pgvector_missing") }) }),
+    );
+    renderPage();
+    const processing = await screen.findByRole("region", { name: "Processing" });
+    const row = within(processing).getByText("Semantic search").parentElement as HTMLElement;
+    expect(row.querySelector(".badge")).toBeNull();
+    expect(
+      within(row).getByText("Semantic search is not available here right now; documents are found by their keywords."),
+    ).toBeTruthy();
+    expect(within(processing).getByRole("button", { name: "Re-index" })).toBeTruthy();
+    expect(within(processing).queryByRole("button", { name: "Re-embed" })).toBeNull();
+    expect(screen.queryByText(/pgvector|nexa-embed/)).toBeNull();
+  });
+
+  it("offers Re-embed only to those who may re-index", async () => {
+    vi.mocked(getDocument).mockResolvedValue(documentRecord({ can_reindex: false, editable: false }));
+    renderPage();
+    const processing = await screen.findByRole("region", { name: "Processing" });
+    expect(within(processing).getByText("Semantic search ready", { selector: ".badge" })).toBeTruthy();
+    expect(within(processing).queryByRole("button", { name: "Re-embed" })).toBeNull();
   });
 
   it("saves edited details, checking the category first", async () => {

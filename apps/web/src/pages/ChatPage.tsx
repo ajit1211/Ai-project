@@ -4,8 +4,10 @@
  * list as a drawer. Writing a message with no conversation open starts one.
  *
  * The composer's Documents control answers the next questions from chosen documents (or all
- * of them); the choice is kept per conversation for this visit. With nothing chosen, the
- * chat is the ordinary chat and sends exactly what it always did.
+ * of them); the choice is kept per conversation for this visit. Where semantic search runs,
+ * the user may also choose how documents are searched (kept for the visit, in every
+ * conversation). With nothing chosen, the chat is the ordinary chat and sends exactly what it
+ * always did.
  */
 
 import { useRef, useState, type ReactNode } from "react";
@@ -27,7 +29,7 @@ import {
   type DocumentSelection,
   type PickedDocument,
 } from "../components/chat/grounding";
-import { GroundingBar } from "../components/chat/GroundingBar";
+import { GroundingBar, type RetrievalControl } from "../components/chat/GroundingBar";
 import { Icon } from "../components/chat/Icon";
 import { MessageComposer, type ComposerHandle } from "../components/chat/MessageComposer";
 import { MessageList } from "../components/chat/MessageList";
@@ -37,7 +39,8 @@ import { useChat } from "../hooks/useChat";
 import { useConversations } from "../hooks/useConversations";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useModels } from "../hooks/useModels";
-import type { Conversation } from "../types/chat";
+import { useRetrievalOptions } from "../hooks/useRetrievalOptions";
+import type { Conversation, RetrievalChoice } from "../types/chat";
 
 /** Matches the CSS breakpoint of the chat layout. */
 const NARROW_QUERY = "(max-width: 800px)";
@@ -146,6 +149,19 @@ export function ChatPage() {
     setGroundingAlert(key, null);
   };
 
+  // How documents are searched: offered only when there is more than keyword search, and a
+  // choice the server no longer offers falls back to its default.
+  const [retrievalChoice, setRetrievalChoice] = useState<RetrievalChoice>("auto");
+  const retrievalOptions = useRetrievalOptions(selection !== null);
+  const offeredModes = retrievalOptions && retrievalOptions.modes.length > 1 ? retrievalOptions.modes : null;
+  const retrieval: RetrievalChoice =
+    retrievalChoice !== "auto" && offeredModes?.includes(retrievalChoice) ? retrievalChoice : "auto";
+  const retrievalControl: RetrievalControl | null = offeredModes && {
+    modes: offeredModes,
+    value: retrieval,
+    onChange: setRetrievalChoice,
+  };
+
   const closeDrawer = () => {
     setDrawerOpen(false);
   };
@@ -170,7 +186,7 @@ export function ChatPage() {
   const send = () => {
     const content = draft;
     if (!content.trim() || creating) return;
-    const grounding = selection ? groundingFor(selection) : undefined;
+    const grounding = selection ? groundingFor(selection, retrieval) : undefined;
     if (grounding && content.length > MAX_GROUNDED_CHARS) {
       setGroundingAlert(
         draftKey,
@@ -221,6 +237,7 @@ export function ChatPage() {
         setGroundingAlert(draftKey, null);
       }}
       openerRef={documentsButton}
+      retrieval={retrievalControl}
     />
   );
 

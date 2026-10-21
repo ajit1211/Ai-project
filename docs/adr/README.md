@@ -25,5 +25,6 @@ ADR-00N"; they are filed under their NEXA numbers:
 | [034](034-memory-engine.md) | Structured memory in PostgreSQL, team scope as project memory, in-process extraction | 06 |
 | [035](035-document-uploads-through-core.md) | Document uploads through Core, private storage behind an interface, processing on a dedicated queue | 07 |
 | [036](036-rag-in-chat-lexical-baseline.md) | Document-grounded answers inside the chat engine, lexical retrieval first, validated inline citations | 08 |
+| [037](037-pgvector-hybrid-retrieval.md) | Embeddings in PostgreSQL with pgvector, hybrid retrieval by reciprocal rank fusion, keyword search as the floor | 09 |
 
 Format: context, decision, alternatives, consequences. Status is *accepted* unless noted.

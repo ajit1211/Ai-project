@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { listMessageSources } from "../../api/conversations";
 import type { ChatItem } from "../../hooks/chatThread";
 import { chatItem, chatMessage, grounding, source, unavailableSource } from "../../test/chatFixtures";
-import type { Message } from "../../types/chat";
+import type { Grounding, Message } from "../../types/chat";
 import { MessageBubble } from "./MessageBubble";
 
 vi.mock("../../api/conversations", async (importOriginal) => {
@@ -196,6 +196,43 @@ describe("a reply answered from documents", () => {
       </MemoryRouter>,
     );
     expect(screen.getByText("Found 3 passages")).toBeTruthy();
+  });
+
+  it("says how its passages were found", () => {
+    renderItem(chatItem(grounded("Answer [S1].")));
+    expect(screen.getByText("Passages found by keywords and meaning.")).toBeTruthy();
+    expect(screen.queryByText(/semantic search was unavailable/)).toBeNull();
+  });
+
+  it.each(["query_embedding_failed", "vector_search_failed", "semantic_disabled", "semantic_pgvector_missing"])(
+    "says, without alarm, when the search fell back to keywords (%s)",
+    (fallback) => {
+      renderItem(
+        chatItem(
+          grounded("Answer [S1].", {
+            grounding: grounding({ retrieval_requested: "semantic", retrieval_mode: "lexical", fallback }),
+          }),
+        ),
+      );
+      const notice = screen.getByText("Searched by keywords: semantic search was unavailable for this answer.");
+      expect(notice.classList.contains("grounding-warning")).toBe(false);
+      expect(screen.queryByText(fallback, { exact: false })).toBeNull();
+      // The notice already says how: no second line about it.
+      expect(screen.queryByText(/^Passages found by/)).toBeNull();
+      expect(screen.getByRole("list", { name: "Sources" })).toBeTruthy();
+    },
+  );
+
+  it("still shows a reply from before semantic search, with no notice", () => {
+    const older: Grounding = grounding();
+    delete older.retrieval_requested;
+    delete older.retrieval_mode;
+    delete older.fallback;
+    renderItem(chatItem(grounded("Revenue grew [S1].", { grounding: older })));
+    expect(screen.getByText("From your documents")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Source S1: Q4 report, page 3" })).toBeTruthy();
+    expect(screen.queryByText(/semantic search was unavailable/)).toBeNull();
+    expect(screen.queryByText(/^Passages found by/)).toBeNull();
   });
 
   it("leaves an ordinary reply exactly as before", () => {

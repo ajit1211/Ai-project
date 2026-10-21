@@ -63,6 +63,8 @@ def make_client(provider: MockProvider, **overrides: Any) -> Iterator[TestClient
         ),
         redis_queue_url="redis://127.0.0.1:1/0",
         ai_registry_ttl_seconds=0.0,
+        # The Phase 08 lexical baseline; test_rag_eval_modes.py compares the modes.
+        rag_retrieval_mode="lexical",
         **overrides,
     )
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=jwks()))

@@ -4,14 +4,21 @@ AI Intelligence & Agent Platform. The architecture and the 20-phase plan are in
 [docs/architecture/NEXA-architecture.md](docs/architecture/NEXA-architecture.md); decisions
 made since are in [docs/adr/](docs/adr/).
 
-**Current phase: 08, document-grounded answers (RAG).** In the chat, choose documents (or
-all documents you may read) and ask about them: the reply is built from passages retrieved
-from those documents and cites them (`[S1]`), with source cards that open the document at
-the right page. Retrieval is PostgreSQL full-text search over chunks built when a document is
-processed; it runs inside your access rights, and when nothing matches the reply says so
-instead of guessing. No embeddings or vector search yet (Phase 09). Details:
-[rag.md](docs/architecture/rag.md), the API in [docs/api/conversations.md](docs/api/conversations.md#document-grounded-answers),
-decision in [ADR-036](docs/adr/036-rag-in-chat-lexical-baseline.md).
+**Current phase: 09, vector search, embeddings and hybrid retrieval.** Document passages are
+embedded in the background (OpenAI `text-embedding-3-small` by default; a deterministic mock in
+development) and stored with pgvector; grounded questions are answered from keyword search,
+semantic (vector) search, or both fused (hybrid, the default), always inside your access
+rights. Where pgvector or an embedding key is missing, answers fall back to keyword search and
+say so. Details: [vector-search.md](docs/architecture/vector-search.md) (including
+[installing pgvector](docs/architecture/vector-search.md#installing-pgvector)), decision in
+[ADR-037](docs/adr/037-pgvector-hybrid-retrieval.md). The local Windows database has no
+pgvector, so `pnpm dev` runs keyword search only unless you install it.
+
+Phase 08, document-grounded answers (RAG): in the chat, choose documents (or all documents you
+may read) and ask about them; the reply cites passages (`[S1]`) with source cards that open the
+document at the right page, and says so when nothing matches
+([rag.md](docs/architecture/rag.md), [docs/api/conversations.md](docs/api/conversations.md#document-grounded-answers),
+[ADR-036](docs/adr/036-rag-in-chat-lexical-baseline.md)).
 
 Phase 07, documents: upload PDF, Word, text, Markdown and CSV files at `/documents`; they are
 stored privately, their text is extracted in the background, and the library shows status,
@@ -32,7 +39,7 @@ and identity and access (Phase 03, [authentication.md](docs/architecture/authent
 React (/chat, /documents, /memories) ──► edge (Vite proxy) ──► FastAPI /api/v1/conversations, /memories, /ai
                                                        └──► Django   /api/v1/auth, /users, /organizations,
                                                                      /documents, /ai/usage
-Django ──► Celery (core.documents): extraction, search index ──► private file storage
+Django ──► Celery (core.documents): extraction, search index, embeddings ──► private file storage
 FastAPI ──► memory engine + document retrieval (RAG) ──► AI Gateway ──► Anthropic | OpenAI | mock
                                                    (one PostgreSQL; Django owns the schema)
 ```
@@ -98,6 +105,9 @@ as down. Without AI provider keys the mock provider answers; add `AI_ANTHROPIC_A
 | `uv run python scripts/e2e_documents.py` | Walks the document pipeline (uploads in every format, processing, indexing, text, preview, download, refusals, retry, isolation, deletion) against the running stack |
 | `uv run python scripts/e2e_rag.py` | Walks document-grounded chat (sources, citations, no-evidence, fabricated citations, isolation, deletion) against the running stack |
 | `uv run pytest -s apps/runtime/tests/test_rag_eval.py` | Prints the retrieval and citation evaluation on the synthetic set |
+| `uv run pytest -s apps/runtime/tests/test_rag_eval_modes.py` | Compares lexical, semantic and hybrid retrieval (needs pgvector) |
+| `uv run python apps/core/manage.py setup_vector_search` | Says whether semantic search runs here and creates the vector table when pgvector is installed |
+| `uv run python apps/core/manage.py embed_documents` | Embeds documents that have no current vectors (`--force` re-embeds all) |
 | `uv run python apps/core/manage.py createsuperuser` | Creates an admin login for http://localhost:8000/admin/ |
 
 Emails in development are written to `.local/mail/`; open the newest file for the link.

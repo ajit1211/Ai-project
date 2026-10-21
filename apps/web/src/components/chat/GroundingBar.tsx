@@ -1,14 +1,23 @@
 /**
  * The composer's document controls: the Documents button that opens the picker, what the
- * next question will be answered from (removable chips, or "all your documents"), the way
- * back to ordinary chat, and why the last grounded question was refused.
+ * next question will be answered from (removable chips, or "all your documents"), how to
+ * search them (only where semantic search runs), the way back to ordinary chat, and why the
+ * last grounded question was refused.
  */
 
-import type { Ref } from "react";
+import { useId, type Ref } from "react";
 
+import type { RetrievalChoice, RetrievalMode } from "../../types/chat";
 import { Alert } from "../forms";
-import { selectionSummary, type DocumentSelection } from "./grounding";
+import { retrievalLabel, selectionSummary, type DocumentSelection } from "./grounding";
 import { Icon } from "./Icon";
+
+/** The search control: the modes the server offers, and the one chosen. */
+export interface RetrievalControl {
+  modes: readonly RetrievalMode[];
+  value: RetrievalChoice;
+  onChange: (choice: RetrievalChoice) => void;
+}
 
 export interface GroundingBarProps {
   selection: DocumentSelection | null;
@@ -21,6 +30,11 @@ export interface GroundingBarProps {
   alert: string | null;
   onDismissAlert: () => void;
   openerRef: Ref<HTMLButtonElement>;
+  /**
+   * How to search the documents; null hides the control (keyword search is the only way
+   * here, or the options could not be loaded), and questions then use the server's default.
+   */
+  retrieval?: RetrievalControl | null;
 }
 
 export function GroundingBar({
@@ -32,7 +46,9 @@ export function GroundingBar({
   alert,
   onDismissAlert,
   openerRef,
+  retrieval = null,
 }: GroundingBarProps) {
+  const id = useId();
   return (
     <div className="grounding-bar">
       <div className="grounding-row">
@@ -48,6 +64,25 @@ export function GroundingBar({
           Documents
         </button>
         {selection && <span className="grounding-indicator">{selectionSummary(selection)}</span>}
+        {selection && retrieval && (
+          <span className="grounding-mode">
+            <label htmlFor={`${id}-retrieval`}>Search by</label>
+            <select
+              id={`${id}-retrieval`}
+              value={retrieval.value}
+              onChange={(event) => {
+                retrieval.onChange(event.target.value as RetrievalChoice);
+              }}
+            >
+              <option value="auto">{retrievalLabel("auto")}</option>
+              {retrieval.modes.map((mode) => (
+                <option key={mode} value={mode}>
+                  {retrievalLabel(mode)}
+                </option>
+              ))}
+            </select>
+          </span>
+        )}
         {selection && (
           <button type="button" className="btn btn-quiet grounding-clear" onClick={onClear}>
             Use ordinary chat

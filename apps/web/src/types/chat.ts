@@ -34,6 +34,25 @@ export type MessageStatus = "pending" | "streaming" | "completed" | "failed" | "
  */
 export type GroundingOutcome = "pending" | "answered" | "uncited" | "no_evidence" | "failed" | "cancelled";
 
+/** How passages are found: by their keywords, by meaning (semantic), or both (hybrid). */
+export type RetrievalMode = "lexical" | "semantic" | "hybrid";
+
+/** What a grounded question may ask for; "auto" is the deployment's default. */
+export type RetrievalChoice = "auto" | RetrievalMode;
+
+/** The ways of searching documents this deployment supports (`GET /ai/retrieval/`). */
+export interface RetrievalOptions {
+  /** Only the modes that can run here; just "lexical" when semantic search does not. */
+  modes: RetrievalMode[];
+  /** What "auto" uses. */
+  default_mode: RetrievalMode;
+  semantic_available: boolean;
+  /** A code ("disabled", "pgvector_missing", ...) when semantic search does not run here. */
+  semantic_unavailable_reason: string | null;
+  /** The logical embedding model's key, when semantic search runs. */
+  embedding_model: string | null;
+}
+
 /** How a reply was answered from documents (null on ordinary messages). */
 export interface Grounding {
   mode: "documents";
@@ -49,6 +68,17 @@ export interface Grounding {
   invalid_citations: string[];
   retrieval_ms: number | null;
   strategy: string;
+  // Replies from before semantic search (Phase 09) lack the three fields below: they were
+  // found by keywords, with no fallback.
+  /** The mode the question asked for. */
+  retrieval_requested?: RetrievalChoice;
+  /** The mode that ran. */
+  retrieval_mode?: RetrievalMode;
+  /**
+   * Why keyword search ran instead of what was asked for ("query_embedding_failed",
+   * "vector_search_failed", "semantic_disabled", ...); null when nothing fell back.
+   */
+  fallback?: string | null;
 }
 
 /**
@@ -87,6 +117,8 @@ export type GroundingRequest = (
 ) & {
   /** 1 to 12. */
   max_sources?: number;
+  /** How to search; left out for "auto" (the deployment's default). */
+  retrieval_mode?: RetrievalChoice;
 };
 
 export interface Message {

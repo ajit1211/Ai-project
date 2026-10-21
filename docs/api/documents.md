@@ -76,7 +76,12 @@ or `documents.manage_all`).
     "status": "indexed", "searchable": true, "stale": false, "chunk_count": 31,
     "token_estimate": 8640, "strategy_version": "structured-chars/v1", "attempt_count": 1,
     "warnings": [], "error_code": null, "error_message": null,
-    "requested_at": "...", "started_at": "...", "finished_at": "...", "indexed_at": "..."
+    "requested_at": "...", "started_at": "...", "finished_at": "...", "indexed_at": "...",
+    "semantic": {
+      "status": "ready", "reason": null, "model": "nexa-embed-small", "ready": true,
+      "chunk_count": 31, "error_code": null, "error_message": null, "retryable": false,
+      "ready_at": "..."
+    }
   },
   "can_reindex": true
 }
@@ -89,6 +94,15 @@ page_count, word_count, char_count, warnings, duration_ms, created_at, started_a
 finished_at}`. `index.status` is `none` before indexing was requested, then `pending`,
 `indexing`, `indexed`, `failed`, or `stale` (indexed by an older chunking strategy; still
 searchable). No response ever contains the storage key or a file path.
+
+`index.semantic` (Phase 09, [vector-search.md](../architecture/vector-search.md#indexing)) is
+the document's state for semantic search with the active embedding model: `unavailable` (with
+`reason`: `disabled`, `pgvector_missing`, `no_model`, `provider_not_configured`; the other
+fields are then `null`/`false`), `none` (not requested for this model), `pending`,
+`embedding`, `ready`, `failed` (with `error_code`, `error_message`, `retryable`) or `stale`
+(vectors from an older index; new ones are being made, keyword search is unaffected). `ready`
+is true only when the vectors match the current index. No response contains vectors,
+dimensions or similarity scores.
 
 ## GET /documents/
 
@@ -155,3 +169,31 @@ Phase 08. `POST` rebuilds the search index of a `completed` document (409 otherw
 limited per user, `RAG_INDEX_REQUESTS_PER_HOUR`) and returns `202` with the `index` object;
 audited as `DOCUMENT_INDEX_REQUESTED`. `GET` returns the `index` object. See
 [rag.md](../architecture/rag.md#indexing).
+
+Phase 09: the optional JSON body `{"reembed": true}` re-embeds the document for semantic search
+(all its passages, with the active model) and leaves the keyword index as it is; same
+permission, rate limit and audit event (with `reembed` in its details). 409 `CONFLICT`
+when semantic search is not running or the document is not indexed yet, 422 when `reembed` is not a
+boolean. A re-index (no body) re-embeds afterwards anyway, reusing vectors of unchanged
+passages.
+
+## GET /documents/search-status/
+
+Phase 09. Administrators with `documents.manage_all` (403 otherwise): whether semantic search
+runs in this deployment and why not, and how much of the organization's library is embedded.
+Counts and codes only.
+
+```json
+{
+  "semantic": {
+    "available": true, "reason": "ok",
+    "model": {"key": "nexa-embed-small", "provider": "openai",
+              "provider_model": "text-embedding-3-small", "dimensions": 1536, "distance": "cosine"},
+    "vector_store": {"extension_available": true, "extension_installed": true, "table": true,
+                     "approximate_index": false}
+  },
+  "documents": {"total": 120, "indexed": 118, "semantic_ready": 115, "pending": 2,
+                "embedding": 1, "failed": 0},
+  "passages": {"total": 3410, "embedded": 3352}
+}
+```

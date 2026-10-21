@@ -160,7 +160,23 @@ export async function requestReindex(id: string): Promise<DocumentIndex> {
   return data;
 }
 
-/** Where the search index stands: the call to poll while it is pending or being built. */
+/**
+ * Asks for the passages to be embedded again for semantic search, leaving the keyword index as
+ * it is; resolves to the index, its semantic part now pending. Refused with 409 while the
+ * passages are not indexed or semantic search does not run here, and 429 when asked too often.
+ */
+export async function requestReembed(id: string): Promise<DocumentIndex> {
+  const { data } = await api<DocumentIndex>(`${documentPath(id)}index/`, {
+    method: "POST",
+    body: { reembed: true },
+  });
+  return data;
+}
+
+/**
+ * Where the search index stands, semantic part included: the call to poll while either is
+ * pending or being built.
+ */
 export async function getIndexStatus(id: string, control: RequestControl = {}): Promise<DocumentIndex> {
   const { data } = await api<DocumentIndex>(`${documentPath(id)}index-status/`, {
     signal: control.signal,

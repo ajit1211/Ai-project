@@ -1,10 +1,13 @@
-/** The chat answering from documents: choosing them, sending, the sources event, refusals. */
+/**
+ * The chat answering from documents: choosing them, how to search them, sending, the sources
+ * event, refusals.
+ */
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { listModels } from "../api/ai";
+import { getRetrievalOptions, listModels } from "../api/ai";
 import { ApiError } from "../api/client";
 import {
   getConversation,
@@ -18,7 +21,7 @@ import { getDocument, listDocuments } from "../api/documents";
 import { AuthContext } from "../auth/AuthContext";
 import { chatMessage, grounding, source } from "../test/chatFixtures";
 import { documentIndex, documentPage, documentRecord, signedIn } from "../test/documentFixtures";
-import type { ChatStreamEvent, Conversation, Message } from "../types/chat";
+import type { ChatStreamEvent, Conversation, Message, RetrievalOptions } from "../types/chat";
 import { ChatPage } from "./ChatPage";
 
 vi.mock("../api/conversations", async (importOriginal) => {
@@ -40,7 +43,7 @@ vi.mock("../api/conversations", async (importOriginal) => {
 
 vi.mock("../api/ai", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/ai")>();
-  return { ...actual, listModels: vi.fn() };
+  return { ...actual, listModels: vi.fn(), getRetrievalOptions: vi.fn() };
 });
 
 vi.mock("../api/documents", async (importOriginal) => {
@@ -68,6 +71,22 @@ const draftPlan = documentRecord({
   format: "md",
   index: documentIndex({ status: "indexing", searchable: false }),
 });
+
+const HYBRID: RetrievalOptions = {
+  modes: ["hybrid", "semantic", "lexical"],
+  default_mode: "hybrid",
+  semantic_available: true,
+  semantic_unavailable_reason: null,
+  embedding_model: "nexa-embed-small",
+};
+
+const KEYWORDS_ONLY: RetrievalOptions = {
+  modes: ["lexical"],
+  default_mode: "lexical",
+  semantic_available: false,
+  semantic_unavailable_reason: "pgvector_missing",
+  embedding_model: null,
+};
 
 const question = chatMessage({ id: "m3", sequence: 3, role: "user", content: "How did revenue do?", model: "" });
 const reply = chatMessage({ status: "pending", content: "", grounding: grounding({ outcome: "pending" }), sources: [] });
@@ -124,6 +143,7 @@ const composer = () => screen.getByLabelText<HTMLTextAreaElement>("Message");
 const documentsButton = () => screen.getByRole("button", { name: "Documents" });
 const picker = () => screen.getByRole("dialog", { name: "Answer from documents" });
 const messages = () => screen.getByRole("list", { name: "Messages" });
+const searchBy = () => screen.getByRole<HTMLSelectElement>("combobox", { name: "Search by" });
 
 async function openChat(): Promise<void> {
   renderChat();
@@ -166,6 +186,7 @@ describe("ChatPage answering from documents", () => {
     vi.mocked(getConversation).mockResolvedValue(conversation);
     vi.mocked(listMessages).mockResolvedValue({ data: [], meta: { next_before: null, has_more: false } });
     vi.mocked(listDocuments).mockResolvedValue(documentPage([report, sales, draftPlan]));
+    vi.mocked(getRetrievalOptions).mockResolvedValue(HYBRID);
   });
 
   afterEach(() => {
@@ -244,6 +265,74 @@ describe("ChatPage answering from documents", () => {
     expect(Object.keys(sentBody())).toEqual(["content", "client_message_id"]);
   });
 
+  it("offers the ways of searching the server lists, and sends the one chosen", async () => {
+    vi.mocked(sendMessage).mockImplementation((_id, _body, control) => controlledStream().events(control));
+    await openChat();
+    // Ordinary chat neither asks nor shows anything about searching.
+    expect(getRetrievalOptions).not.toHaveBeenCalled();
+    expect(screen.queryByRole("combobox", { name: "Search by" })).toBeNull();
+
+    await choose("Q4 report");
+    const control = await screen.findByRole<HTMLSelectElement>("combobox", { name: "Search by" });
+    expect(getRetrievalOptions).toHaveBeenCalledTimes(1);
+    expect([...control.options].map((option) => [option.value, option.textContent])).toEqual([
+      ["auto", "Automatic"],
+      ["hybrid", "Hybrid (keywords + meaning)"],
+      ["semantic", "Meaning (semantic)"],
+      ["lexical", "Keywords"],
+    ]);
+    expect(control.value).toBe("auto");
+
+    fireEvent.change(control, { target: { value: "semantic" } });
+    expect(searchBy().value).toBe("semantic");
+    sendText("How did revenue do?");
+    expect(sentBody().grounding).toEqual({ document_ids: ["doc-1"], retrieval_mode: "semantic" });
+  });
+
+  it("offers only the modes the server lists", async () => {
+    vi.mocked(getRetrievalOptions).mockResolvedValue({ ...HYBRID, modes: ["hybrid", "lexical"] });
+    vi.mocked(sendMessage).mockImplementation((_id, _body, control) => controlledStream().events(control));
+    await openChat();
+    fireEvent.click(documentsButton());
+    fireEvent.click(within(picker()).getByRole("radio", { name: "All documents I can access" }));
+    fireEvent.click(within(picker()).getByRole("button", { name: "Use all documents" }));
+    const control = await screen.findByRole<HTMLSelectElement>("combobox", { name: "Search by" });
+    expect([...control.options].map((option) => option.textContent)).toEqual([
+      "Automatic",
+      "Hybrid (keywords + meaning)",
+      "Keywords",
+    ]);
+    fireEvent.change(control, { target: { value: "lexical" } });
+    sendText("Summarize everything");
+    expect(sentBody().grounding).toEqual({ all_documents: true, retrieval_mode: "lexical" });
+  });
+
+  it.each([
+    ["only keyword search runs", () => vi.mocked(getRetrievalOptions).mockResolvedValue(KEYWORDS_ONLY)],
+    [
+      "the options cannot be loaded",
+      () =>
+        vi
+          .mocked(getRetrievalOptions)
+          .mockRejectedValue(new ApiError(403, { code: "PERMISSION_DENIED", message: "No." }, "req_9")),
+    ],
+  ])("offers no choice when %s, and sends none", async (_case, arrange) => {
+    arrange();
+    vi.mocked(sendMessage).mockImplementation((_id, _body, control) => controlledStream().events(control));
+    await openChat();
+    await choose("Q4 report");
+    await waitFor(() => {
+      expect(getRetrievalOptions).toHaveBeenCalled();
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(screen.queryByRole("combobox", { name: "Search by" })).toBeNull();
+    expect(screen.getByText("Answering from 1 document")).toBeTruthy();
+    sendText("How did revenue do?");
+    expect(sentBody().grounding).toEqual({ document_ids: ["doc-1"] });
+  });
+
   it("streams the sources event before the answer, then cites them", async () => {
     const stream = controlledStream();
     vi.mocked(sendMessage).mockImplementation((_id, _body, control) => stream.events(control));
@@ -267,6 +356,8 @@ describe("ChatPage answering from documents", () => {
 
     await feed(stream, { type: "sources", message_id: "m4", searched_documents: 1, sources: [s1, s2] });
     expect(within(messages()).getByText("Found 2 passages")).toBeTruthy();
+    // How they were found is known once the reply ends.
+    expect(within(messages()).queryByText(/^Passages found by/)).toBeNull();
 
     await feed(stream, { type: "text_delta", message_id: "m4", text: "Revenue grew 12% [S1]." });
     expect(within(messages()).queryByText("Found 2 passages")).toBeNull();
@@ -282,6 +373,7 @@ describe("ChatPage answering from documents", () => {
     await feed(stream, { type: "message_complete", message: done });
     expect(within(messages()).getByRole("list", { name: "Sources" })).toBeTruthy();
     expect(within(messages()).getByText("Other passages consulted (1)")).toBeTruthy();
+    expect(within(messages()).getByText("Passages found by keywords and meaning.")).toBeTruthy();
   });
 
   it("explains a 409 in the composer, names the documents still being indexed and puts the question back", async () => {

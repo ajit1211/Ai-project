@@ -29,6 +29,43 @@ export type DocumentVisibility = "private" | "team" | "organization";
  */
 export type IndexStatus = "none" | "pending" | "indexing" | "indexed" | "failed" | "stale";
 
+/**
+ * Where the semantic index (the passages' vectors for the active embedding model) stands.
+ * "unavailable": semantic search does not run here (see `reason`). "none": never embedded for
+ * the active model. "stale": the vectors are from an older keyword index; new ones are being
+ * made.
+ */
+export type SemanticStatus =
+  | "unavailable"
+  | "none"
+  | "pending"
+  | "embedding"
+  | "ready"
+  | "failed"
+  | "stale";
+
+/** The semantic index of one document, part of its `index`. */
+export interface SemanticIndex {
+  status: SemanticStatus;
+  /**
+   * Why semantic search does not run here ("disabled", "pgvector_missing", "no_model",
+   * "provider_not_configured"); null unless the status is "unavailable".
+   */
+  reason: string | null;
+  /** The logical embedding model's key; null while unavailable. */
+  model: string | null;
+  /** Whether the document can be found by meaning now. */
+  ready: boolean;
+  // The fields below are absent while unavailable and for "none".
+  chunk_count?: number;
+  error_code?: string | null;
+  /** Written for the user by the server; set when embedding failed. */
+  error_message?: string | null;
+  /** Whether embedding again may succeed (false for, say, a configuration problem). */
+  retryable?: boolean;
+  ready_at?: string | null;
+}
+
 /** The search index of one document (also GET /documents/{id}/index-status/). */
 export interface DocumentIndex {
   status: IndexStatus;
@@ -48,6 +85,8 @@ export interface DocumentIndex {
   started_at: string | null;
   finished_at: string | null;
   indexed_at: string | null;
+  /** The semantic index, which follows the keyword index with its own status. */
+  semantic: SemanticIndex;
 }
 
 export interface DocumentOwner {

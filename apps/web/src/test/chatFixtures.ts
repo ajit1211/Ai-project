@@ -47,6 +47,9 @@ export function grounding(overrides: Partial<Grounding> = {}): Grounding {
     invalid_citations: [],
     retrieval_ms: 42,
     strategy: "hybrid-v1",
+    retrieval_requested: "auto",
+    retrieval_mode: "hybrid",
+    fallback: null,
     ...overrides,
   };
 }

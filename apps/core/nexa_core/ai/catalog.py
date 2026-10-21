@@ -149,9 +149,9 @@ EMBEDDING_MODELS: tuple[SeedEmbeddingModel, ...] = (
         "mock",
         "mock-embed-hash",
         256,
-        version="hash-v1",
+        version="hash-v2",
         max_batch_size=64,
-        relevance_floor=0.15,
+        relevance_floor=0.2,
         notes="Deterministic feature hashing: lexical, not semantic. Refused outside "
         "development and test.",
     ),

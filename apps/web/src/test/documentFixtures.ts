@@ -9,8 +9,38 @@ import type {
   DocumentPage,
   DocumentRecord,
   Ingestion,
+  SemanticIndex,
   UploadLimits,
 } from "../types/document";
+
+/** A semantic index for the active model: ready unless overridden. */
+export function semanticIndex(overrides: Partial<SemanticIndex> = {}): SemanticIndex {
+  return {
+    status: "ready",
+    reason: null,
+    model: "nexa-embed-small",
+    ready: true,
+    chunk_count: 14,
+    error_code: null,
+    error_message: null,
+    retryable: false,
+    ready_at: "2026-10-12T08:01:20+00:00",
+    ...overrides,
+  };
+}
+
+/** Never embedded for the active model: the server then sends only these fields. */
+export const NOT_EMBEDDED: SemanticIndex = {
+  status: "none",
+  reason: null,
+  model: "nexa-embed-small",
+  ready: false,
+};
+
+/** Semantic search does not run in this deployment. */
+export function semanticUnavailable(reason = "disabled"): SemanticIndex {
+  return { status: "unavailable", reason, model: null, ready: false };
+}
 
 export function documentIndex(overrides: Partial<DocumentIndex> = {}): DocumentIndex {
   return {
@@ -28,6 +58,7 @@ export function documentIndex(overrides: Partial<DocumentIndex> = {}): DocumentI
     started_at: "2026-10-12T08:01:02+00:00",
     finished_at: "2026-10-12T08:01:09+00:00",
     indexed_at: "2026-10-12T08:01:09+00:00",
+    semantic: semanticIndex(),
     ...overrides,
   };
 }
@@ -44,6 +75,7 @@ export const NO_INDEX = documentIndex({
   started_at: null,
   finished_at: null,
   indexed_at: null,
+  semantic: NOT_EMBEDDED,
 });
 
 export function documentRecord(overrides: Partial<DocumentRecord> = {}): DocumentRecord {

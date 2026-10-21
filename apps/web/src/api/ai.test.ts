@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ChatRequest, StreamEvent } from "../types/ai";
-import { AiStreamError, chat, getMyUsage, listModels, streamChat } from "./ai";
+import { AiStreamError, chat, getMyUsage, getRetrievalOptions, listModels, streamChat } from "./ai";
 import { ApiError, getAccessToken, onSessionLost, setAccessToken } from "./client";
 
 type Call = { url: string; init: RequestInit };
@@ -295,5 +295,56 @@ describe("the JSON endpoints", () => {
     const summary = await getMyUsage(7);
     expect(summary.scope).toBe("me");
     expect(call(0).url).toBe("/api/v1/ai/usage/?scope=me&days=7");
+  });
+
+  it("reads the document search options", async () => {
+    const options = {
+      modes: ["hybrid", "semantic", "lexical"],
+      default_mode: "hybrid",
+      semantic_available: true,
+      semantic_unavailable_reason: null,
+      embedding_model: "nexa-embed-small",
+    };
+    responses.push(json(200, { success: true, data: options }));
+    expect(await getRetrievalOptions()).toEqual(options);
+    expect(call(0).url).toBe("/api/v1/ai/retrieval/");
+    expect(header(0, "Authorization")).toBe("Bearer stale");
+  });
+
+  it("keeps only the search modes it knows, and always keyword search", async () => {
+    responses.push(
+      json(200, {
+        success: true,
+        data: {
+          modes: ["semantic", "quantum", "hybrid"],
+          default_mode: "quantum",
+          semantic_available: true,
+          semantic_unavailable_reason: null,
+          embedding_model: "nexa-embed-small",
+        },
+      }),
+    );
+    responses.push(
+      json(200, {
+        success: true,
+        data: {
+          modes: ["lexical"],
+          default_mode: "lexical",
+          semantic_available: false,
+          semantic_unavailable_reason: "pgvector_missing",
+          embedding_model: null,
+        },
+      }),
+    );
+    const newer = await getRetrievalOptions();
+    expect(newer.modes).toEqual(["hybrid", "semantic", "lexical"]);
+    expect(newer.default_mode).toBe("lexical");
+    expect(await getRetrievalOptions()).toEqual({
+      modes: ["lexical"],
+      default_mode: "lexical",
+      semantic_available: false,
+      semantic_unavailable_reason: "pgvector_missing",
+      embedding_model: null,
+    });
   });
 });

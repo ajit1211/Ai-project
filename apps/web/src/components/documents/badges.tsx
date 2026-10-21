@@ -1,7 +1,10 @@
-/** The small marks of a document: its processing and index status, its format, whether search finds it. */
+/**
+ * The small marks of a document: its processing, index and semantic index status, its format,
+ * whether search finds it.
+ */
 
 import { Icon } from "../chat/Icon";
-import { indexLabel, indexTone, statusLabel, statusTone } from "./labels";
+import { indexLabel, indexTone, semanticLabel, semanticTone, statusLabel, statusTone } from "./labels";
 
 /** An extraction status as a coloured badge: green when ready, red when it failed, amber while in progress. */
 export function StatusBadge({ status }: { status: string }) {
@@ -11,6 +14,11 @@ export function StatusBadge({ status }: { status: string }) {
 /** A search-index status as a badge, coloured like `StatusBadge`. */
 export function IndexBadge({ status }: { status: string }) {
   return <span className={`badge badge-${indexTone(status)} doc-badge`}>{indexLabel(status)}</span>;
+}
+
+/** A semantic index status as a badge, coloured like `StatusBadge`. */
+export function SemanticBadge({ status }: { status: string }) {
+  return <span className={`badge badge-${semanticTone(status)} doc-badge`}>{semanticLabel(status)}</span>;
 }
 
 /** Shown on documents whose passages search can find. */

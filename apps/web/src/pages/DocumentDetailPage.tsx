@@ -1,7 +1,7 @@
 /**
- * One document (`/documents/:id`): where text extraction and the search index stand (with
- * their warnings, every extraction attempt, Retry and Re-index), its details and sharing, and
- * its extracted text. The text is untrusted
+ * One document (`/documents/:id`): where text extraction, the search index and the semantic
+ * index stand (with their warnings, every extraction attempt, Retry, Re-index and Re-embed),
+ * its details and sharing, and its extracted text. The text is untrusted
  * data: it is shown as plain text, never as HTML or Markdown, one slice at a time.
  *
  * Two query parameters open a passage directly, for links from citations: `?page=N` shows that
@@ -15,15 +15,18 @@ import { useAuth } from "../auth/AuthContext";
 import { Banner } from "../components/chat/Banner";
 import { formatCount, formatDuration } from "../components/chat/format";
 import { Icon } from "../components/chat/Icon";
-import { FormatIcon, IndexBadge, StatusBadge } from "../components/documents/badges";
+import { FormatIcon, IndexBadge, SemanticBadge, StatusBadge } from "../components/documents/badges";
 import { ConfirmDelete } from "../components/documents/ConfirmDelete";
 import { formatBytes } from "../components/documents/files";
 import {
+  describeEmbeddingFailure,
   describeFailure,
   describeIndexFailure,
+  describeSemanticUnavailable,
   describeWarning,
   displayName,
   formatName,
+  isEmbeddingNow,
   isInFlight,
   isIndexing,
   visibilityLabel,
@@ -225,6 +228,32 @@ function indexSummary(record: DocumentRecord): string {
   }
 }
 
+function semanticSummary(record: DocumentRecord): string {
+  const semantic = record.index.semantic;
+  switch (semantic.status) {
+    case "unavailable":
+      return describeSemanticUnavailable(semantic.reason);
+    case "none":
+      return record.index.searchable
+        ? "Not embedded yet: it is found by its keywords only."
+        : "Embedding starts once the search index is built.";
+    case "pending":
+      return "Waiting for its turn.";
+    case "embedding":
+      return "Its passages are being embedded.";
+    case "ready": {
+      const ready = semantic.ready_at ? `; ready ${dateTime(semantic.ready_at)}` : "";
+      return semantic.chunk_count === undefined
+        ? `It can be found by meaning${ready}.`
+        : `${plural(semantic.chunk_count, "passage", "passages")} can be found by meaning${ready}.`;
+    }
+    case "stale":
+      return "The search index changed, so its passages are being embedded again; until then it is found by its keywords.";
+    case "failed":
+      return "It is still found by its keywords.";
+  }
+}
+
 function extractionSummary(record: DocumentRecord): string {
   const attempt = record.attempt_count > 1 ? ` (attempt ${String(record.attempt_count)})` : "";
   switch (record.status) {
@@ -257,9 +286,14 @@ function Warnings({ title, warnings }: { title: string; warnings: string[] }) {
 function ProcessingCard({ detail, record }: { detail: DocumentDetail; record: DocumentRecord }) {
   const [retrying, setRetrying] = useState(false);
   const [reindexing, setReindexing] = useState(false);
+  const [reembedding, setReembedding] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   const failure = describeFailure(record);
   const indexFailure = describeIndexFailure(record.index);
+  const semantic = record.index.semantic;
+  const semanticAvailable = semantic.status !== "unavailable";
+  const embeddingFailure = describeEmbeddingFailure(semantic);
+  const embedding = reembedding || isEmbeddingNow(semantic.status);
 
   const retry = () => {
     setRetrying(true);
@@ -279,6 +313,19 @@ function ProcessingCard({ detail, record }: { detail: DocumentDetail; record: Do
     });
   };
 
+  const reembed = () => {
+    setReembedding(true);
+    void detail.reembed().then((queued) => {
+      setReembedding(false);
+      // Re-embed is disabled while the passages are embedded: keep focus in this card.
+      if (queued) heading.current?.focus();
+    });
+  };
+
+  let reembedLabel = "Re-embed";
+  if (embedding) reembedLabel = "Embedding…";
+  else if (semantic.status === "failed" && semantic.retryable) reembedLabel = "Retry embedding";
+
   return (
     <section className="card section doc-processing" aria-labelledby="doc-processing-title">
       <h2 id="doc-processing-title" ref={heading} tabIndex={-1}>
@@ -291,9 +338,16 @@ function ProcessingCard({ detail, record }: { detail: DocumentDetail; record: Do
         <StatusRow label="Search index" badge={<IndexBadge status={record.index.status} />}>
           {indexSummary(record)}
         </StatusRow>
+        <StatusRow
+          label="Semantic search"
+          badge={semanticAvailable ? <SemanticBadge status={semantic.status} /> : null}
+        >
+          {semanticSummary(record)}
+        </StatusRow>
       </dl>
       {failure && <p className="doc-failure">{failure}</p>}
       {indexFailure && <p className="doc-failure">{indexFailure}</p>}
+      {embeddingFailure && <p className="doc-failure">{embeddingFailure}</p>}
       {(record.can_retry || record.can_reindex) && (
         <div className="doc-processing-actions">
           {record.can_retry && (
@@ -309,6 +363,18 @@ function ProcessingCard({ detail, record }: { detail: DocumentDetail; record: Do
               onClick={reindex}
             >
               {reindexing || isIndexing(record.index.status) ? "Indexing…" : "Re-index"}
+            </button>
+          )}
+          {record.can_reindex && semanticAvailable && (
+            // Embedding needs the passages of the keyword index: until it has some, there is
+            // nothing to embed.
+            <button
+              type="button"
+              className="btn"
+              disabled={embedding || !record.index.searchable}
+              onClick={reembed}
+            >
+              {reembedLabel}
             </button>
           )}
         </div>

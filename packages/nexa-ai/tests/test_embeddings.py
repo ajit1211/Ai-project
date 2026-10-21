@@ -14,6 +14,7 @@ from nexa_ai.embeddings import (
     EmbeddingModel,
     MockEmbeddingProvider,
     OpenAIEmbeddingProvider,
+    choose_model,
     hash_embedding,
 )
 from nexa_ai.errors import (
@@ -34,7 +35,7 @@ MOCK = EmbeddingModel(
     provider="mock",
     provider_model="mock-embed",
     dimensions=64,
-    version="hash-v1",
+    version="hash-v2",
     max_batch_size=4,
 )
 SMALL = EmbeddingModel(
@@ -45,6 +46,20 @@ SMALL = EmbeddingModel(
     max_batch_size=8,
     price_micros_per_million=20_000,
 )
+DEFAULT = EmbeddingModel(
+    key="nexa-embed-small",
+    provider="openai",
+    provider_model="text-embedding-3-small",
+    dimensions=1536,
+    is_default=True,
+)
+OTHER = EmbeddingModel(
+    key="nexa-embed-large",
+    provider="openai",
+    provider_model="text-embedding-3-large",
+    dimensions=3072,
+)
+REGISTRY = [DEFAULT, OTHER, MOCK]
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -68,7 +83,7 @@ class TestMock:
         assert cosine(query, near) > cosine(query, far)
 
     def test_space_identifies_compatible_vectors(self) -> None:
-        assert MOCK.space == "mock/mock-embed@hash-v1:64:cosine"
+        assert MOCK.space == "mock/mock-embed@hash-v2:64:cosine"
         assert SMALL.space == "openai/text-embedding-3-small@unversioned:3:cosine"
         with pytest.raises(ValueError, match="dimensions"):
             EmbeddingModel(key="x", provider="mock", provider_model="m", dimensions=0)
@@ -226,3 +241,33 @@ class TestOpenAI:
         )
         with pytest.raises(AIEmbeddingInvalid):
             await Embedder({"openai": provider}, sleep=no_sleep).embed_query("x", SMALL)
+
+
+class TestRegistry:
+    """Core and Runtime must pick the same model from the same rows and settings."""
+
+    def choose(
+        self, configured: str = "", providers: tuple[str, ...] = (), mock: bool = False
+    ) -> Any:
+        return choose_model(
+            REGISTRY, configured=configured, available_providers=providers, mock_allowed=mock
+        )
+
+    def test_the_configured_model_and_no_other(self) -> None:
+        assert self.choose("nexa-embed-large", ("openai", "mock"), mock=True) is OTHER
+        # Named but unknown: nothing, never a silent substitute.
+        assert self.choose("nexa-embed-missing", ("openai", "mock"), mock=True) is None
+
+    def test_the_default_when_its_provider_is_configured(self) -> None:
+        assert self.choose(providers=("openai", "mock"), mock=True) is DEFAULT
+
+    def test_the_mock_only_where_allowed(self) -> None:
+        assert self.choose(providers=("mock",), mock=True) is MOCK
+        # In production the default is reported (and is unavailable): no mock vectors.
+        assert self.choose(providers=(), mock=False) is DEFAULT
+
+    def test_no_models(self) -> None:
+        assert (
+            choose_model([], configured="", available_providers=("openai",), mock_allowed=True)
+            is None
+        )

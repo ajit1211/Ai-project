@@ -1,8 +1,9 @@
 /**
  * A reply answered from documents: a "From your documents" badge, the answer with its
- * citations as buttons, notices about how well it is supported, and its sources (the cited
- * passages as cards, the others folded under "Other passages consulted"). A citation button
- * brings its card into view, focuses it and highlights it for a moment.
+ * citations as buttons, notices about how well it is supported (and about a search that fell
+ * back to keywords), and its sources (the cited passages as cards, the others folded under
+ * "Other passages consulted", then how they were found). A citation button brings its card
+ * into view, focuses it and highlights it for a moment.
  *
  * Excerpts are untrusted document text: they are shown as plain text, never as HTML or
  * Markdown. A source whose document is gone or no longer shared says so and links nowhere.
@@ -15,6 +16,7 @@ import { listMessageSources } from "../../api/conversations";
 import type { Retrieval } from "../../hooks/chatThread";
 import type { Grounding, Message, Source } from "../../types/chat";
 import { CitationContext, sourceLocation, sourceName } from "./citations";
+import { FALLBACK_NOTICE, retrievalMethod } from "./grounding";
 import { Markdown } from "./Markdown";
 
 /** How long a card stays highlighted after its citation was followed. */
@@ -173,6 +175,9 @@ export function GroundedReply({ message, grounding, streaming }: GroundedReplyPr
   );
   const cited = sources.filter((source) => source.cited);
   const others = sources.filter((source) => !source.cited);
+  // Until the reply ends, its grounding is the pending one, which does not say how yet.
+  const settled = !streaming && grounding.outcome !== "pending";
+  const method = settled && sources.length > 0 ? retrievalMethod(grounding) : null;
 
   return (
     <CitationContext.Provider value={citations}>
@@ -191,6 +196,7 @@ export function GroundedReply({ message, grounding, streaming }: GroundedReplyPr
           Some citations could not be verified and are shown as plain text.
         </p>
       )}
+      {settled && grounding.fallback && <p className="grounding-note small">{FALLBACK_NOTICE}</p>}
       {cited.length > 0 && (
         <div className="sources">
           <p className="sources-title">Sources</p>
@@ -213,6 +219,7 @@ export function GroundedReply({ message, grounding, streaming }: GroundedReplyPr
           </ol>
         </details>
       )}
+      {method && <p className="grounding-note small">{method}</p>}
       {passageError && <p className="grounding-note grounding-warning small">{passageError}</p>}
     </CitationContext.Provider>
   );

@@ -1,6 +1,7 @@
 /**
- * The AI Gateway endpoints (docs/architecture/ai-gateway.md, "API"). This is the only
- * module that calls `/ai/...`; pages go through the playground hook.
+ * The AI Gateway endpoints (docs/architecture/ai-gateway.md, "API"), and the document search
+ * options of the chat (`/ai/retrieval/`). This is the only module that calls `/ai/...`; pages
+ * go through the playground and chat hooks.
  */
 
 import type { SseFrame } from "../services/ai/sse";
@@ -13,6 +14,7 @@ import type {
   StreamEventName,
   UsageSummary,
 } from "../types/ai";
+import type { RetrievalMode, RetrievalOptions } from "../types/chat";
 import { ApiError, api } from "./client";
 import { frameObject, notAStream, postForStream } from "./stream";
 
@@ -47,6 +49,32 @@ export async function chat(request: ChatRequest, control: RequestControl = {}): 
     signal: control.signal,
   });
   return data;
+}
+
+const RETRIEVAL_MODES: readonly RetrievalMode[] = ["hybrid", "semantic", "lexical"];
+
+function isRetrievalMode(value: unknown): value is RetrievalMode {
+  return typeof value === "string" && (RETRIEVAL_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * The ways of searching documents this deployment supports, for the chat's search control.
+ * Modes this client does not know (a newer server) are dropped; keyword search is always there.
+ */
+export async function getRetrievalOptions(control: RequestControl = {}): Promise<RetrievalOptions> {
+  const { data } = await api<Partial<RetrievalOptions>>("/ai/retrieval/", { signal: control.signal });
+  const listed: unknown[] = Array.isArray(data.modes) ? data.modes : [];
+  const modes = RETRIEVAL_MODES.filter((mode) => listed.includes(mode));
+  if (!modes.includes("lexical")) modes.push("lexical");
+  return {
+    modes,
+    default_mode:
+      isRetrievalMode(data.default_mode) && modes.includes(data.default_mode) ? data.default_mode : "lexical",
+    semantic_available: data.semantic_available === true && modes.length > 1,
+    semantic_unavailable_reason:
+      typeof data.semantic_unavailable_reason === "string" ? data.semantic_unavailable_reason : null,
+    embedding_model: typeof data.embedding_model === "string" ? data.embedding_model : null,
+  };
 }
 
 /** Usage of the signed-in user in the active organization over the last `days` days. */
