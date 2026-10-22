@@ -12,6 +12,12 @@
  *
  * Every new submission gets a fresh `client_message_id`; retrying that same submission after
  * it failed reuses it, so a send that did reach the server is replayed, not duplicated.
+ *
+ * A reply may use tools: its `tool_call` and `tool_result` events build its activity as it
+ * streams. A reply that needs the user's approval for an action ends its stream paused
+ * (`approval_required`); `decide` sends the user's choice, and the same reply continues as a
+ * new stream, shown in place. A refused decision (the action changed, expired or was already
+ * decided) reloads the messages, since the server's copy now says what happened.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -19,6 +25,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "../api/client";
 import {
   cancelGeneration,
+  decideApproval,
   getConversation,
   listMessages,
   regenerate,
@@ -36,6 +43,7 @@ import type {
   Message,
   MessageStartEvent,
 } from "../types/chat";
+import type { Approval, ApprovalChoice, ToolActivity } from "../types/tools";
 import {
   buildItems,
   commitReply,
@@ -44,15 +52,23 @@ import {
   upsertMessages,
   type ChatError,
   type ChatItem,
+  type Decision,
   type LiveReply,
   type Submission,
   type Thread,
   type UnsentSubmission,
 } from "./chatThread";
+import { applyToolCall, applyToolResult, pendingApproval, withApproval } from "./toolActivity";
 
 const PAGE_SIZE = 50;
 /** How long a reply may keep streaming after the server accepted a stop. */
 const STOP_GRACE_MS = 5000;
+/** Refusals of a decision after which the server's copy of the paused reply is reloaded. */
+const STALE_DECISION_CODES: ReadonlySet<string> = new Set([
+  "TOOL_APPROVAL_STALE",
+  "TOOL_APPROVAL_EXPIRED",
+  "TOOL_APPROVAL_CLOSED",
+]);
 
 /** A request in flight, by conversation. */
 interface Run {
@@ -97,6 +113,10 @@ export interface ChatState {
   regenerate: () => void;
   /** Retry the row with this key: an unsent submission is resent, a failed reply regenerated. */
   retry: (key: string) => void;
+  /** Approve or reject the action the paused reply `replyId` proposed; that reply continues. */
+  decide: (replyId: string, approval: Approval, choice: ApprovalChoice) => void;
+  /** The action the open conversation's last reply is paused on, until the user decides. */
+  pendingApproval: Approval | null;
   stop: () => void;
   savingModel: boolean;
   setModel: (model: string) => void;
@@ -139,9 +159,16 @@ function eventError(event: ChatErrorEvent): ChatError {
 
 /** The reply an event after `message_start` is about. */
 function replyIdOf(event: Exclude<ChatStreamEvent, MessageStartEvent>): string {
-  return event.type === "message_complete" || event.type === "message_cancelled"
+  return event.type === "message_complete" ||
+    event.type === "message_cancelled" ||
+    event.type === "approval_required"
     ? event.message.id
     : event.message_id;
+}
+
+/** What the live region says when a decision is sent. */
+function decisionAnnouncement(choice: ApprovalChoice): string {
+  return choice === "approve" ? "Action approved; continuing the reply" : "Action rejected; continuing the reply";
 }
 
 function pickUsage(event: Usage): Usage {
@@ -245,28 +272,39 @@ export function useChat(
       .catch(() => undefined); // Cosmetic: the next load brings the title anyway.
   };
 
-  const generate = async (id: string, submission: Submission | null): Promise<void> => {
+  const generate = async (
+    id: string,
+    submission: Submission | null,
+    decision: Decision | null = null,
+  ): Promise<void> => {
     const controller = new AbortController();
     const run: Run = { controller, stopping: false, graceTimer: null, started: false, cancelOnStart: false };
     runs.current.set(id, run);
+    let kind: LiveReply["kind"] = "regenerate";
+    if (submission) kind = "send";
+    else if (decision) kind = "decide";
     setLive((all) => ({
       ...all,
       [id]: {
         conversationId: id,
-        kind: submission ? "send" : "regenerate",
+        kind,
         submission,
+        decision,
         userMessage: null,
         reply: null,
         text: "",
+        tools: [],
         usage: null,
         found: null,
         stopping: false,
       },
     }));
-    setUnsent((all) => omit(all, id));
+    // A decision continues an older reply: a submission refused meanwhile stays, to retry.
+    if (decision) setFailures((all) => omit(all, decision.replyId));
+    else setUnsent((all) => omit(all, id));
     setNotice((current) => (current?.conversationId === id ? null : current));
     // Always the user's own action in the conversation on screen (or the one being opened).
-    setAnnouncement("Generating reply");
+    setAnnouncement(decision ? decisionAnnouncement(decision.choice) : "Generating reply");
 
     const patchLive = (patch: (reply: LiveReply) => LiveReply): void => {
       setLive((all) => {
@@ -277,6 +315,7 @@ export function useChat(
 
     let start: MessageStartEvent | null = null;
     let text = "";
+    let tools: ToolActivity[] = [];
     /** Commit the final reply to the thread (if it is still open) and end the live view. */
     const finish = (reply: Message, failure: ChatError | null): void => {
       const user = start?.user_message;
@@ -292,18 +331,28 @@ export function useChat(
 
     try {
       const { signal } = controller;
-      const events = submission
-        ? sendMessage(
-            id,
-            {
-              content: submission.content,
-              client_message_id: submission.clientMessageId,
-              // Ordinary chat sends exactly what it always did: no grounding key at all.
-              ...(submission.grounding ? { grounding: submission.grounding } : {}),
-            },
-            { signal },
-          )
-        : regenerate(id, {}, { signal });
+      let events: AsyncGenerator<ChatStreamEvent, void, undefined>;
+      if (submission) {
+        events = sendMessage(
+          id,
+          {
+            content: submission.content,
+            client_message_id: submission.clientMessageId,
+            // Ordinary chat sends exactly what it always did: no grounding key at all.
+            ...(submission.grounding ? { grounding: submission.grounding } : {}),
+          },
+          { signal },
+        );
+      } else if (decision) {
+        events = decideApproval(
+          id,
+          decision.approval.id,
+          { decision: decision.choice, arguments_hash: decision.approval.arguments_hash },
+          { signal },
+        );
+      } else {
+        events = regenerate(id, {}, { signal });
+      }
       for await (const event of events) {
         if (event.type === "message_start") {
           start = event;
@@ -314,10 +363,17 @@ export function useChat(
               run.controller.abort();
             });
           }
+          // A continued reply starts with its own text and tool calls; a new one with none.
+          const startText = event.assistant_message.content;
+          const startTools = event.assistant_message.tools ?? [];
+          text = startText;
+          tools = startTools;
           patchLive((current) => ({
             ...current,
             userMessage: event.user_message,
             reply: event.assistant_message,
+            text: startText,
+            tools: startTools,
           }));
           refresh(id);
           continue;
@@ -338,6 +394,14 @@ export function useChat(
             patchLive((current) => ({ ...current, usage }));
             break;
           }
+          case "tool_call":
+            tools = applyToolCall(tools, event);
+            patchLive((current) => ({ ...current, tools: applyToolCall(current.tools, event) }));
+            break;
+          case "tool_result":
+            tools = applyToolResult(tools, event);
+            patchLive((current) => ({ ...current, tools: applyToolResult(current.tools, event) }));
+            break;
           case "message_complete":
             finish(event.message, null);
             // Screen-reader users hear that the answer is there and they can write again.
@@ -353,6 +417,11 @@ export function useChat(
             announce(id, describeChatError(failure));
             return;
           }
+          case "approval_required":
+            // Paused, not over: the reply waits for the user's decision on the action.
+            finish(withApproval(event.message, event.approval), null);
+            announce(id, `Waiting for your approval: ${event.approval.summary || event.approval.tool_name}`);
+            return;
         }
       }
       // The stream ended without a terminal event for this reply.
@@ -364,7 +433,7 @@ export function useChat(
     } catch (err) {
       if (controller.signal.aborted) {
         if (!run.stopping) return; // The page went away.
-        if (start) finish({ ...start.assistant_message, content: text, status: "cancelled" }, null);
+        if (start) finish({ ...start.assistant_message, content: text, tools, status: "cancelled" }, null);
         else {
           // Stopped before the server said what it stored. Keep the text to retry, and reload:
           // if the server did store the message, the list shows its copy instead.
@@ -383,7 +452,7 @@ export function useChat(
         // The stream broke after the messages were stored; the server keeps the text as
         // cancelled. Show the reply as failed with Retry (a regeneration).
         finish(
-          { ...start.assistant_message, content: text, status: "failed", error_code: failure.code },
+          { ...start.assistant_message, content: text, tools, status: "failed", error_code: failure.code },
           failure,
         );
       } else {
@@ -398,6 +467,11 @@ export function useChat(
         }
         if (submission) setUnsent((all) => ({ ...all, [id]: { ...submission, error: failure } }));
         else setNotice({ conversationId: id, error: failure });
+        // A refused decision: the action changed, expired, was decided already, or is gone.
+        // The server's copy of the paused reply now says which.
+        if (decision && err instanceof ApiError && (STALE_DECISION_CODES.has(err.code) || err.status === 404)) {
+          setReloads((count) => count + 1);
+        }
       }
       announce(id, describeChatError(failure));
     } finally {
@@ -445,6 +519,11 @@ export function useChat(
     } else {
       void generate(conversationId, null);
     }
+  };
+
+  const decide = (replyId: string, approval: Approval, choice: ApprovalChoice): void => {
+    if (!conversationId || runs.current.has(conversationId)) return;
+    void generate(conversationId, null, { approval, choice, replyId });
   };
 
   const stop = (): void => {
@@ -534,6 +613,10 @@ export function useChat(
       })
     : [];
 
+  // Only the last reply can be paused; while a decision on it is being sent it is not.
+  const lastReply = items.findLast((item) => item.message.role === "assistant" && item.delivery === "sent");
+  const paused = lastReply && !lastReply.streaming ? pendingApproval(lastReply.message) : null;
+
   return {
     conversation: current?.conversation ?? null,
     items,
@@ -550,6 +633,8 @@ export function useChat(
     send,
     regenerate: regenerateReply,
     retry,
+    decide,
+    pendingApproval: paused,
     stop,
     savingModel,
     setModel,

@@ -8,6 +8,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from nexa_ai.cost import micros_to_usd
 from nexa_runtime.rag.schemas import GroundingOut, GroundingRequest, SourceOut
+from nexa_runtime.tools.schemas import ToolActivityOut
 
 MAX_CONTENT_CHARS = 100_000
 _MODEL_PATTERN = r"^[A-Za-z0-9_-]{1,48}$"
@@ -24,7 +25,10 @@ def _reject_nul(value: str) -> str:
 NulFree = Annotated[str, AfterValidator(_reject_nul)]
 
 ConversationStatus = Literal["active", "archived"]
-MessageStatus = Literal["pending", "streaming", "completed", "failed", "cancelled"]
+MessageStatus = Literal[
+    "pending", "streaming", "completed", "failed", "cancelled", "awaiting_approval"
+]
+ToolUse = Literal["auto", "none"]
 
 
 class CreateConversation(BaseModel):
@@ -50,6 +54,9 @@ class SendMessage(BaseModel):
     model: str = Field(default="", pattern=_MODEL_PATTERN)
     # Answer from the user's documents (Phase 08); absent for an ordinary reply.
     grounding: GroundingRequest | None = None
+    # Phase 10: "auto" lets the model use the tools this user may use (streamed replies of
+    # ordinary chat); "none" answers without tools. Grounded replies never use tools.
+    tools: ToolUse = "auto"
 
 
 class Regenerate(BaseModel):
@@ -109,6 +116,8 @@ class MessageOut(BaseModel):
     # model (re-authorized whenever messages are read).
     grounding: GroundingOut | None = None
     sources: list[SourceOut] = Field(default_factory=list)
+    # Replies that used tools (Phase 10): every call, in order, as its owner may see it.
+    tools: list[ToolActivityOut] = Field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: Any) -> "MessageOut":

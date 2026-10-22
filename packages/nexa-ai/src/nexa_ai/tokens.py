@@ -8,12 +8,14 @@ reserves a little more quota for a moment; under-estimating would let requests t
 the provider then rejects. No tokenizer library is used, so `nexa_ai` stays provider-neutral.
 """
 
+import json
 from collections.abc import Iterable
 
 from nexa_ai.types import Message
 
 CHARS_PER_TOKEN = 3
 _PER_MESSAGE_OVERHEAD = 4
+_PER_TOOL_PART_OVERHEAD = 8
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -21,4 +23,14 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def estimate_message_tokens(messages: Iterable[Message]) -> int:
-    return sum(estimate_text_tokens(m.text) + _PER_MESSAGE_OVERHEAD for m in messages)
+    return sum(_message_tokens(m) for m in messages)
+
+
+def _message_tokens(message: Message) -> int:
+    tokens = estimate_text_tokens(message.text) + _PER_MESSAGE_OVERHEAD
+    for call in message.tool_calls:
+        arguments = call.raw_arguments or json.dumps(call.arguments)
+        tokens += estimate_text_tokens(call.name + arguments) + _PER_TOOL_PART_OVERHEAD
+    for result in message.tool_results:
+        tokens += estimate_text_tokens(result.content) + _PER_TOOL_PART_OVERHEAD
+    return tokens

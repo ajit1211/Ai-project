@@ -27,6 +27,11 @@ const PATHS = {
   ],
   search: ["M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z", "M21 21l-4.35-4.35"],
   back: ["M19 12H5", "M12 19l-7-7 7-7"],
+  // AI tool calls: failed, refused or stopped, timed out, waiting for approval.
+  alert: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M12 8v5", "M12 16h.01"],
+  ban: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M5.6 5.6l12.8 12.8"],
+  clock: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M12 7v5l3 2"],
+  shield: ["M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z", "M12 8v4", "M12 15h.01"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type IconName = keyof typeof PATHS;

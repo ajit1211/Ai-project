@@ -31,6 +31,7 @@ from nexa_runtime.chat.schemas import (
 from nexa_runtime.chat.service import ChatService, Generation
 from nexa_runtime.rag.schemas import SourceOut
 from nexa_runtime.responses import Envelope, ok
+from nexa_runtime.tools.schemas import ApprovalDecision
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -146,6 +147,26 @@ async def regenerate(
         principal, conversation_id, body or Regenerate(), request_id=current_request_id()
     )
     return await _respond(generation, request, service)
+
+
+@router.post("/{conversation_id}/approvals/{approval_id}/", response_model=None)
+async def decide(
+    conversation_id: UUID,
+    approval_id: UUID,
+    body: ApprovalDecision,
+    request: Request,
+    principal: CurrentPrincipal,
+    service: Service,
+) -> Response:
+    """Approve or reject the action a paused reply proposed (Phase 10). The reply continues:
+    as a stream when the client asks for `text/event-stream`, otherwise answered with JSON
+    once it ends (or pauses again)."""
+    generation = await service.decide(
+        principal, conversation_id, approval_id, body, request_id=current_request_id()
+    )
+    if _wants_stream(request):
+        return await _respond(generation, request, service)
+    return _json(await service.finish(generation), status_code=200)
 
 
 @router.post("/{conversation_id}/cancel/")

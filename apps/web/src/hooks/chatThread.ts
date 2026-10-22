@@ -1,6 +1,8 @@
 /**
  * The chat's message state as pure functions: merging pages, committing a finished reply,
- * and the rows the message list renders. `useChat` owns the React state around them.
+ * and the rows the message list renders. `useChat` owns the React state around them. A reply
+ * paused for the user's decision on an action (`awaiting_approval`) is committed like a
+ * finished one; deciding continues that same reply as a new live reply.
  */
 
 import { describeErrorCode, hintForCode } from "../services/ai/errors";
@@ -13,6 +15,7 @@ import type {
   MessageStatus,
   Source,
 } from "../types/chat";
+import type { Approval, ApprovalChoice, ToolActivity } from "../types/tools";
 
 /** What the UI says about a failure. */
 export interface ChatError {
@@ -45,6 +48,14 @@ export type Retrieval =
   | { state: "searching"; documents: number | null }
   | { state: "found"; searched: number; found: number };
 
+/** The user's decision on the action a paused reply proposed, which continues that reply. */
+export interface Decision {
+  approval: Approval;
+  choice: ApprovalChoice;
+  /** The paused reply. */
+  replyId: string;
+}
+
 /** A submission the server refused or never received: an unsent bubble with Retry. */
 export interface UnsentSubmission extends Submission {
   error: ChatError;
@@ -65,14 +76,18 @@ export interface Thread {
 /** A reply being generated. It is shown over the thread until its terminal event. */
 export interface LiveReply {
   conversationId: string;
-  kind: "send" | "regenerate";
-  /** The send being answered (null for a regeneration). */
+  kind: "send" | "regenerate" | "decide";
+  /** The send being answered (null for a regeneration or a decision). */
   submission: Submission | null;
+  /** The decision that continues a paused reply (null otherwise). */
+  decision: Decision | null;
   /** From `message_start`. */
   userMessage: Message | null;
   reply: Message | null;
-  /** The text so far, from `text_delta`. */
+  /** The text so far: the reply's own (a continued reply has some), then `text_delta`. */
   text: string;
+  /** The reply's tool calls so far: its own, then `tool_call` and `tool_result`. */
+  tools: ToolActivity[];
   /** From the `usage` event; the terminal event's message has the final numbers. */
   usage: Usage | null;
   /** From the `sources` event of a grounded reply. */
@@ -93,6 +108,8 @@ export interface ChatItem {
   error: ChatError | null;
   /** Set on a grounded reply while it streams and has no text yet. */
   retrieval?: Retrieval;
+  /** Set on a paused reply while the user's decision on its action is being sent. */
+  deciding?: ApprovalChoice;
 }
 
 /** How many documents a grounded send names, or null when its scope is wider. */
@@ -224,6 +241,7 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
   );
   let streamingId: string | null = null;
   let retrieval: Retrieval | undefined;
+  let deciding: ApprovalChoice | undefined;
   const tail: ChatItem[] = [];
 
   if (live?.userMessage && live.reply) {
@@ -232,6 +250,7 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
       content: live.text,
       status: live.text ? "streaming" : "pending",
       ...(live.found ? { sources: live.found.sources } : {}),
+      ...(live.tools.length > 0 ? { tools: live.tools } : {}),
     };
     messages = withExchange(messages, live.userMessage, reply);
     streamingId = reply.id;
@@ -240,6 +259,10 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
         ? { state: "found", searched: live.found.searched, found: live.found.sources.length }
         : { state: "searching", documents: documentCount(reply.grounding) };
     }
+  } else if (live?.decision) {
+    // Until message_start: the paused reply as it is, marked as continuing.
+    streamingId = live.decision.replyId;
+    deciding = live.decision.choice;
   } else if (live) {
     // Until message_start: the submission as typed and a placeholder for the reply.
     if (live.kind === "regenerate" && messages.at(-1)?.role === "assistant") {
@@ -278,6 +301,7 @@ export function buildItems({ thread, live, unsent, failures, finished }: ItemSou
     delivery: "sent",
     error: failureOf(message, failures),
     ...(message.id === streamingId && retrieval ? { retrieval } : {}),
+    ...(message.id === streamingId && deciding ? { deciding } : {}),
   }));
   // An unsent submission the server turns out to have stored is shown by its stored copy.
   const stored = (submission: Submission) =>

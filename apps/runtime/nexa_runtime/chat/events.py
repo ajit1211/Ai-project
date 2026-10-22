@@ -1,18 +1,22 @@
 """The `nexa.chat.v1` streaming protocol (docs/api/conversations.md#streaming).
 
-Terminal events, exactly one per stream: `message_complete`, `message_cancelled` or `error`.
-Every event after `message_start` names the assistant message it is about. A grounded reply
-sends `sources` once retrieval is done, before any text (Phase 08; clients ignore event types
-they do not know, so the addition keeps the protocol version).
+Terminal events, exactly one per stream: `message_complete`, `message_cancelled`, `error`, or
+`approval_required` (Phase 10: the reply pauses until the user decides on an action a tool
+would take). Every event after `message_start` names the assistant message it is about. A
+grounded reply sends `sources` once retrieval is done, before any text (Phase 08). A reply that
+uses tools sends `tool_call` when a call is checked and `tool_result` when it ends, only for
+calls that really happened (clients ignore event types they do not know, so the additions keep
+the protocol version).
 """
 
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nexa_runtime.chat.schemas import MessageOut
 from nexa_runtime.rag.schemas import SourceOut
+from nexa_runtime.tools.schemas import ApprovalOut, ToolStatus
 
 PROTOCOL = "nexa.chat.v1"
 PROTOCOL_HEADER = "X-NEXA-Stream-Protocol"
@@ -53,6 +57,50 @@ class UsageReport(BaseModel):
     cost_usd: str | None
 
 
+class ToolCallEvent(BaseModel):
+    """A tool call the model asked for, after the checks: about to run (`executing`), refused
+    (`rejected`, with the reason), or waiting for the user (`awaiting_approval`)."""
+
+    type: Literal["tool_call"] = "tool_call"
+    message_id: UUID
+    invocation_id: UUID
+    call_id: str
+    tool_id: str
+    tool_name: str
+    step: int
+    status: ToolStatus
+    summary: str
+    risk: str
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class ToolResultEvent(BaseModel):
+    """How a tool call ended. `result` is the validated data the model received."""
+
+    type: Literal["tool_result"] = "tool_result"
+    message_id: UUID
+    invocation_id: UUID
+    call_id: str
+    tool_id: str
+    status: ToolStatus
+    duration_ms: int | None = None
+    result: dict[str, Any] | None = None
+    result_truncated: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ApprovalRequired(BaseModel):
+    """Terminal: the reply is paused (`awaiting_approval`) until the user approves or rejects
+    the action (POST /conversations/{id}/approvals/{approval_id}/), which continues it."""
+
+    type: Literal["approval_required"] = "approval_required"
+    message: MessageOut
+    approval: ApprovalOut
+
+
 class MessageComplete(BaseModel):
     type: Literal["message_complete"] = "message_complete"
     message: MessageOut
@@ -79,6 +127,9 @@ ChatEvent = (
     | SourcesFound
     | TextDelta
     | UsageReport
+    | ToolCallEvent
+    | ToolResultEvent
+    | ApprovalRequired
     | MessageComplete
     | MessageCancelled
     | GenerationError

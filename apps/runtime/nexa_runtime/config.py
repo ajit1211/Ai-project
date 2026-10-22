@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 
@@ -126,6 +126,16 @@ class RuntimeSettings(BaseSettings):
     rag_query_embedding_timeout_seconds: float = 10.0
     rag_hnsw_ef_search: int = 100
     rag_semantic_status_ttl_seconds: float = 30.0
+
+    # AI tool calling (docs/architecture/tools.md). Every limit applies per reply ("turn").
+    tools_enabled: bool = True
+    tools_max_iterations: int = Field(default=4, ge=1, le=10)
+    tools_max_calls_per_turn: int = Field(default=8, ge=1, le=32)
+    tools_max_concurrency: int = Field(default=4, ge=1, le=8)
+    tools_turn_timeout_seconds: float = Field(default=120.0, ge=5.0, le=600.0)
+    tools_max_total_output_bytes: int = Field(default=48_000, ge=1_000, le=512_000)
+    tools_calls_per_minute: int = Field(default=30, ge=1, le=600)
+    tools_approval_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
 
     @property
     def async_database_url(self) -> URL:

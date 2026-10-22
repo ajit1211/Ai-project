@@ -135,12 +135,22 @@ def visible_documents(scope: DocumentFilter) -> ColumnElement[bool]:
     """Documents the caller may read and that are ready to search, as a SQL predicate on
     `documents` joined with `document_indexes`."""
     d, i = t.documents.c, t.document_indexes.c
-    clauses: list[ColumnElement[bool]] = [
-        d.organization_id == scope.organization_id,
-        d.deleted_at.is_(None),
+    return and_(
+        readable_documents(scope),
         d.status == "completed",
         i.indexed_at.is_not(None),
         i.chunk_count > 0,
+    )
+
+
+def readable_documents(scope: DocumentFilter) -> ColumnElement[bool]:
+    """Documents the caller may read, in any processing state, as a SQL predicate on
+    `documents`: the shared document policy (owner, organization sharing, a team they belong
+    to, or `documents.manage_all`) written as SQL. Search adds "ready to search" on top."""
+    d = t.documents.c
+    clauses: list[ColumnElement[bool]] = [
+        d.organization_id == scope.organization_id,
+        d.deleted_at.is_(None),
     ]
     if not scope.manage_all:
         allowed: list[ColumnElement[bool]] = [

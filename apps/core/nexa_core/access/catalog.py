@@ -83,6 +83,7 @@ PERMISSIONS: tuple[PermissionSpec, ...] = (
     PermissionSpec("ai.chat", "Chat with AI models"),
     PermissionSpec("ai.agent.execute", "Let AI agents act on your behalf"),
     PermissionSpec("ai.tool.execute", "Let AI use tools on your behalf"),
+    PermissionSpec("ai.tool.manage", "Switch AI tools on and off for the organization"),
     PermissionSpec("ai.web_search", "Let AI search the web"),
     PermissionSpec("ai.code_execute", "Let AI run code in the sandbox"),
     PermissionSpec("ai.database_query", "Let AI query connected databases"),

@@ -12,6 +12,9 @@ Translation rules (docs/architecture/ai-gateway.md#provider-adapters):
   `input_tokens` is their sum.
 - Sampling temperature is not sent: the Messages API for current Claude models has no
   temperature parameter, so the catalog marks these models `accepts_temperature = false`.
+- Tools (Phase 10) become `tools` with `input_schema`; an assistant message's tool calls are
+  `tool_use` blocks, and a `tool` message becomes a user turn of `tool_result` blocks. A
+  streamed tool call arrives as `input_json_delta` fragments, joined and decoded at the end.
 - The SDK's own retries are off: the gateway is the only place that retries.
 """
 
@@ -21,7 +24,7 @@ from typing import Any
 import anthropic
 import httpx2
 from anthropic import omit
-from anthropic.types import MessageParam, TextBlockParam
+from anthropic.types import MessageParam
 
 from nexa_ai.errors import (
     AIAuthenticationError,
@@ -47,7 +50,8 @@ from nexa_ai.providers.base import (
     Timeouts,
     TokenCounts,
 )
-from nexa_ai.types import FinishReason, Role
+from nexa_ai.tools import decode_arguments, tool_call
+from nexa_ai.types import FinishReason, Role, ToolCallPart
 from nexa_common.logs import get_logger
 
 log = get_logger("nexa.ai.anthropic")
@@ -96,11 +100,17 @@ class AnthropicProvider:
         except Exception as exc:
             raise _map_error(exc, call.model) from exc
         content = "".join(block.text for block in message.content if block.type == "text")
+        calls = tuple(
+            tool_call(block.id, block.name, block.input)
+            for block in message.content
+            if block.type == "tool_use"
+        )
         return ProviderResult(
             content=content,
             finish_reason=_finish(message.stop_reason),
             usage=_usage(message.usage),
             provider_response_id=message.id,
+            tool_calls=calls,
         )
 
     async def stream(self, call: ProviderCall) -> AsyncIterator[ProviderEvent]:
@@ -114,6 +124,8 @@ class AnthropicProvider:
         stop_reason: str | None = None
         start_usage: Any = None
         output_tokens = 0
+        # index -> (id, name, argument fragments) of the tool_use blocks seen so far
+        tool_blocks: dict[int, tuple[str, str, list[str]]] = {}
         try:
             async with response:
                 async for event in response:
@@ -126,6 +138,20 @@ class AnthropicProvider:
                     elif event.type == "content_block_delta" and event.delta.type == "text_delta":
                         if event.delta.text:
                             yield TextChunk(event.delta.text)
+                    elif (
+                        event.type == "content_block_start"
+                        and event.content_block.type == "tool_use"
+                    ):
+                        block = event.content_block
+                        tool_blocks[event.index] = (block.id, block.name, [])
+                        yield ACTIVITY
+                    elif (
+                        event.type == "content_block_delta"
+                        and event.delta.type == "input_json_delta"
+                        and event.index in tool_blocks
+                    ):
+                        tool_blocks[event.index][2].append(event.delta.partial_json)
+                        yield ACTIVITY
                     elif event.type == "message_delta":
                         stop_reason = event.delta.stop_reason or stop_reason
                         output_tokens = event.usage.output_tokens  # cumulative
@@ -142,6 +168,9 @@ class AnthropicProvider:
                             )
                             if usage is not None
                             else None,
+                            tool_calls=tuple(
+                                _assembled(*tool_blocks[index]) for index in sorted(tool_blocks)
+                            ),
                         )
                         return
                     else:
@@ -158,11 +187,32 @@ class AnthropicProvider:
         for message in call.messages:
             if message.role is Role.SYSTEM:
                 continue
-            block: TextBlockParam = {"type": "text", "text": message.text}
-            if message.role is Role.ASSISTANT:
-                messages.append({"role": "assistant", "content": [block]})
+            if message.role is Role.TOOL:
+                # Consecutive user turns are combined by the API, so the results stay first
+                # in the turn that follows the tool_use blocks, as required.
+                results: list[Any] = [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": result.call_id,
+                        "content": result.content,
+                        "is_error": result.is_error,
+                    }
+                    for result in message.tool_results
+                ]
+                messages.append({"role": "user", "content": results})
+            elif message.role is Role.ASSISTANT:
+                blocks: list[Any] = []
+                if message.text or not message.tool_calls:
+                    blocks.append({"type": "text", "text": message.text})
+                blocks.extend(
+                    {"type": "tool_use", "id": c.id, "name": c.name, "input": c.arguments}
+                    for c in message.tool_calls
+                )
+                messages.append({"role": "assistant", "content": blocks})
             else:
-                messages.append({"role": "user", "content": [block]})
+                messages.append(
+                    {"role": "user", "content": [{"type": "text", "text": message.text}]}
+                )
 
         fmt = call.response_format
         output_config: Any = omit
@@ -176,6 +226,7 @@ class AnthropicProvider:
                     provider="anthropic", provider_model=call.model, provider_message=str(exc)
                 ) from exc
             output_config = {"format": {"type": "json_schema", "schema": schema}}
+        tools = call.request.tools or []
         return {
             "model": call.model,
             "max_tokens": call.max_output_tokens,
@@ -184,7 +235,19 @@ class AnthropicProvider:
             "stop_sequences": call.request.stop or omit,
             "metadata": {"user_id": call.end_user_id} if call.end_user_id else omit,
             "output_config": output_config,
+            "tools": [
+                {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+                for t in tools
+            ]
+            if tools
+            else omit,
+            "tool_choice": {"type": call.request.tool_choice} if tools else omit,
         }
+
+
+def _assembled(call_id: str, name: str, fragments: list[str]) -> ToolCallPart:
+    arguments, raw = decode_arguments("".join(fragments))
+    return ToolCallPart(id=call_id, name=name, arguments=arguments, raw_arguments=raw)
 
 
 def _finish(stop_reason: str | None) -> FinishReason:

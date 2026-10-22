@@ -153,12 +153,15 @@ Body:
 `content` is 1 to 100 000 characters. `client_message_id` (optional, ≤ 64 characters) makes
 the submission idempotent: sending the same id again returns the original user message and
 its reply instead of generating a new one. `model` (optional) changes the conversation's
-model for this and later messages.
+model for this and later messages. `tools` (optional, Phase 10): `"auto"` (default) lets the
+model use the tools you may use in a streamed reply, `"none"` answers without tools; see
+[Tool calling](#tool-calling).
 
 The user message is stored first, then an assistant message in state `pending`, then the
 reply is generated through the AI Gateway with the conversation's recent messages as
 context. 409 `GENERATION_IN_PROGRESS` if a reply is already being generated; 409 `CONFLICT`
-if the conversation is archived.
+if the conversation is archived; 409 `TOOL_APPROVAL_PENDING` while a reply in the conversation
+awaits a decision on an action (regenerating replaces that reply instead).
 
 **Streaming** (`Accept: text/event-stream`): the response is `200 text/event-stream` as soon
 as the two messages are stored. Protocol `nexa.chat.v1`, also sent as the
@@ -181,7 +184,9 @@ data: {"message":{...Message, "status":"completed"}}
 ```
 
 Terminal events, exactly one per stream: `message_complete` (status `completed`),
-`message_cancelled` (status `cancelled`, with the text that had arrived) or `error`:
+`message_cancelled` (status `cancelled`, with the text that had arrived), `error`, or
+`approval_required` (Phase 10: the reply is paused on an action; see
+[Tool calling](#tool-calling)):
 
 ```text
 event: error
@@ -235,6 +240,60 @@ non-streaming one returns its reply as `cancelled`. A stop that arrives after th
 finished (after the `usage` event) changes nothing: the reply completes. Because providers are
 stopped by closing their stream, a few more tokens may be billed after the cancel; they are
 not shown.
+
+## Tool calling
+
+Phase 10 ([tools.md](../architecture/tools.md), [the tools API](tools.md)). In a streamed
+reply of ordinary chat, the model may call the tools you may use (members and above have
+`ai.tool.execute`; viewers do not). Every call is checked, run and recorded by NEXA; the
+stream shows only calls that really happened:
+
+```text
+event: tool_call
+data: {"message_id":"0199...","invocation_id":"0199...","call_id":"toolu_01...",
+       "tool_id":"calculator","tool_name":"Calculator","step":0,"status":"executing",
+       "summary":"Calculating 6*7","risk":"low","error_code":null,"error_message":null}
+
+event: tool_result
+data: {"message_id":"0199...","invocation_id":"0199...","call_id":"toolu_01...",
+       "tool_id":"calculator","status":"succeeded","duration_ms":3,
+       "result":{"expression":"6*7","result":42.0,"result_text":"42"},"result_truncated":false,
+       "error_code":null,"error_message":null,"sources":[]}
+```
+
+`tool_call.status` is `executing`, `rejected` (it will not run; `error_code` says why) or
+`awaiting_approval`. `tool_result.status` is `succeeded`, `failed`, `timed_out`, `rejected` or
+`cancelled`. Text may come in several parts (one per model call) and `usage` carries the
+reply's running total. The final message lists every call in `tools` (also when messages are
+listed later), and the reply keeps one `usage_event_id` (the last model call); every model call
+is its own row in the usage ledger.
+
+### Approvals
+
+An action that changes data (in Phase 10: saving a memory) pauses the reply. The stream ends
+with:
+
+```text
+event: approval_required
+data: {"message":{...Message, "status":"awaiting_approval", "tools":[...]},
+       "approval":{"id":"0199...","tool_id":"save_memory","summary":"Saving to your memories",
+                   "details":{"action":"Save a memory","target":"Your private memories",
+                              "content":"I prefer metric units","consequences":"..."},
+                   "risk":"high","status":"pending","arguments_hash":"3f1c...",
+                   "expires_at":"..."}}
+```
+
+### POST /conversations/{id}/approvals/{approval_id}/
+
+Body: `{"decision": "approve" | "reject", "arguments_hash": "<the approval's hash>"}`. Only the
+user who asked may decide (404 for anyone else). The decision continues the same reply: with
+`Accept: text/event-stream` as a stream (`message_start` with the paused message, then the
+decided call's `tool_call`/`tool_result`, more text, and one terminal event); otherwise
+`200 {"data": {"user_message", "assistant_message"}}` once it ends or pauses again. An approved
+action runs with your permissions as they are now; a rejected one is reported to the model as
+declined. 409 `TOOL_APPROVAL_STALE` (the hash is not the pending action's),
+`TOOL_APPROVAL_EXPIRED` (the reply is closed as cancelled), `TOOL_APPROVAL_CLOSED` (already
+decided), `CONFLICT` (the conversation is archived). An approval expires after 15 minutes (`TOOLS_APPROVAL_TTL_SECONDS`).
 
 ## Context
 

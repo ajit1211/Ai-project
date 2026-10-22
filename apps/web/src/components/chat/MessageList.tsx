@@ -7,6 +7,7 @@
 import { useLayoutEffect, useRef } from "react";
 
 import type { ChatItem } from "../../hooks/chatThread";
+import type { Approval, ApprovalChoice } from "../../types/tools";
 import { MessageBubble } from "./MessageBubble";
 
 /** Within this many pixels of the bottom, the list follows new text. */
@@ -34,6 +35,8 @@ export interface MessageListProps {
   idle: boolean;
   onRegenerate: () => void;
   onRetry: (key: string) => void;
+  /** Decide on the action a paused reply proposed; left out where that is not possible. */
+  onDecide?: ((replyId: string, approval: Approval, choice: ApprovalChoice) => void) | undefined;
 }
 
 export function MessageList({
@@ -45,6 +48,7 @@ export function MessageList({
   idle,
   onRegenerate,
   onRetry,
+  onDecide,
 }: MessageListProps) {
   const scroller = useRef<HTMLDivElement>(null);
   const following = useRef(true);
@@ -111,6 +115,7 @@ export function MessageList({
                 canRetry={offered && canRetry(item)}
                 onRegenerate={onRegenerate}
                 onRetry={onRetry}
+                onDecide={onDecide}
               />
             );
           })}

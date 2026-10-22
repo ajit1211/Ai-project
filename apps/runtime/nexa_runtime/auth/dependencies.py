@@ -79,6 +79,23 @@ async def load_principal(
     conn: AsyncConnection, user: AuthenticatedUser, organization_id: UUID
 ) -> Principal:
     """Membership, role and permissions in `organization_id`, from the database only."""
+    return await _principal(conn, user.user_id, user.session_id, organization_id)
+
+
+async def reload_principal(conn: AsyncConnection, principal: Principal) -> Principal:
+    """The same principal read again now: a tool call re-checks permissions at the moment it
+    runs (a role changed or a membership suspended mid-turn takes effect at once). Raises
+    PermissionDenied when the membership is gone."""
+    if principal.organization_id is None:
+        raise PermissionDenied("Select an organization first.")
+    return await _principal(
+        conn, principal.user_id, principal.session_id, principal.organization_id
+    )
+
+
+async def _principal(
+    conn: AsyncConnection, user_id: UUID, session_id: UUID | None, organization_id: UUID
+) -> Principal:
     membership = (
         await conn.execute(
             select(
@@ -93,7 +110,7 @@ async def load_principal(
                 )
             )
             .where(
-                t.organization_memberships.c.user_id == user.user_id,
+                t.organization_memberships.c.user_id == user_id,
                 t.organization_memberships.c.organization_id == organization_id,
                 t.organization_memberships.c.status == "active",
                 t.organizations.c.deleted_at.is_(None),
@@ -119,8 +136,8 @@ async def load_principal(
     )
     team_rows = teams.all()
     return Principal(
-        user_id=user.user_id,
-        session_id=user.session_id,
+        user_id=user_id,
+        session_id=session_id,
         organization_id=organization_id,
         membership_id=membership.id,
         role_key=membership.key,

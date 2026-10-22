@@ -42,6 +42,10 @@ _CLIENT_FEATURES = frozenset({Feature.API, Feature.PLAYGROUND})
 def _check_feature(body: ChatRequest) -> None:
     if body.feature not in _CLIENT_FEATURES:
         raise AIInvalidRequest("This feature label is reserved for NEXA's own services.")
+    # Tools are offered by NEXA's tool registry, per user and per call, in conversations
+    # (docs/architecture/tools.md); a raw request cannot define or replay its own.
+    if body.offers_tools or body.has_tool_history or body.tool_choice != "auto":
+        raise AIInvalidRequest("Tool calling is available in conversations only.")
 
 
 def _context(principal: Principal) -> AIRequestContext:

@@ -11,6 +11,11 @@ before anything is stored; its reply first retrieves passages (`sources` event),
 without calling the model when the documents have nothing, and stores which passages it
 cited, checked against the ones it was given.
 
+A reply may use tools (Phase 10, docs/architecture/tools.md): the model is offered the tools
+the user may use, and the reply becomes a bounded loop of model calls and tool calls, each
+call checked and run by the tool executor. A call that needs the user's approval pauses the
+reply (`awaiting_approval`); the decision continues the same reply.
+
 Everything here is scoped by the caller's principal (organization from the token, ownership
 checked with the shared policy). The gateway does authorization, quotas and metering for the
 model call itself; this service only persists what happened to it.
@@ -31,7 +36,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from nexa_ai.context import AIRequestContext
-from nexa_ai.cost import usd_to_micros
+from nexa_ai.cost import micros_to_usd, usd_to_micros
 from nexa_ai.errors import (
     AIContentRejected,
     AIError,
@@ -40,7 +45,17 @@ from nexa_ai.errors import (
     AIProviderError,
 )
 from nexa_ai.gateway import Gateway, GatewayStream, KeepAlive
-from nexa_ai.types import ChatRequest, Feature, Usage, UsageEvent
+from nexa_ai.types import (
+    ChatRequest,
+    Feature,
+    Message,
+    Role,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+    Usage,
+    UsageEvent,
+)
 from nexa_ai.types import MessageDelta as GatewayDelta
 from nexa_ai.types import MessageEnd as GatewayEnd
 from nexa_ai.types import MessageStart as GatewayStart
@@ -53,6 +68,7 @@ from nexa_runtime.chat import repository as repo
 from nexa_runtime.chat.cancellation import CancelRegistry
 from nexa_runtime.chat.context import ContextPolicy, HistoryItem, MemoryItem, build_context
 from nexa_runtime.chat.events import (
+    ApprovalRequired,
     ChatEvent,
     GenerationError,
     MessageCancelled,
@@ -60,9 +76,11 @@ from nexa_runtime.chat.events import (
     MessageStart,
     SourcesFound,
     TextDelta,
+    ToolCallEvent,
+    ToolResultEvent,
     UsageReport,
 )
-from nexa_runtime.chat.prompts import DEFAULT_PROMPT_VERSION
+from nexa_runtime.chat.prompts import DEFAULT_PROMPT_VERSION, tools_message
 from nexa_runtime.chat.schemas import (
     CancelResult,
     ConversationOut,
@@ -86,6 +104,26 @@ from nexa_runtime.rag.evidence import (
 from nexa_runtime.rag.schemas import GroundingRequest, SourceOut
 from nexa_runtime.rag.service import Grounded, RagEngine, Scope, failed_record
 from nexa_runtime.ratelimit import Limiter
+from nexa_runtime.tools import repository as tools_repo
+from nexa_runtime.tools.activity import activity_for
+from nexa_runtime.tools.errors import (
+    ApprovalClosed,
+    ApprovalExpired,
+    ApprovalPending,
+    ApprovalStale,
+)
+from nexa_runtime.tools.executor import (
+    DECLINED,
+    Finished,
+    Planned,
+    ToolExecutor,
+    Turn,
+    finished_from_row,
+    planned_from_row,
+    result_part,
+)
+from nexa_runtime.tools.schemas import ApprovalDecision
+from nexa_runtime.tools.validation import redacted
 
 log = get_logger("nexa.runtime.chat")
 
@@ -133,6 +171,31 @@ class Generation:
     request_id: str | None
     # Set for a document-grounded reply: the scope, authorized when the message was sent.
     scope: Scope | None = None
+    # "auto": the model may use the tools this user may use; "none": no tools (Phase 10).
+    tools: str = "auto"
+    # Set when a paused reply continues after the user decided on an action.
+    resume: "Resume | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class Resume:
+    approval_id: UUID
+    decision: str
+
+
+@dataclass
+class _Relay:
+    """The gateway stream being read and the task reading it, for cleanup."""
+
+    events: GatewayStream | None = None
+    pump: asyncio.Task[None] | None = None
+
+
+@dataclass
+class _StepOutcome:
+    finished: bool = False
+    text: str = ""
+    tool_calls: list[ToolCallPart] = field(default_factory=list)
 
 
 @dataclass
@@ -143,11 +206,19 @@ class _Progress:
     alias: str = ""
     provider: str = ""
     provider_model: str = ""
+    # The whole reply's usage (every model call so far); `step_usage` is the current call's.
     usage: Usage | None = None
+    prior_usage: Usage | None = None
+    step_usage: Usage | None = None
     usage_event_id: UUID | None = None
     finish_reason: str = ""
     ttft_ms: int | None = None
     ended: bool = False
+    # Tool use (Phase 10): each model call's text and tool calls; stored as `tool_trace`.
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    tool_limit_reached: bool = False
+    # Time already spent on a reply that paused for approval and now continues.
+    latency_base: int = 0
 
     @property
     def text(self) -> str:
@@ -155,8 +226,39 @@ class _Progress:
 
     @property
     def call_finished(self) -> bool:
-        """The gateway has metered the model call: only its closing event is still to come."""
-        return self.ended or self.usage is not None
+        """The gateway has metered the current model call: only its closing event is still
+        to come."""
+        return self.ended or self.step_usage is not None
+
+    def begin_step(self) -> None:
+        self.prior_usage = self.usage
+        self.step_usage = None
+        self.ended = False
+        self.finish_reason = ""
+
+    def meter(self, usage: Usage) -> None:
+        self.step_usage = usage
+        self.usage = _add_usage(self.prior_usage, usage)
+
+    def elapsed_ms(self) -> int:
+        return self.latency_base + _elapsed_ms(self.started)
+
+    def resume_from(self, row: Any) -> None:
+        """Continue a paused reply: its text, usage, timing and tool steps so far."""
+        if row.content:
+            self.parts = [row.content]
+        if row.input_tokens or row.output_tokens:
+            self.usage = Usage(
+                input_tokens=row.input_tokens,
+                output_tokens=row.output_tokens,
+                total_tokens=row.input_tokens + row.output_tokens,
+                cost_usd=micros_to_usd(row.cost_micros) if row.cost_micros is not None else None,
+            )
+        trace = getattr(row, "tool_trace", None) or {}
+        self.steps = list(trace.get("steps", []))
+        self.ttft_ms = row.ttft_ms
+        self.latency_base = row.latency_ms or 0
+        self.alias, self.provider, self.provider_model = row.model, row.provider, row.provider_model
 
     def add_text(self, text: str) -> str:
         """Append model output; returns what was kept. PostgreSQL cannot store NUL, so it is
@@ -178,10 +280,12 @@ class ChatService:
         limiter: Limiter | None = None,
         memory: MemoryEngine | None = None,
         rag: RagEngine | None = None,
+        tools: ToolExecutor | None = None,
     ) -> None:
         self._engine = engine
         self._memory = memory
         self._rag = rag
+        self._tools = tools
         self._gateway = gateway
         self._cancel = cancel
         self._limiter = limiter or Limiter(None)
@@ -277,6 +381,7 @@ class ChatService:
             messages = await self._with_sources(
                 conn, principal, [MessageOut.from_row(m) for m in rows]
             )
+            messages = await self._with_tools(conn, principal, messages)
         return messages, next_before
 
     async def message_sources(
@@ -326,6 +431,7 @@ class ChatService:
                 scope = await self._resolve_grounding(
                     principal, body.grounding, body.content, conn=conn
                 )
+            await self._close_paused(conn, conversation.id)
             assistant_id = new_id()
             await self._claim(conn, conversation, assistant_id)
             sequence = await repo.next_sequence(conn, conversation.id)
@@ -361,7 +467,29 @@ class ChatService:
             if not conversation.title:
                 changes["title"] = self._title_from(body.content)
             conversation = await repo.update_conversation(conn, conversation.id, **changes)
-        return Generation(conversation, user, assistant, principal, request_id, scope)
+        return Generation(
+            conversation, user, assistant, principal, request_id, scope, tools=body.tools
+        )
+
+    async def _close_paused(self, conn: Any, conversation_id: UUID) -> None:
+        """A reply paused for approval blocks a new message until the user decides; once the
+        approval has expired, the paused reply is closed (cancelled) and the conversation
+        goes on."""
+        last = await repo.last_message(conn, conversation_id)
+        if last is None or last.status != "awaiting_approval":
+            return
+        rows = await tools_repo.invocations_of(conn, [last.id])
+        approvals = await tools_repo.approvals_of(conn, [row.id for row in rows])
+        if any(a.status == "pending" and a.expires_at > repo.now() for a in approvals):
+            raise ApprovalPending()
+        await tools_repo.close_pending_approvals(conn, last.id, status="expired")
+        await repo.update_message(
+            conn,
+            last.id,
+            status="cancelled",
+            error_code=ErrorCode.TOOL_APPROVAL_EXPIRED.value,
+            completed_at=repo.now(),
+        )
 
     async def regenerate(
         self,
@@ -446,20 +574,27 @@ class ChatService:
         return GenerationStream(self, gen)
 
     async def _events(self, gen: Generation) -> AsyncGenerator[ChatEvent | KeepAlive]:
-        """The generation itself. The gateway stream is read in a separate task, so a stop
-        request is noticed within a quarter of a second even while the model is thinking."""
+        """The generation itself: one model call, or, when tools are used, a bounded loop of
+        model calls and tool calls (docs/architecture/tools.md#orchestration). Each gateway
+        stream is read in a separate task, so a stop request is noticed within a quarter of a
+        second even while the model is thinking or a tool is running."""
         assistant_id: UUID = gen.assistant_message.id
         progress = _Progress(started=time.perf_counter())
+        if gen.resume is not None:
+            progress.resume_from(gen.assistant_message)
         stop = self._cancel.start(assistant_id)
-        events: GatewayStream | None = None
-        pump: asyncio.Task[None] | None = None
+        relay = _Relay()
         done = False
         try:
+            assistant_out = MessageOut.from_row(gen.assistant_message)
+            if gen.resume is not None:
+                async with self._engine.connect() as conn:
+                    [assistant_out] = await self._with_tools(conn, gen.principal, [assistant_out])
             yield MessageStart(
                 conversation_id=gen.conversation.id,
                 request_id=gen.request_id,
                 user_message=MessageOut.from_row(gen.user_message),
-                assistant_message=MessageOut.from_row(gen.assistant_message),
+                assistant_message=assistant_out,
             )
             if gen.scope is not None:
                 progress.grounded = await self._ground(gen)
@@ -479,79 +614,93 @@ class ChatService:
                         yield _error_event(AIInternalError(), out, gen.request_id)
                     return
             request, ctx = await self._prepare(gen, progress.grounded)
+            turn = await self._tool_turn(gen, request, ctx)
+            if turn is not None:
+                request = _offering(request, turn)
             # Marked before the gateway call: between opening the gateway stream (which holds
             # a quota reservation) and handing it to the pump nothing is awaited, so it cannot
             # be abandoned unclosed.
             await self._mark_streaming(assistant_id)
-            events = await self._gateway.open_stream(request, ctx)
-            progress.usage_event_id = events.call_id
-            queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
-            # Started eagerly, so the pump owns the gateway stream (and closes it on the way
-            # out) even when a stop is already waiting. (Python 3.13 needs the loop passed.)
-            pump = asyncio.Task(
-                _pump(events, queue), loop=asyncio.get_running_loop(), eager_start=True
-            )
-            last_flush = time.monotonic()
+            messages = list(request.messages)
+            if gen.resume is not None and turn is not None:
+                async for resumed in self._resume(gen, progress, turn, messages):
+                    yield resumed
+            settings = self._settings
+            deadline = time.monotonic() + settings.tools_turn_timeout_seconds
             while True:
-                # A stop that arrives once the model has finished changes nothing.
-                if stop.is_set() and not progress.call_finished:
-                    await _stop(pump)
-                    pump = None
-                    await _close(events)
-                    _take_usage(progress, events)
+                step = len(progress.steps)
+                limited = turn is not None and (
+                    step >= settings.tools_max_iterations or time.monotonic() > deadline
+                )
+                if limited:
+                    progress.tool_limit_reached = True
+                outcome = _StepOutcome()
+                step_request = request.model_copy(
+                    update={
+                        "messages": messages,
+                        "tool_choice": "none" if limited else request.tool_choice,
+                    }
+                )
+                async for event in self._model_step(
+                    gen, progress, step_request, ctx, stop, relay, outcome
+                ):
+                    yield event
+                if outcome.finished:
+                    done = True
+                    return
+                calls = outcome.tool_calls if turn is not None and not limited else []
+                if not calls:
+                    break
+                progress.steps.append(
+                    {"text": outcome.text, "calls": [_traced(c, turn) for c in calls]}
+                )
+                tools = self._tools
+                if tools is None or turn is None:  # pragma: no cover - calls need a turn
+                    raise AIInternalError()
+                planned = await tools.plan(turn, step, calls)
+                for item in planned:
+                    yield _tool_call_event(assistant_id, item)
+                waiting = [item for item in planned if item.status == "awaiting_approval"]
+                results: dict[int, ToolResultPart] = {}
+                stopped = False
+                async for finished in self._run_tools(
+                    turn, [item for item in planned if item.status != "awaiting_approval"], stop
+                ):
+                    if finished is None:
+                        stopped = True
+                        break
+                    results[finished.planned.position] = finished.result_part()
+                    yield _tool_result_event(assistant_id, finished)
+                if stopped:
                     done = True
                     out, ok = await self._settle(gen, progress, status="cancelled")
-                    if ok:
-                        yield MessageCancelled(message=out)
+                    yield (
+                        MessageCancelled(message=out)
+                        if ok
+                        else _error_event(AIInternalError(), out, gen.request_id)
+                    )
+                    return
+                if waiting:
+                    # Paused: the user decides; the decision continues this same reply.
+                    done = True
+                    out, ok = await self._settle(gen, progress, status="awaiting_approval")
+                    approval = next(
+                        (
+                            activity.approval
+                            for activity in out.tools
+                            if activity.approval is not None
+                            and activity.invocation_id == waiting[0].invocation_id
+                        ),
+                        None,
+                    )
+                    if ok and approval is not None:
+                        yield ApprovalRequired(message=out, approval=approval)
                     else:
                         yield _error_event(AIInternalError(), out, gen.request_id)
                     return
-                try:
-                    async with asyncio.timeout(_STOP_CHECK_SECONDS):
-                        item = await queue.get()
-                except TimeoutError:
-                    continue
-                if isinstance(item, _End):
-                    break
-                if isinstance(item, _Failure):
-                    raise item.error
-                if isinstance(item, KeepAlive):
-                    yield item
-                elif isinstance(item, GatewayStart):
-                    progress.alias = item.model
-                    progress.provider = item.provider
-                    progress.provider_model = item.provider_model
-                elif isinstance(item, GatewayDelta):
-                    text = progress.add_text(item.text)
-                    if not text:
-                        continue
-                    if progress.ttft_ms is None:
-                        progress.ttft_ms = _elapsed_ms(progress.started)
-                    yield TextDelta(message_id=assistant_id, text=text)
-                    if time.monotonic() - last_flush > _FLUSH_SECONDS:
-                        await self._flush(assistant_id, progress.text)
-                        last_flush = time.monotonic()
-                elif isinstance(item, UsageEvent):
-                    # Sent before the end of the stream, whether it succeeded or failed.
-                    progress.usage = item.usage
-                    yield UsageReport(message_id=assistant_id, **item.usage.model_dump())
-                elif isinstance(item, GatewayEnd):
-                    progress.finish_reason = item.finish_reason.value
-                    progress.ended = True
-                elif isinstance(item, GatewayError):
-                    done = True
-                    out, _ = await self._settle(
-                        gen, progress, status="failed", error_code=item.code
-                    )
-                    yield GenerationError(
-                        message_id=assistant_id,
-                        code=item.code,
-                        message=item.message,
-                        retryable=item.retryable,
-                        request_id=gen.request_id,
-                        assistant_message=out,
-                    )
-                    return
+                messages.extend(
+                    _step_messages(outcome.text, calls, [results[p.position] for p in planned])
+                )
             if not progress.ended:
                 raise AIProviderError("The provider ended the stream without finishing.")
             empty = _empty_answer_error(progress)
@@ -568,7 +717,7 @@ class ChatService:
         except NexaError as exc:
             if not done:
                 done = True
-                _take_usage(progress, events)
+                _take_usage(progress, relay.events)
                 out, _ = await self._settle(gen, progress, status="failed", error=exc)
                 yield _error_event(exc, out, gen.request_id)
         except (GeneratorExit, asyncio.CancelledError):
@@ -577,7 +726,7 @@ class ChatService:
             log.error("chat.generation.bug", error=type(exc).__name__, message_id=str(assistant_id))
             if not done:
                 done = True
-                _take_usage(progress, events)
+                _take_usage(progress, relay.events)
                 internal = AIInternalError()
                 out, _ = await self._settle(gen, progress, status="failed", error=internal)
                 yield _error_event(internal, out, gen.request_id)
@@ -585,11 +734,319 @@ class ChatService:
             self._cancel.finish(assistant_id)
             if not done:
                 # The client went away, or the server is shutting down.
-                self._abandon(gen, progress, pump, events)
-            elif pump is not None and not pump.done():
+                self._abandon(gen, progress, relay.pump, relay.events)
+            elif relay.pump is not None and not relay.pump.done():
                 # Closes the gateway stream, which closes the provider's and records usage.
-                pump.cancel()
-                self._track(pump)
+                relay.pump.cancel()
+                self._track(relay.pump)
+
+    async def _model_step(
+        self,
+        gen: Generation,
+        progress: "_Progress",
+        request: ChatRequest,
+        ctx: AIRequestContext,
+        stop: asyncio.Event,
+        relay: "_Relay",
+        outcome: "_StepOutcome",
+    ) -> AsyncGenerator[ChatEvent | KeepAlive]:
+        """One model call, relayed. Ends normally when the model has finished (its text and
+        tool calls are in `outcome`), or with `outcome.finished` set once a terminal event
+        (stopped, failed) has been yielded and the reply stored."""
+        assistant_id: UUID = gen.assistant_message.id
+        if progress.steps:
+            async with self._engine.begin() as conn:
+                await repo.renew_generation(conn, gen.conversation.id, assistant_id)
+        progress.begin_step()
+        if relay.pump is not None and not relay.pump.done():
+            await _stop(relay.pump)
+        events = await self._gateway.open_stream(request, ctx)
+        relay.events = events
+        progress.usage_event_id = events.call_id
+        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
+        # Started eagerly, so the pump owns the gateway stream (and closes it on the way
+        # out) even when a stop is already waiting. (Python 3.13 needs the loop passed.)
+        relay.pump = asyncio.Task(
+            _pump(events, queue), loop=asyncio.get_running_loop(), eager_start=True
+        )
+        last_flush = time.monotonic()
+        step_text: list[str] = []
+        while True:
+            # A stop that arrives once the model has finished changes nothing.
+            if stop.is_set() and not progress.call_finished:
+                await _stop(relay.pump)
+                relay.pump = None
+                await _close(events)
+                _take_usage(progress, events)
+                outcome.finished = True
+                out, ok = await self._settle(gen, progress, status="cancelled")
+                if ok:
+                    yield MessageCancelled(message=out)
+                else:
+                    yield _error_event(AIInternalError(), out, gen.request_id)
+                return
+            try:
+                async with asyncio.timeout(_STOP_CHECK_SECONDS):
+                    item = await queue.get()
+            except TimeoutError:
+                continue
+            if isinstance(item, _End):
+                break
+            if isinstance(item, _Failure):
+                raise item.error
+            if isinstance(item, KeepAlive):
+                yield item
+            elif isinstance(item, GatewayStart):
+                progress.alias = item.model
+                progress.provider = item.provider
+                progress.provider_model = item.provider_model
+            elif isinstance(item, GatewayDelta):
+                if not step_text and progress.text and not progress.text[-1].isspace():
+                    # A later step's text starts a new paragraph after the earlier text.
+                    yield TextDelta(message_id=assistant_id, text=progress.add_text("\n\n"))
+                text = progress.add_text(item.text)
+                if not text:
+                    continue
+                step_text.append(text)
+                if progress.ttft_ms is None:
+                    progress.ttft_ms = progress.elapsed_ms()
+                yield TextDelta(message_id=assistant_id, text=text)
+                if time.monotonic() - last_flush > _FLUSH_SECONDS:
+                    await self._flush(assistant_id, progress.text)
+                    last_flush = time.monotonic()
+            elif isinstance(item, UsageEvent):
+                # Sent before the end of the stream, whether it succeeded or failed.
+                progress.meter(item.usage)
+                total = progress.usage or item.usage
+                yield UsageReport(message_id=assistant_id, **total.model_dump())
+            elif isinstance(item, GatewayEnd):
+                progress.finish_reason = item.finish_reason.value
+                progress.ended = True
+                outcome.tool_calls = list(item.tool_calls)
+            elif isinstance(item, GatewayError):
+                outcome.finished = True
+                out, _ = await self._settle(gen, progress, status="failed", error_code=item.code)
+                yield GenerationError(
+                    message_id=assistant_id,
+                    code=item.code,
+                    message=item.message,
+                    retryable=item.retryable,
+                    request_id=gen.request_id,
+                    assistant_message=out,
+                )
+                return
+        if not progress.ended:
+            raise AIProviderError("The provider ended the stream without finishing.")
+        outcome.text = "".join(step_text)
+
+    async def _tool_turn(
+        self, gen: Generation, request: ChatRequest, ctx: AIRequestContext
+    ) -> "Turn | None":
+        """The tools this reply may use, or None: grounded replies, replies sent with
+        `tools: "none"`, models that cannot call tools and users who may not let AI use tools
+        get none."""
+        if self._tools is None or gen.scope is not None or gen.tools == "none":
+            return None
+        capabilities = await self._gateway.model_capabilities(ctx, request.model)
+        offered = await self._tools.offer(gen.principal, capabilities)
+        if not offered:
+            return None
+        turn = Turn(
+            principal=gen.principal,
+            conversation_id=gen.conversation.id,
+            message_id=gen.assistant_message.id,
+            request_id=gen.request_id,
+            offered={d.id: d for d in offered},
+        )
+        if gen.resume is not None:
+            async with self._engine.connect() as conn:
+                turn.calls_made = await tools_repo.count_for_message(conn, turn.message_id)
+        log.info(
+            "chat.tools.offered",
+            message_id=str(gen.assistant_message.id),
+            tools=sorted(turn.offered),
+        )
+        return turn
+
+    async def _run_tools(
+        self, turn: "Turn", planned: list["Planned"], stop: asyncio.Event
+    ) -> AsyncIterator["Finished | None"]:
+        """The executor's results as calls end; None (then nothing more) when a stop request
+        arrived: running calls are cancelled and recorded as such."""
+        tools = self._tools
+        if tools is None or not planned:
+            return
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+
+        async def pump() -> None:
+            try:
+                async for finished in tools.run(turn, planned):
+                    await queue.put(finished)
+                await queue.put(_END)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                await queue.put(_Failure(exc))
+
+        task = asyncio.ensure_future(pump())
+        try:
+            while True:
+                if stop.is_set():
+                    await _stop(task)
+                    yield None
+                    return
+                try:
+                    async with asyncio.timeout(_STOP_CHECK_SECONDS):
+                        item = await queue.get()
+                except TimeoutError:
+                    continue
+                if isinstance(item, _End):
+                    return
+                if isinstance(item, _Failure):
+                    raise item.error
+                yield item
+        finally:
+            if not task.done():
+                await _stop(task)
+
+    async def _resume(
+        self, gen: Generation, progress: "_Progress", turn: "Turn", messages: list[Message]
+    ) -> AsyncGenerator[ChatEvent]:
+        """Rebuild the paused reply's tool steps for the model, running the call the user has
+        just approved (or recording that they declined it). Earlier calls are never re-run:
+        their recorded results are replayed."""
+        tools = self._tools
+        if tools is None:  # pragma: no cover - a paused reply always had tools
+            return
+        async with self._engine.connect() as conn:
+            rows = await tools_repo.invocations_of(conn, [gen.assistant_message.id])
+        assistant_id: UUID = gen.assistant_message.id
+        last = len(progress.steps) - 1
+        for index, recorded in enumerate(progress.steps):
+            calls = [ToolCallPart.model_validate(c) for c in recorded.get("calls", [])]
+            for call in calls:
+                turn.seen_call_ids.add(call.id)
+            by_position = {row.position: row for row in rows if row.step == index}
+            results: list[ToolResultPart] = []
+            for position, call in enumerate(calls):
+                row = by_position.get(position)
+                definition = tools.registry.get(row.tool_id) if row is not None else None
+                if row is None:
+                    results.append(
+                        result_part(call.id, call.name, "failed", None, False, "not_run", "")
+                    )
+                    continue
+                item = planned_from_row(row, call, definition)
+                if row.status == "approved" and definition is not None:
+                    yield _tool_call_event(assistant_id, replace(item, status="executing"))
+                    finished = await tools.execute(turn, item)
+                    yield _tool_result_event(assistant_id, finished)
+                else:
+                    finished = finished_from_row(item, row)
+                    if row.status not in tools_repo.FINAL:
+                        finished = replace(finished, status="rejected", error_code="not_approved")
+                    elif index == last and row.error_code == DECLINED:
+                        yield _tool_result_event(assistant_id, finished)
+                results.append(finished.result_part())
+            messages.extend(_step_messages(recorded.get("text", ""), calls, results))
+
+    async def decide(
+        self,
+        principal: Principal,
+        conversation_id: UUID,
+        approval_id: UUID,
+        body: ApprovalDecision,
+        *,
+        request_id: str | None,
+    ) -> Generation:
+        """Record the user's decision on a paused action and claim the conversation to
+        continue the reply. Only the requesting user may decide; the decision must name the
+        exact action they were shown (`arguments_hash`), before it expires."""
+        require(principal, "ai.chat")
+        if self._tools is None:
+            raise NotFound
+        organization_id = _organization(principal)
+        expired = False
+        user: repo.MessageRow | None = None
+        async with self._engine.begin() as conn:
+            conversation = await self._load(
+                conn, principal, conversation_id, "update", for_update=True
+            )
+            if conversation.status != "active":
+                raise Conflict("This conversation is archived.")
+            approval = await tools_repo.approval(
+                conn, organization_id, approval_id, for_update=True
+            )
+            if approval is None or approval.requested_by_id != principal.user_id:
+                raise NotFound
+            invocation = await tools_repo.invocation(conn, organization_id, approval.invocation_id)
+            if invocation is None or invocation.conversation_id != conversation.id:
+                raise NotFound
+            message = await repo.message_by_id(conn, conversation.id, invocation.message_id)
+            if message is None or message.status != "awaiting_approval":
+                raise ApprovalClosed()
+            if approval.status != "pending":
+                raise ApprovalClosed()
+            if approval.expires_at <= repo.now():
+                expired = True
+                await tools_repo.close_pending_approvals(conn, message.id, status="expired")
+                await repo.update_message(
+                    conn,
+                    message.id,
+                    status="cancelled",
+                    error_code=ErrorCode.TOOL_APPROVAL_EXPIRED.value,
+                    completed_at=repo.now(),
+                )
+            elif body.arguments_hash != approval.arguments_hash:
+                raise ApprovalStale()
+            else:
+                approved = body.decision == "approve"
+                decided = await tools_repo.decide(
+                    conn,
+                    approval.id,
+                    status="approved" if approved else "rejected",
+                    decided_by=principal.user_id,
+                )
+                if decided is None:
+                    raise ApprovalClosed()
+                if approved:
+                    await tools_repo.set_status(
+                        conn, invocation.id, "approved", from_states=("awaiting_approval",)
+                    )
+                else:
+                    await tools_repo.finish(
+                        conn,
+                        invocation.id,
+                        from_states=("awaiting_approval",),
+                        status="rejected",
+                        error_code=DECLINED,
+                        error_message="The user declined this action.",
+                    )
+                await self._claim(conn, conversation, message.id)
+                message = await repo.update_message(conn, message.id, status="streaming")
+                user = await repo.message_at(conn, conversation.id, message.sequence - 1)
+        if expired:
+            raise ApprovalExpired()
+        await self._tools.audit_decision(
+            principal,
+            invocation_id=invocation.id,
+            approval_id=approval.id,
+            tool_id=approval.tool_id,
+            decision=body.decision,
+            conversation_id=conversation.id,
+            message_id=message.id,
+            request_id=request_id,
+        )
+        if user is None:  # pragma: no cover - a reply always follows its question
+            raise NotFound
+        return Generation(
+            conversation,
+            user,
+            message,
+            principal,
+            request_id,
+            resume=Resume(approval_id=approval.id, decision=body.decision),
+        )
 
     async def complete(self, gen: Generation) -> Exchange:
         """The non-streaming path: wait for the whole reply. A stop request ends it too; the
@@ -644,6 +1101,25 @@ class ChatService:
         if not ok:
             raise AIInternalError()
         return Exchange(user_message=MessageOut.from_row(gen.user_message), assistant_message=out)
+
+    async def finish(self, gen: Generation) -> Exchange:
+        """Run a generation's stream to its end and return the exchange it ended with: the
+        JSON path of a continued reply (completed, failed, cancelled, or paused again)."""
+        events = self.stream(gen)
+        message: MessageOut | None = None
+        try:
+            async for event in events:
+                if isinstance(event, MessageComplete | MessageCancelled | ApprovalRequired):
+                    message = event.message
+                elif isinstance(event, GenerationError):
+                    message = event.assistant_message
+        finally:
+            await events.aclose()
+        if message is None:  # pragma: no cover - every stream ends with a terminal event
+            raise AIInternalError()
+        return Exchange(
+            user_message=MessageOut.from_row(gen.user_message), assistant_message=message
+        )
 
     async def drain(self) -> None:
         while pending := [task for task in self._background if not task.done()]:
@@ -702,6 +1178,7 @@ class ChatService:
             conn, message_id, error_code=ErrorCode.GENERATION_INTERRUPTED.value
         )
         if row is not None:
+            await tools_repo.cancel_open(conn, message_id)
             log.warning("chat.generation.interrupted", message_id=str(message_id))
         return row
 
@@ -721,6 +1198,7 @@ class ChatService:
             # Its generation died with its process: report that, not a reply pending forever.
             reply = await self._interrupted(conn, reply.id) or reply
         [answer] = await self._with_sources(conn, principal, [MessageOut.from_row(reply)])
+        [answer] = await self._with_tools(conn, principal, [answer])
         return Exchange(user_message=MessageOut.from_row(user), assistant_message=answer)
 
     # --- Document grounding (Phase 08) -------------------------------------------------------
@@ -752,7 +1230,7 @@ class ChatService:
         grounded = progress.grounded
         no_terms = grounded is not None and grounded.terms == 0
         progress.add_text(NO_TERMS_ANSWER if no_terms else NO_EVIDENCE_ANSWER)
-        progress.ttft_ms = _elapsed_ms(progress.started)
+        progress.ttft_ms = progress.elapsed_ms()
         progress.finish_reason = "stop"
         progress.ended = True
         return await self._settle(gen, progress, status="completed")
@@ -768,6 +1246,18 @@ class ChatService:
         return [
             m.model_copy(update={"sources": found.get(m.id, [])}) if m.grounding else m
             for m in messages
+        ]
+
+    async def _with_tools(
+        self, conn: Any, principal: Principal, messages: list[MessageOut]
+    ) -> list[MessageOut]:
+        """Attach each reply's tool activity, with document results re-authorized now."""
+        if self._tools is None:
+            return messages
+        replies = [m.id for m in messages if m.role == "assistant"]
+        found = await activity_for(conn, principal, self._tools.registry, replies)
+        return [
+            m.model_copy(update={"tools": found[m.id]}) if m.id in found else m for m in messages
         ]
 
     async def _prepare(
@@ -914,6 +1404,9 @@ class ChatService:
             out = MessageOut.from_row(row)
             if progress.grounded is not None:
                 out = out.model_copy(update={"sources": self._sources_of(progress.grounded, check)})
+            if progress.steps:
+                async with self._engine.connect() as conn:
+                    [out] = await self._with_tools(conn, gen.principal, [out])
             return out, True
         except Exception as exc:
             log.error(
@@ -961,14 +1454,19 @@ class ChatService:
             "input_tokens": usage.input_tokens if usage else 0,
             "output_tokens": usage.output_tokens if usage else 0,
             "cost_micros": usd_to_micros(usage.cost_usd) if usage and usage.cost_usd else None,
-            "latency_ms": _elapsed_ms(progress.started),
+            "latency_ms": progress.elapsed_ms(),
             "ttft_ms": progress.ttft_ms,
             "usage_event_id": progress.usage_event_id,
             "request_id": gen.request_id or "",
             "finish_reason": progress.finish_reason,
             "error_code": code,
-            "completed_at": repo.now(),
+            "completed_at": None if status == "awaiting_approval" else repo.now(),
         }
+        if progress.steps:
+            values["tool_trace"] = {
+                "steps": progress.steps,
+                "limit_reached": progress.tool_limit_reached,
+            }
         grounded = progress.grounded
         if gen.scope is not None:
             values["grounding"] = (
@@ -981,6 +1479,9 @@ class ChatService:
             await repo.update_conversation(conn, gen.conversation.id, last_message_at=repo.now())
             await repo.release_generation(conn, gen.conversation.id, gen.assistant_message.id)
             row = await repo.update_message(conn, gen.assistant_message.id, **values)
+            if progress.steps and status != "awaiting_approval":
+                # Calls that never got to run end with the reply.
+                await tools_repo.cancel_open(conn, gen.assistant_message.id)
             if grounded is not None and self._rag is not None:
                 await self._rag.store_sources(
                     conn,
@@ -1146,8 +1647,90 @@ def _empty_answer_error(progress: _Progress) -> AIError | None:
 
 def _take_usage(progress: _Progress, events: GatewayStream | None) -> None:
     """Keep what the gateway metered when the stream ended without a `usage` event."""
-    if progress.usage is None and events is not None and events.usage is not None:
-        progress.usage = events.usage
+    if progress.step_usage is None and events is not None and events.usage is not None:
+        progress.meter(events.usage)
+
+
+def _add_usage(first: Usage | None, second: Usage) -> Usage:
+    """Two model calls' usage together; the cost is unknown only when neither had a price."""
+    if first is None:
+        return second
+    costs = [usd_to_micros(c) for c in (first.cost_usd, second.cost_usd) if c is not None]
+    return Usage(
+        input_tokens=first.input_tokens + second.input_tokens,
+        output_tokens=first.output_tokens + second.output_tokens,
+        total_tokens=first.total_tokens + second.total_tokens,
+        cached_input_tokens=first.cached_input_tokens + second.cached_input_tokens,
+        cache_write_input_tokens=first.cache_write_input_tokens + second.cache_write_input_tokens,
+        cost_usd=micros_to_usd(sum(costs)) if costs else None,
+    )
+
+
+def _offering(request: ChatRequest, turn: Turn) -> ChatRequest:
+    """The request with the turn's tools, and the rules for using them after the other
+    system blocks (instructions, memories, summary), just before the conversation."""
+    messages = list(request.messages)
+    at = next((i for i, m in enumerate(messages) if m.role is not Role.SYSTEM), len(messages))
+    messages.insert(at, tools_message())
+    return request.model_copy(
+        update={"messages": messages, "tools": [d.spec() for d in turn.offered.values()]}
+    )
+
+
+def _traced(call: ToolCallPart, turn: Turn | None) -> dict[str, Any]:
+    """A tool call as `tool_trace` keeps it: with the tool's redacted arguments replaced, as
+    in its invocation record (replaying "[redacted]" to the model is harmless; tools that
+    need approval cannot redact, so an approved call always runs with its real arguments)."""
+    traced = call.model_dump(mode="json")
+    definition = turn.offered.get(call.name) if turn is not None else None
+    if definition is not None and definition.redact:
+        traced["arguments"] = redacted(definition, call.arguments)
+    return traced
+
+
+def _step_messages(
+    text: str, calls: list[ToolCallPart], results: list[ToolResultPart]
+) -> list[Message]:
+    """One tool step in the provider-neutral history: the model's turn (its text and calls)
+    and one tool message answering every call, in the same order."""
+    content: list[Any] = [TextPart(text=text)] if text else []
+    return [
+        Message(role=Role.ASSISTANT, content=[*content, *calls]),
+        Message(role=Role.TOOL, content=list(results)),
+    ]
+
+
+def _tool_call_event(message_id: UUID, item: Planned) -> ToolCallEvent:
+    definition = item.definition
+    return ToolCallEvent(
+        message_id=message_id,
+        invocation_id=item.invocation_id,
+        call_id=item.call.id,
+        tool_id=item.tool_id,
+        tool_name=definition.name if definition else item.tool_id,
+        step=item.step,
+        status="executing" if item.runnable else item.status,
+        summary=item.summary,
+        risk=definition.risk if definition else "",
+        error_code=item.error_code or None,
+        error_message=item.error_message or None,
+    )
+
+
+def _tool_result_event(message_id: UUID, finished: Finished) -> ToolResultEvent:
+    return ToolResultEvent(
+        message_id=message_id,
+        invocation_id=finished.planned.invocation_id,
+        call_id=finished.planned.call.id,
+        tool_id=finished.planned.tool_id,
+        status=finished.status,
+        duration_ms=finished.duration_ms,
+        result=finished.data,
+        result_truncated=finished.truncated,
+        error_code=finished.error_code or None,
+        error_message=finished.error_message or None,
+        sources=list(finished.sources),
+    )
 
 
 async def _pump(events: AsyncIterator[Any], queue: "asyncio.Queue[Any]") -> None:

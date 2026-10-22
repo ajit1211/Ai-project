@@ -149,6 +149,18 @@ async def acquire_generation(
     return result.rowcount == 1
 
 
+async def renew_generation(conn: AsyncConnection, conversation_id: UUID, message_id: UUID) -> None:
+    """Keep this generation's claim fresh (a long tool loop is alive, not stale)."""
+    await conn.execute(
+        update(t.conversations)
+        .where(
+            t.conversations.c.id == conversation_id,
+            t.conversations.c.active_generation_id == message_id,
+        )
+        .values(generation_started_at=now())
+    )
+
+
 async def release_generation(
     conn: AsyncConnection, conversation_id: UUID, message_id: UUID
 ) -> None:

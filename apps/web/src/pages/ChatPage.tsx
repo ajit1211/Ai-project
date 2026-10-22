@@ -8,6 +8,10 @@
  * the user may also choose how documents are searched (kept for the visit, in every
  * conversation). With nothing chosen, the chat is the ordinary chat and sends exactly what it
  * always did.
+ *
+ * Replies of ordinary chat may use tools. When one pauses for the user's approval of an
+ * action, the reply shows the action with Approve and Reject, and the composer says that a
+ * decision is pending (the server refuses new messages until then).
  */
 
 import { useRef, useState, type ReactNode } from "react";
@@ -41,6 +45,10 @@ import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useModels } from "../hooks/useModels";
 import { useRetrievalOptions } from "../hooks/useRetrievalOptions";
 import type { Conversation, RetrievalChoice } from "../types/chat";
+
+/** Said above the composer while the last reply waits for the user's decision on an action. */
+export const PENDING_APPROVAL_NOTE =
+  "An action in this conversation is waiting for your approval. Approve or reject it above before sending a new message.";
 
 /** Matches the CSS breakpoint of the chat layout. */
 const NARROW_QUERY = "(max-width: 800px)";
@@ -319,6 +327,7 @@ export function ChatPage() {
         idle={!chat.streaming && !archived}
         onRegenerate={thenType(chat.regenerate)}
         onRetry={thenType(chat.retry)}
+        onDecide={archived ? undefined : thenType(chat.decide)}
       />
     );
   }
@@ -404,7 +413,17 @@ export function ChatPage() {
             streaming={chat.streaming}
             stopping={chat.stopping}
             disabled={creating || (Boolean(conversationId) && (chat.loading || Boolean(chat.loadError)))}
-            header={groundingBar}
+            header={
+              <>
+                {chat.pendingApproval && (
+                  <p className="chat-composer-note">
+                    <Icon name="shield" />
+                    {PENDING_APPROVAL_NOTE}
+                  </p>
+                )}
+                {groundingBar}
+              </>
+            }
             placeholder={selection ? "Ask about your documents…" : undefined}
           />
         )}

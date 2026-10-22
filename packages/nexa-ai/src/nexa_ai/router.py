@@ -29,6 +29,8 @@ def required_capabilities(request: ChatRequest, *, stream: bool) -> frozenset[Ca
         required.add(Capability.STREAMING)
     if request.wants_structured_output:
         required.add(Capability.STRUCTURED_OUTPUT)
+    if request.offers_tools:
+        required.add(Capability.TOOL_CALLING)
     for message in request.messages:
         for part in message.parts:
             if isinstance(part, ImagePart):

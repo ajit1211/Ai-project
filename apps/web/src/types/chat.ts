@@ -4,6 +4,7 @@
  */
 
 import type { Usage } from "./ai";
+import type { Approval, ToolActivity, ToolStatus, ToolUse } from "./tools";
 
 export type ConversationStatus = "active" | "archived";
 
@@ -25,8 +26,12 @@ export interface Conversation {
 
 export type MessageRole = "user" | "assistant";
 
-/** Always `completed` for user messages; any of these for assistant messages. */
-export type MessageStatus = "pending" | "streaming" | "completed" | "failed" | "cancelled";
+/**
+ * Always `completed` for user messages; any of these for assistant messages.
+ * `awaiting_approval`: paused until the user approves or rejects an action a tool would take
+ * (nothing is running meanwhile).
+ */
+export type MessageStatus = "pending" | "streaming" | "completed" | "failed" | "cancelled" | "awaiting_approval";
 
 /**
  * How a grounded reply went. "uncited": answered without citing the documents (unverified);
@@ -151,6 +156,8 @@ export interface Message {
   grounding?: Grounding | null;
   /** The passages of a grounded reply; empty (or absent) for ordinary messages. */
   sources?: Source[];
+  /** Every tool call of the reply, in order; empty (or absent) for replies without tools. */
+  tools?: ToolActivity[];
 }
 
 /** `meta` of `GET /conversations/`. */
@@ -216,6 +223,8 @@ export interface SendMessageBody {
   model?: string;
   /** Answer from documents. Left out for ordinary chat. Grounded questions: 4 000 characters. */
   grounding?: GroundingRequest;
+  /** Whether ordinary chat may use tools; left out for "auto". Grounded replies never do. */
+  tools?: ToolUse;
 }
 
 export interface RegenerateBody {
@@ -246,7 +255,10 @@ export interface MessageStartEvent {
   request_id: string | null;
   /** The message being answered (for a regeneration, the existing one). */
   user_message: Message;
-  /** The reply, status `pending`. Every later event names its id. */
+  /**
+   * The reply, status `pending`. Every later event names its id. After a decision on a paused
+   * reply it is that same reply, status `streaming`, with its text and tool calls so far.
+   */
   assistant_message: Message;
 }
 
@@ -265,10 +277,56 @@ export interface TextDeltaEvent {
   text: string;
 }
 
-/** The Usage object of the reply, flattened into the event payload. */
+/** The Usage object of the reply so far (all of its model steps), flattened into the payload. */
 export interface ChatUsageEvent extends Usage {
   type: "usage";
   message_id: string;
+}
+
+/**
+ * A tool call the model asked for, once the server checked it: about to run (`executing`),
+ * refused without running (`rejected`, with the reason), or waiting for the user
+ * (`awaiting_approval`). Sent once per call, only for calls that really happened.
+ */
+export interface ToolCallEvent {
+  type: "tool_call";
+  message_id: string;
+  invocation_id: string;
+  call_id: string;
+  tool_id: string;
+  tool_name: string;
+  step: number;
+  status: ToolStatus;
+  summary: string;
+  risk: ToolActivity["risk"];
+  error_code: string | null;
+  error_message: string | null;
+}
+
+/** How a tool call ended. `result` is the validated data the model received. */
+export interface ToolResultEvent {
+  type: "tool_result";
+  message_id: string;
+  invocation_id: string;
+  call_id: string;
+  tool_id: string;
+  status: ToolStatus;
+  duration_ms: number | null;
+  result: Record<string, unknown> | null;
+  result_truncated: boolean;
+  error_code: string | null;
+  error_message: string | null;
+  sources: ToolActivity["sources"];
+}
+
+/**
+ * Terminal: the reply is paused (status `awaiting_approval`) until the user approves or
+ * rejects `approval`; the decision continues the same reply as a new stream.
+ */
+export interface ApprovalRequiredEvent {
+  type: "approval_required";
+  message: Message;
+  approval: Approval;
 }
 
 export interface MessageCompleteEvent {
@@ -297,13 +355,19 @@ export interface ChatErrorEvent {
 }
 
 /** Exactly one of these ends every stream. */
-export type ChatTerminalEvent = MessageCompleteEvent | MessageCancelledEvent | ChatErrorEvent;
+export type ChatTerminalEvent =
+  | MessageCompleteEvent
+  | MessageCancelledEvent
+  | ChatErrorEvent
+  | ApprovalRequiredEvent;
 
 export type ChatStreamEvent =
   | MessageStartEvent
   | SourcesEvent
   | TextDeltaEvent
   | ChatUsageEvent
+  | ToolCallEvent
+  | ToolResultEvent
   | ChatTerminalEvent;
 
 export type ChatStreamEventName = ChatStreamEvent["type"];

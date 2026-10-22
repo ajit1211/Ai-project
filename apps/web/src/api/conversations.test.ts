@@ -1,14 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { approval, awaitingActivity, toolActivity } from "../test/chatFixtures";
 import type { ChatStreamEvent, Conversation, Message } from "../types/chat";
 import { ApiError, onSessionLost, setAccessToken } from "./client";
 import {
   cancelGeneration,
   createConversation,
+  decideApproval,
   deleteConversation,
   getConversation,
   listConversations,
   listMessages,
+  parseChatEvent,
   regenerate,
   sendMessage,
   updateConversation,
@@ -378,5 +381,130 @@ describe("the other conversation endpoints", () => {
     ]);
     expect(JSON.parse(call(0).init.body as string)).toEqual({ model: "nexa-fast" });
     expect(JSON.parse(call(2).init.body as string)).toEqual({ status: "archived" });
+  });
+});
+
+describe("tool calling", () => {
+  const toolCall = {
+    message_id: "m2",
+    invocation_id: "inv-1",
+    call_id: "call_1",
+    tool_id: "calculator",
+    tool_name: "Calculator",
+    step: 1,
+    status: "executing",
+    summary: "Calculating 6*7",
+    risk: "low",
+    error_code: null,
+    error_message: null,
+  };
+  const toolResult = {
+    message_id: "m2",
+    invocation_id: "inv-1",
+    call_id: "call_1",
+    tool_id: "calculator",
+    status: "succeeded",
+    duration_ms: 3,
+    result: { expression: "6*7", result: 42, result_text: "42" },
+    result_truncated: false,
+    error_code: null,
+    error_message: null,
+    sources: [],
+  };
+  const pendingApproval = approval({ invocation_id: "inv-2" });
+  const paused = message({
+    content: "6*7 is 42. Shall I remember that?",
+    status: "awaiting_approval",
+    tools: [toolActivity(), awaitingActivity(pendingApproval)],
+  });
+
+  it("reads tool_call and tool_result, and ends the stream at approval_required", async () => {
+    responses.push(
+      sse([
+        frame("message_start", 1, start),
+        frame("tool_call", 2, toolCall),
+        frame("tool_result", 3, toolResult),
+        frame("text_delta", 4, { message_id: "m2", text: "6*7 is 42." }),
+        frame("approval_required", 5, { message: paused, approval: pendingApproval }),
+        frame("text_delta", 6, { message_id: "m2", text: "never read" }),
+      ]),
+    );
+    const { events, error } = await drain(sendMessage("c1", { content: "What is 6*7? Remember it." }));
+    expect(error).toBeNull();
+    expect(events).toEqual([
+      { type: "message_start", ...start },
+      { type: "tool_call", ...toolCall },
+      { type: "tool_result", ...toolResult },
+      { type: "text_delta", message_id: "m2", text: "6*7 is 42." },
+      { type: "approval_required", message: paused, approval: pendingApproval },
+    ]);
+  });
+
+  it("drops tool events whose data is not an object", () => {
+    expect(parseChatEvent({ event: "tool_call", id: "2", data: "[1, 2]" })).toBeNull();
+    expect(parseChatEvent({ event: "tool_result", id: "3", data: "not json" })).toBeNull();
+  });
+
+  it("posts a decision with the approval's arguments hash and streams the same reply on", async () => {
+    const continued = { ...paused, status: "streaming" as const };
+    const done = message({ content: "6*7 is 42. Saved.", status: "completed", tools: paused.tools });
+    responses.push(
+      sse([
+        frame("message_start", 1, { ...start, assistant_message: continued }),
+        frame("tool_call", 2, { ...toolCall, invocation_id: "inv-2", tool_id: "save_memory", status: "executing" }),
+        frame("text_delta", 3, { message_id: "m2", text: " Saved." }),
+        frame("message_complete", 4, { message: done }),
+      ]),
+    );
+    const controller = new AbortController();
+
+    const { events, error } = await drain(
+      decideApproval(
+        "c1",
+        "ap-1",
+        { decision: "approve", arguments_hash: pendingApproval.arguments_hash },
+        { signal: controller.signal },
+      ),
+    );
+
+    expect(error).toBeNull();
+    expect(events.map((event) => event.type)).toEqual(["message_start", "tool_call", "text_delta", "message_complete"]);
+    expect(call(0).url).toBe("/api/v1/conversations/c1/approvals/ap-1/");
+    expect(call(0).init.method).toBe("POST");
+    expect(call(0).init.signal).toBe(controller.signal);
+    expect(header(0, "Accept")).toBe("text/event-stream");
+    expect(JSON.parse(call(0).init.body as string)).toEqual({
+      decision: "approve",
+      arguments_hash: "a".repeat(64),
+    });
+  });
+
+  it.each([
+    ["TOOL_APPROVAL_STALE", "The action changed since it was shown to you. Review it again before deciding."],
+    ["TOOL_APPROVAL_EXPIRED", "This action was not approved in time and has expired."],
+    ["TOOL_APPROVAL_CLOSED", "This action is no longer waiting for a decision."],
+  ])("throws the ApiError of a refused decision (%s)", async (code, text) => {
+    responses.push(json(409, { success: false, error: { code, message: text }, request_id: "req_8" }));
+    const { events, error } = await drain(
+      decideApproval("c1", "ap-1", { decision: "reject", arguments_hash: "b".repeat(64) }),
+    );
+    expect(events).toEqual([]);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 409, code, message: text });
+  });
+
+  it("replays an earlier submission whose reply is paused as approval_required", async () => {
+    responses.push(json(200, { success: true, data: { user_message: user, assistant_message: paused } }));
+    const { events } = await drain(sendMessage("c1", { content: "Remember it.", client_message_id: "cid-1" }));
+    expect(events.map((event) => event.type)).toEqual(["message_start", "approval_required"]);
+    expect(events[1]).toEqual({ type: "approval_required", message: paused, approval: pendingApproval });
+  });
+
+  it("sends no tools key unless asked, and passes one through when given", async () => {
+    responses.push(sse([happyStream]), sse([happyStream]));
+    await drain(sendMessage("c1", { content: "Hi" }));
+    await drain(sendMessage("c1", { content: "Hi", tools: "none" }));
+    expect(JSON.parse(call(0).init.body as string)).toEqual({ content: "Hi" });
+    expect(JSON.parse(call(1).init.body as string)).toEqual({ content: "Hi", tools: "none" });
   });
 });

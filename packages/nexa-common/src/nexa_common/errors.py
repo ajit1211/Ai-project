@@ -57,6 +57,12 @@ class ErrorCode(StrEnum):
     DOCUMENT_NOT_INDEXED = "DOCUMENT_NOT_INDEXED"
     RAG_INVALID_SCOPE = "RAG_INVALID_SCOPE"
     RAG_RETRIEVAL_FAILED = "RAG_RETRIEVAL_FAILED"
+    # AI tool calling (Phase 10, docs/architecture/tools.md).
+    TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
+    TOOL_APPROVAL_PENDING = "TOOL_APPROVAL_PENDING"
+    TOOL_APPROVAL_EXPIRED = "TOOL_APPROVAL_EXPIRED"
+    TOOL_APPROVAL_STALE = "TOOL_APPROVAL_STALE"
+    TOOL_APPROVAL_CLOSED = "TOOL_APPROVAL_CLOSED"
 
 
 DEFAULT_MESSAGES: dict[ErrorCode, str] = {
@@ -100,6 +106,15 @@ DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ),
     ErrorCode.RAG_INVALID_SCOPE: "The document selection is not valid.",
     ErrorCode.RAG_RETRIEVAL_FAILED: "Searching the documents failed. Please try again.",
+    ErrorCode.TOOL_NOT_FOUND: "That tool is not available.",
+    ErrorCode.TOOL_APPROVAL_PENDING: (
+        "An action in this conversation is waiting for your approval. Approve or reject it first."
+    ),
+    ErrorCode.TOOL_APPROVAL_EXPIRED: "This action was not approved in time and has expired.",
+    ErrorCode.TOOL_APPROVAL_STALE: (
+        "The action changed since it was shown to you. Review it again before deciding."
+    ),
+    ErrorCode.TOOL_APPROVAL_CLOSED: "This action is no longer waiting for a decision.",
 }
 
 

@@ -10,6 +10,9 @@ Translation rules (docs/architecture/ai-gateway.md#provider-adapters):
   `content_filter` with empty content.
 - Streams request `include_usage`, so the final chunk carries token counts.
 - OpenAI's prompt tokens already include cached tokens, which matches NEXA's `input_tokens`.
+- Tools (Phase 10) become `function` tools. An assistant message's calls are `tool_calls` with
+  JSON-encoded arguments; a `tool` message becomes one `tool` message per result. A streamed
+  call arrives in fragments keyed by `index`, joined and decoded at the end.
 - The SDK's own retries are off: the gateway is the only place that retries.
 """
 
@@ -46,7 +49,8 @@ from nexa_ai.providers.base import (
     Timeouts,
     TokenCounts,
 )
-from nexa_ai.types import FinishReason, Role
+from nexa_ai.tools import call_arguments_text, decode_arguments
+from nexa_ai.types import FinishReason, Role, ToolCallPart
 from nexa_common.logs import get_logger
 
 log = get_logger("nexa.ai.openai")
@@ -108,11 +112,17 @@ class OpenAIProvider:
             raise AIProviderError("The provider returned no answer.", provider=self.name)
         choice = completion.choices[0]
         refused = bool(getattr(choice.message, "refusal", None))
+        calls = tuple(
+            _call(index, tc.id, tc.function.name, tc.function.arguments)
+            for index, tc in enumerate(getattr(choice.message, "tool_calls", None) or [])
+            if getattr(tc, "type", "function") == "function"
+        )
         return ProviderResult(
             content="" if refused else (choice.message.content or ""),
             finish_reason=FinishReason.CONTENT_FILTER if refused else _finish(choice.finish_reason),
             usage=_usage(completion.usage),
             provider_response_id=completion.id,
+            tool_calls=() if refused else calls,
         )
 
     async def stream(self, call: ProviderCall) -> AsyncIterator[ProviderEvent]:
@@ -130,6 +140,8 @@ class OpenAIProvider:
         finish: str | None = None
         refused = False
         usage: TokenCounts | None = None
+        # index -> [id, name, argument fragments] of the tool calls seen so far
+        calls: dict[int, tuple[list[str], list[str], list[str]]] = {}
         try:
             async with response:
                 async for chunk in response:
@@ -145,6 +157,16 @@ class OpenAIProvider:
                     finish = choice.finish_reason or finish
                     if getattr(choice.delta, "refusal", None):
                         refused = True
+                    for fragment in getattr(choice.delta, "tool_calls", None) or []:
+                        ids, names, arguments = calls.setdefault(fragment.index, ([], [], []))
+                        if fragment.id:
+                            ids.append(fragment.id)
+                        function = fragment.function
+                        if function is not None:
+                            if function.name:
+                                names.append(function.name)
+                            if function.arguments:
+                                arguments.append(function.arguments)
                     if choice.delta.content and not refused:
                         yield TextChunk(choice.delta.content)
                     else:
@@ -156,6 +178,12 @@ class OpenAIProvider:
         yield StreamEnd(
             finish_reason=FinishReason.CONTENT_FILTER if refused else _finish(finish),
             usage=usage,
+            tool_calls=()
+            if refused
+            else tuple(
+                _call(index, ids[0] if ids else None, "".join(names), "".join(arguments))
+                for index, (ids, names, arguments) in sorted(calls.items())
+            ),
         )
 
     def _params(self, call: ProviderCall) -> dict[str, Any]:
@@ -163,12 +191,51 @@ class OpenAIProvider:
         for message in call.messages:
             if message.role is Role.SYSTEM:
                 messages.append({"role": "system", "content": message.text})
+            elif message.role is Role.TOOL:
+                messages.extend(
+                    {"role": "tool", "tool_call_id": r.call_id, "content": r.content}
+                    for r in message.tool_results
+                )
             elif message.role is Role.ASSISTANT:
-                messages.append({"role": "assistant", "content": message.text})
+                if message.tool_calls:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": message.text or None,
+                            "tool_calls": [
+                                {
+                                    "id": c.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": c.name,
+                                        "arguments": call_arguments_text(c),
+                                    },
+                                }
+                                for c in message.tool_calls
+                            ],
+                        }
+                    )
+                else:
+                    messages.append({"role": "assistant", "content": message.text})
             else:
                 messages.append({"role": "user", "content": message.text})
         fmt = call.response_format
+        tools = call.request.tools or []
         return {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    },
+                }
+                for t in tools
+            ]
+            if tools
+            else omit,
+            "tool_choice": call.request.tool_choice if tools else omit,
             "model": call.model,
             "messages": messages,
             "max_completion_tokens": call.max_output_tokens,
@@ -182,6 +249,17 @@ class OpenAIProvider:
             if fmt is not None
             else omit,
         }
+
+
+def _call(index: int, call_id: str | None, name: str | None, arguments: str | None) -> ToolCallPart:
+    # Some OpenAI-compatible servers omit the id; the result must still be able to answer it.
+    decoded, raw = decode_arguments(arguments)
+    return ToolCallPart(
+        id=(call_id or f"call_{index}")[:128],
+        name=(name or "unknown")[:128],
+        arguments=decoded,
+        raw_arguments=raw,
+    )
 
 
 def _finish(reason: str | None) -> FinishReason:

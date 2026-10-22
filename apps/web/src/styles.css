@@ -1792,6 +1792,336 @@ button:focus-visible {
   }
 }
 
+/* AI tool calls: what a reply did with tools, and the action it waits for approval of */
+
+.tool-activity {
+  margin: 0 0 10px;
+}
+
+.tool-activity-title {
+  margin: 0 0 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tool-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  border-left: 2px solid var(--border);
+  list-style: none;
+}
+
+.tool-row {
+  padding: 3px 0 3px 8px;
+  font-size: 13px;
+}
+
+.tool-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+}
+
+.tool-icon {
+  display: inline-flex;
+  justify-content: center;
+  width: 18px;
+}
+
+.tool-icon .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.tool-running .tool-icon {
+  color: var(--accent);
+}
+
+.tool-done .tool-icon {
+  color: var(--up);
+}
+
+.tool-failed .tool-icon,
+.tool-failed .tool-status,
+.tool-failed .tool-reason {
+  color: var(--down);
+}
+
+.tool-stopped .tool-icon {
+  color: var(--text-muted);
+}
+
+.tool-waiting .tool-icon,
+.tool-waiting .tool-status {
+  color: var(--waiting);
+}
+
+.tool-summary {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.tool-status,
+.tool-duration {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tool-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: tool-spin 0.8s linear infinite;
+}
+
+@keyframes tool-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.tool-reason,
+.tool-note {
+  margin: 2px 0 0 26px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tool-details {
+  margin: 2px 0 0 26px;
+}
+
+.tool-details summary {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tool-result {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.tool-result .tool-note {
+  margin: 6px 0 0;
+}
+
+.tool-result > :first-child {
+  margin-top: 0;
+}
+
+.tool-calculation {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.tool-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 0;
+}
+
+.tool-facts div {
+  display: contents;
+}
+
+.tool-facts dt {
+  color: var(--text-muted);
+}
+
+.tool-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.tool-passage-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+}
+
+/* Tool output is untrusted text: plain, wrapped, its own scroll when long. */
+.tool-excerpt,
+.tool-quote {
+  max-height: 12em;
+  margin: 4px 0 0;
+  padding-left: 10px;
+  overflow-y: auto;
+  border-left: 3px solid var(--border);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tool-json {
+  max-height: 16em;
+  margin: 0;
+  overflow: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.approval-card {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--waiting);
+  border-radius: 10px;
+  background: var(--waiting-tint);
+}
+
+.approval-risk-high {
+  border-color: var(--down);
+}
+
+.approval-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  color: var(--waiting);
+}
+
+.approval-risk-high .approval-head {
+  color: var(--down);
+}
+
+.approval-head .badge {
+  margin-left: 0;
+}
+
+.approval-title {
+  margin: 0;
+  font-weight: 700;
+}
+
+.approval-summary {
+  margin: 6px 0 8px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.approval-details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 14px;
+}
+
+.approval-details div {
+  display: contents;
+}
+
+.approval-details dt {
+  color: var(--text-muted);
+}
+
+.approval-details dd {
+  min-width: 0;
+  margin: 0;
+}
+
+/* The exact text the action would use: line breaks and spaces kept, never laid out as HTML. */
+.approval-value {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.approval-hint {
+  margin: 10px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.chat-composer-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--waiting-tint);
+  color: var(--waiting);
+  font-size: 13px;
+}
+
+.chat-composer-note .icon {
+  flex: none;
+}
+
+@media (max-width: 640px) {
+  .approval-details,
+  .tool-facts {
+    grid-template-columns: 1fr;
+  }
+
+  .approval-details dd + dt,
+  .tool-facts dd + dt {
+    margin-top: 4px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-spinner {
+    animation: none;
+  }
+}
+
+/* Organization settings: AI tools */
+
+.tool-setting {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.tool-setting-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.tool-setting-name .badge {
+  margin-left: 0;
+}
+
+.tool-switch {
+  flex: none;
+  white-space: nowrap;
+}
+
 /* Narrow screens: one panel, the list in a drawer. */
 
 .chat-drawer-layer {

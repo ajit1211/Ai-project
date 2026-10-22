@@ -182,9 +182,13 @@ sent in `message_start` and in the `X-NEXA-Stream-Protocol` header so it can evo
 | `message_start` | protocol, conversation_id, request_id, user_message, assistant_message (`pending`) | First, once the messages are stored |
 | `text_delta` | message_id, text | Each chunk, as it arrives; never buffered |
 | `usage` | message_id, input/output/total/cached/cache-write tokens, cost_usd | Once the gateway has metered the call: before `message_complete`, and before an `error` from the provider (what the failed call used) |
+| `sources` | message_id, searched_documents, sources | A grounded reply, once retrieval is done (Phase 08, [rag.md](rag.md)) |
+| `tool_call` | message_id, invocation_id, call_id, tool_id, tool_name, step, status, summary, risk, error | A tool call the model asked for, once checked (Phase 10, [tools.md](tools.md)) |
+| `tool_result` | message_id, invocation_id, call_id, tool_id, status, duration_ms, result, sources, error | When that call ends |
 | `message_complete` | message (`completed`) | Terminal |
 | `message_cancelled` | message (`cancelled`, with partial text) | Terminal |
 | `error` | message_id, code, message, retryable, retry_after, request_id, assistant_message (`failed`) | Terminal |
+| `approval_required` | message (`awaiting_approval`), approval | Terminal: the reply waits for the user's decision on an action (Phase 10) |
 | `: ping` | — | Every 15 s while the model is quiet |
 
 Exactly one terminal event ends every stream. Events carry an incrementing SSE `id`; within one

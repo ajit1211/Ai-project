@@ -1,9 +1,13 @@
 """Canonical AI types: what callers send, what they get back, and what a stream carries.
 
 These are NEXA's own shapes (architecture doc 12.1). Adapters translate them to and from each
-provider's API, so switching providers never touches calling code. Roles and parts for later
-phases (images, tool calls) are declared now so the schema does not change when they arrive;
-the gateway refuses what it cannot serve yet with `AI_INVALID_REQUEST`.
+provider's API, so switching providers never touches calling code. Image parts are declared for
+a later phase and refused with `AI_INVALID_REQUEST`.
+
+Tool calling (Phase 10, docs/architecture/tools.md): a request may offer `tools`; the model
+answers with text, tool calls, or both. A tool call and its result travel in the history as an
+assistant message with `ToolCallPart`s followed by one `tool` message with the matching
+`ToolResultPart`s. The gateway only carries tool calls: it never executes anything.
 """
 
 import re
@@ -16,6 +20,9 @@ MAX_MESSAGES = 200
 MAX_TEXT_CHARS = 400_000  # ~100k tokens; models with smaller windows reject earlier
 MAX_STOP_SEQUENCES = 4
 DEFAULT_MAX_OUTPUT_TOKENS = 1024
+MAX_TOOLS = 32
+MAX_TOOL_DESCRIPTION_CHARS = 1024
+MAX_TOOL_ARGUMENTS_CHARS = 16_000
 
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -87,23 +94,28 @@ class ImagePart(BaseModel):
 
 
 class ToolCallPart(BaseModel):
-    """A tool the model wants to call. Declared for Phase 10."""
+    """A tool the model wants to call. `id` is the provider's call id, echoed by the result.
+
+    `arguments` is the decoded JSON object. When the model produced something that is not a
+    JSON object, `arguments` is empty and `raw_arguments` keeps a bounded prefix of what it
+    produced, so the caller rejects the call instead of running it with no arguments."""
 
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["tool_call"] = "tool_call"
-    id: str = Field(max_length=128)
-    name: str = Field(max_length=128)
+    id: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=128)
     arguments: dict[str, Any] = Field(default_factory=dict)
+    raw_arguments: str | None = Field(default=None, max_length=MAX_TOOL_ARGUMENTS_CHARS)
 
 
 class ToolResultPart(BaseModel):
-    """The result of a tool call, sent back to the model. Declared for Phase 10."""
+    """The result of a tool call, sent back to the model as data (never as instructions)."""
 
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["tool_result"] = "tool_result"
-    call_id: str = Field(max_length=128)
+    call_id: str = Field(min_length=1, max_length=128)
     content: str = Field(max_length=MAX_TEXT_CHARS)
     is_error: bool = False
 
@@ -127,6 +139,33 @@ class Message(BaseModel):
     def text(self) -> str:
         """The text parts joined; used for token estimates and text-only providers."""
         return "".join(part.text for part in self.parts if isinstance(part, TextPart))
+
+    @property
+    def tool_calls(self) -> list[ToolCallPart]:
+        return [part for part in self.parts if isinstance(part, ToolCallPart)]
+
+    @property
+    def tool_results(self) -> list[ToolResultPart]:
+        return [part for part in self.parts if isinstance(part, ToolResultPart)]
+
+
+# --- Tools ---------------------------------------------------------------------------------
+
+
+class ToolSpec(BaseModel):
+    """A tool offered to the model: what it is for and the JSON Schema of its arguments.
+
+    Only the definition travels to the provider. What a call does, and whether it may run at
+    all, is decided by the caller (Runtime's tool executor), never by the gateway."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(pattern=_NAME.pattern)
+    description: str = Field(min_length=1, max_length=MAX_TOOL_DESCRIPTION_CHARS)
+    input_schema: dict[str, Any]
+
+
+ToolChoice = Literal["auto", "none"]
 
 
 # --- Response format -----------------------------------------------------------------------
@@ -165,6 +204,10 @@ class ChatRequest(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=1, le=128_000)
     response_format: ResponseFormat | None = None
     stop: list[str] | None = Field(default=None, max_length=MAX_STOP_SEQUENCES)
+    # Tools the model may call (Phase 10). "none" keeps them defined (a history with tool
+    # calls needs the definitions) but asks the model to answer in text.
+    tools: list[ToolSpec] | None = Field(default=None, max_length=MAX_TOOLS)
+    tool_choice: ToolChoice = "auto"
     # Metadata for the usage ledger only; it never affects authorization.
     feature: Feature = Feature.API
 
@@ -174,11 +217,23 @@ class ChatRequest(BaseModel):
             raise ValueError("messages must include at least one user or assistant message")
         if self.stop is not None and any(not s or len(s) > 64 for s in self.stop):
             raise ValueError("stop sequences must be 1 to 64 characters")
+        if self.tools:
+            names = [tool.name for tool in self.tools]
+            if len(set(names)) != len(names):
+                raise ValueError("tool names must be unique")
         return self
 
     @property
     def wants_structured_output(self) -> bool:
         return isinstance(self.response_format, JSONSchemaFormat)
+
+    @property
+    def offers_tools(self) -> bool:
+        return bool(self.tools)
+
+    @property
+    def has_tool_history(self) -> bool:
+        return any(m.role is Role.TOOL or m.tool_calls for m in self.messages)
 
 
 # --- Response ------------------------------------------------------------------------------
@@ -203,6 +258,8 @@ class ChatResponse(BaseModel):
     provider_model: str
     content: str
     parsed: Any | None = None
+    # The calls the model asked for (finish reason `tool_calls`); empty otherwise.
+    tool_calls: list[ToolCallPart] = Field(default_factory=list)
     finish_reason: FinishReason
     usage: Usage
     latency_ms: int
@@ -235,6 +292,8 @@ class UsageEvent(BaseModel):
 class MessageEnd(BaseModel):
     type: Literal["message.end"] = "message.end"
     finish_reason: FinishReason
+    # A streamed answer's tool calls arrive whole, here, once the model has finished.
+    tool_calls: list[ToolCallPart] = Field(default_factory=list)
     latency_ms: int
     attempts: int = 1
     fallback_used: bool = False

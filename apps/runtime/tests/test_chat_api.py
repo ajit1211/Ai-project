@@ -459,7 +459,9 @@ class TestGeneration:
             say(client, headers, conversation["id"], f"turn {n}")
         sent = provider.calls[-1].request.messages
         assert sent[0].role.value == "system"
-        assert len(sent) == 1 + 3
+        # The instructions (and, since Phase 10, the rules for tools), then three turns.
+        turns = [m for m in sent if m.role.value != "system"]
+        assert len(turns) == 3
         assert sent[-1].text == "turn 2"
         assert all("SECRET" not in m.text for m in sent)
 

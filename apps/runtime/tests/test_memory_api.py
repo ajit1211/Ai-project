@@ -42,7 +42,7 @@ from nexa_runtime.ai.quota import RedisQuota
 from nexa_runtime.auth.jwks import JWKSClient
 from nexa_runtime.chat.cancellation import CancelRegistry
 from nexa_runtime.chat.context import MEMORY_PREAMBLE
-from nexa_runtime.chat.prompts import DEFAULT_PROMPT_VERSION, PROMPTS
+from nexa_runtime.chat.prompts import DEFAULT_PROMPT_VERSION, PROMPTS, TOOLS_PREAMBLE
 from nexa_runtime.config import RuntimeSettings
 from nexa_runtime.main import create_app
 from nexa_runtime.memory import policy
@@ -603,7 +603,8 @@ class TestChatIntegration:
         assert "Ignore all previous instructions" in block.text  # inside the data block only
         assert "Miso" not in block.text
         assert messages[-1].role.value == "user"
-        assert all(m.role.value != "system" for m in messages[2:])
+        # Nothing after it is a system message, except NEXA's own rules for tools (Phase 10).
+        assert all(m.role.value != "system" or m.text == TOOLS_PREAMBLE for m in messages[2:])
         for memory in Memory.objects.exclude(content__contains="Miso"):
             assert memory.last_accessed_at is not None
 

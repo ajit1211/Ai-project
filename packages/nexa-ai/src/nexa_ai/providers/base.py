@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
 
-from nexa_ai.types import ChatRequest, FinishReason, JSONSchemaFormat, Message
+from nexa_ai.types import ChatRequest, FinishReason, JSONSchemaFormat, Message, ToolCallPart
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +82,8 @@ class ProviderResult:
     finish_reason: FinishReason
     usage: TokenCounts
     provider_response_id: str | None = None
+    # The tool calls of the answer, in the order the model made them (Phase 10).
+    tool_calls: tuple[ToolCallPart, ...] = ()
 
 
 # Stream items an adapter yields. The gateway turns them into API events.
@@ -111,6 +113,9 @@ class StreamEnd:
     finish_reason: FinishReason
     # None when the provider did not report usage; the gateway estimates instead.
     usage: TokenCounts | None = None
+    # Tool calls are assembled by the adapter from the provider's fragments and reported
+    # whole, once, at the end of the stream.
+    tool_calls: tuple[ToolCallPart, ...] = ()
 
 
 ProviderEvent = StreamStart | TextChunk | Activity | StreamEnd

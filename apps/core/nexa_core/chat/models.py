@@ -83,6 +83,8 @@ class Message(models.Model):
         COMPLETED = "completed"
         FAILED = "failed"
         CANCELLED = "cancelled"
+        # Paused until the user approves or rejects an action a tool would take (Phase 10).
+        AWAITING_APPROVAL = "awaiting_approval"
 
     id = models.UUIDField(primary_key=True, default=new_id, editable=False)
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="+")
@@ -92,7 +94,7 @@ class Message(models.Model):
     sequence = models.PositiveIntegerField(help_text="Position in the conversation, from 1.")
     role = models.CharField(max_length=16, choices=Role.choices)
     content = models.TextField(blank=True)
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.COMPLETED)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.COMPLETED)
     # Caller-supplied idempotency key for user messages: a retried submission is not a new one.
     client_message_id = models.CharField(max_length=64, blank=True)
     # Generation details for assistant messages.
@@ -113,6 +115,10 @@ class Message(models.Model):
     # A reply grounded in the user's documents (Phase 08, docs/architecture/rag.md): the scope
     # that was asked for and how retrieval and citation went. Null for ordinary replies.
     grounding = models.JSONField(null=True, blank=True)
+    # A reply that used tools (Phase 10, docs/architecture/tools.md): the text of each model
+    # call and the tool calls it made, in order, so a paused turn can resume exactly. The
+    # calls themselves are `tool_invocations` rows. Null for replies without tools.
+    tool_trace = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 

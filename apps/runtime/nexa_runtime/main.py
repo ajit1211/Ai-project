@@ -1,6 +1,6 @@
 """FastAPI application for NEXA Runtime."""
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from importlib.metadata import version
 
@@ -27,6 +27,11 @@ from nexa_runtime.memory.service import MemoryEngine
 from nexa_runtime.middleware import RequestContextMiddleware
 from nexa_runtime.rag.service import RagEngine
 from nexa_runtime.ratelimit import Limiter
+from nexa_runtime.tools.audit import ToolAudit
+from nexa_runtime.tools.builtin import builtin_registry
+from nexa_runtime.tools.executor import ToolExecutor
+from nexa_runtime.tools.registry import ToolRegistry
+from nexa_runtime.tools.service import ToolService
 
 
 def create_app(
@@ -35,7 +40,10 @@ def create_app(
     jwks_client: JWKSClient | None = None,
     providers: Mapping[str, AIProvider] | None = None,
     embedding_providers: Mapping[str, EmbeddingProvider] | None = None,
+    tool_registry: Callable[..., ToolRegistry] | None = None,
 ) -> FastAPI:
+    """`tool_registry` builds the tool registry from the engines it may use (keyword arguments
+    `engine`, `rag`, `memory`); NEXA's built-in tools by default."""
     settings = settings or get_settings()
     configure_logging(
         service="runtime",
@@ -111,6 +119,21 @@ def create_app(
             embedder=app.state.embedder,
             usage=app.state.gateway.usage,
         )
+        # AI tool calling (docs/architecture/tools.md): trusted tools and one executor that
+        # checks, runs and records every call the model asks for.
+        tool_audit = ToolAudit(app.state.engine)
+        app.state.tools = ToolExecutor(
+            engine=app.state.engine,
+            registry=(tool_registry or builtin_registry)(
+                engine=app.state.engine, rag=app.state.rag, memory=app.state.memory
+            ),
+            settings=settings,
+            limiter=app.state.limiter,
+            audit=tool_audit,
+        )
+        app.state.tool_service = ToolService(
+            engine=app.state.engine, executor=app.state.tools, audit=tool_audit
+        )
         app.state.chat = ChatService(
             engine=app.state.engine,
             gateway=app.state.gateway,
@@ -119,6 +142,7 @@ def create_app(
             settings=settings,
             memory=app.state.memory,
             rag=app.state.rag,
+            tools=app.state.tools,
         )
         try:
             yield

@@ -32,7 +32,7 @@ PRICES_EFFECTIVE_FROM = datetime(2026, 10, 8, tzinfo=UTC)
 PRICE_SOURCE = "Provider pricing pages, 2026-10-08"
 
 _FULL = ["chat", "streaming", "structured_output", "tool_calling", "vision", "reasoning"]
-_MOCK_CAPABILITIES = ["chat", "streaming", "structured_output"]
+_MOCK_CAPABILITIES = ["chat", "streaming", "structured_output", "tool_calling"]
 
 
 @dataclass(frozen=True)

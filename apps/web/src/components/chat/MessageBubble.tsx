@@ -1,17 +1,24 @@
 /**
  * One message. The user's text is shown as typed (line breaks kept); a reply is rendered as
  * Markdown, with its status, its details (tokens, cost, latency) and its actions. A reply
- * answered from documents adds its citations and sources (GroundedReply.tsx).
+ * answered from documents adds its citations and sources (GroundedReply.tsx). A reply that
+ * used tools shows what they did above its text (ToolTimeline.tsx), and a reply paused for the
+ * user's decision ends with the action to approve or reject (ApprovalCard.tsx).
  */
 
 import { useEffect, useState } from "react";
 
-import type { ChatItem } from "../../hooks/chatThread";
+import { isUnfinished, type ChatItem } from "../../hooks/chatThread";
+import { pendingApproval } from "../../hooks/toolActivity";
+import { describeErrorCode } from "../../services/ai/errors";
 import type { Message } from "../../types/chat";
+import type { Approval, ApprovalChoice } from "../../types/tools";
+import { ApprovalCard } from "./ApprovalCard";
 import { GroundedReply, RetrievalStatus } from "./GroundedReply";
 import { Icon } from "./Icon";
 import { Markdown } from "./Markdown";
 import { StreamingIndicator } from "./StreamingIndicator";
+import { ToolTimeline } from "./ToolTimeline";
 import { formatCount, formatDuration } from "./format";
 
 /** How long "Copied" stays on the button. */
@@ -114,7 +121,11 @@ function StatusLine({ item }: { item: ChatItem }) {
       return (
         <p className="message-status">
           <span className="badge badge-waiting">Cancelled</span>
-          <span className="muted">The reply was stopped before it finished.</span>
+          <span className="muted">
+            {message.error_code === "TOOL_APPROVAL_EXPIRED"
+              ? describeErrorCode(message.error_code)
+              : "The reply was stopped before it finished."}
+          </span>
         </p>
       );
     case "pending":
@@ -126,6 +137,7 @@ function StatusLine({ item }: { item: ChatItem }) {
         </p>
       );
     case "completed":
+    case "awaiting_approval": // The approval card says what it waits for.
       return null;
   }
 }
@@ -138,9 +150,14 @@ export interface MessageBubbleProps {
   canRetry: boolean;
   onRegenerate: () => void;
   onRetry: (key: string) => void;
+  /**
+   * Approve or reject the action this paused reply proposed. Left out where nothing can be
+   * decided (an archived conversation): the action is shown without buttons.
+   */
+  onDecide?: ((replyId: string, approval: Approval, choice: ApprovalChoice) => void) | undefined;
 }
 
-export function MessageBubble({ item, canRegenerate, canRetry, onRegenerate, onRetry }: MessageBubbleProps) {
+export function MessageBubble({ item, canRegenerate, canRetry, onRegenerate, onRetry, onDecide }: MessageBubbleProps) {
   const { message, streaming, delivery } = item;
   const isUser = message.role === "user";
   const finishedReply =
@@ -154,12 +171,29 @@ export function MessageBubble({ item, canRegenerate, canRetry, onRegenerate, onR
   if (isUser) body = <p className="message-text">{message.content}</p>;
   else if (grounding) body = <GroundedReply message={message} grounding={grounding} streaming={streaming} />;
   else if (message.content) body = <Markdown text={message.content} />;
+  const tools = isUser ? [] : (message.tools ?? []);
+  const approval = isUser ? null : pendingApproval(message);
 
   return (
     <li className={`message message-${message.role} message-${delivery}${grounding ? " message-grounded" : ""}`}>
       <div className="message-bubble">
         <span className="visually-hidden">{isUser ? "You said:" : "NEXA replied:"}</span>
+        {tools.length > 0 && <ToolTimeline tools={tools} running={streaming || isUnfinished(message)} />}
         {body}
+        {approval && (
+          <ApprovalCard
+            key={approval.id}
+            approval={approval}
+            busy={streaming}
+            deciding={item.deciding}
+            onDecide={
+              onDecide &&
+              ((choice) => {
+                onDecide(message.id, approval, choice);
+              })
+            }
+          />
+        )}
         {item.retrieval && <RetrievalStatus retrieval={item.retrieval} />}
         {streaming && <StreamingIndicator />}
       </div>

@@ -6,6 +6,7 @@ and model tables; it writes `message_sources` alongside the replies it writes.
 """
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -49,6 +50,11 @@ documents = Table(
     Column("format", String, nullable=False),
     Column("status", String, nullable=False),
     Column("deleted_at", DateTime(timezone=True)),
+    # Metadata the document tools may show (Phase 10).
+    Column("size_bytes", BigInteger),
+    Column("page_count", Integer),
+    Column("word_count", Integer),
+    Column("created_at", DateTime(timezone=True)),
 )
 
 teams = Table(

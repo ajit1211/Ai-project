@@ -1,10 +1,12 @@
 /**
- * Test data for the chat: messages shaped like the server's, and the grounding and sources a
- * reply answered from documents carries (docs/api/conversations.md).
+ * Test data for the chat: messages shaped like the server's, the grounding and sources a
+ * reply answered from documents carries (docs/api/conversations.md), and the tool calls and
+ * approvals of a reply that used tools (docs/architecture/tools.md).
  */
 
 import type { ChatItem } from "../hooks/chatThread";
 import type { Grounding, Message, Source } from "../types/chat";
+import type { Approval, ToolActivity, ToolInfo } from "../types/tools";
 
 /** An assistant message of conversation c1, completed unless overridden. */
 export function chatMessage(overrides: Partial<Message> = {}): Message {
@@ -106,4 +108,92 @@ export function unavailableSource(label: string, cited = true): Source {
 
 export function chatItem(message: Message, overrides: Partial<ChatItem> = {}): ChatItem {
   return { key: message.id, message, streaming: false, delivery: "sent", error: null, ...overrides };
+}
+
+/** A calculator call that succeeded, unless overridden. */
+export function toolActivity(overrides: Partial<ToolActivity> = {}): ToolActivity {
+  return {
+    invocation_id: "inv-1",
+    call_id: "call_1",
+    tool_id: "calculator",
+    tool_name: "Calculator",
+    tool_version: "1",
+    step: 1,
+    position: 0,
+    status: "succeeded",
+    summary: "Calculating 6*7",
+    risk: "low",
+    duration_ms: 3,
+    error_code: null,
+    error_message: null,
+    result: { expression: "6*7", result: 42, result_text: "42" },
+    result_truncated: false,
+    result_hidden: false,
+    sources: [],
+    approval: null,
+    ...overrides,
+  };
+}
+
+/** The exact text save_memory would save: two spaces and a line break that must survive. */
+export const MEMORY_TEXT = "I prefer  metric units.\nAlways <b>bold</b>.";
+
+/** A pending approval to save a memory, unless overridden. */
+export function approval(overrides: Partial<Approval> = {}): Approval {
+  return {
+    id: "ap-1",
+    invocation_id: "inv-2",
+    tool_id: "save_memory",
+    tool_name: "Save to memory",
+    summary: "Saving to your memories",
+    details: {
+      action: "Save a memory",
+      target: "Your private memories",
+      content: MEMORY_TEXT,
+      kind: "preference",
+      consequences:
+        "NEXA will use this in your future conversations. Only you can see it, and you can delete it at any time on the Memories page.",
+    },
+    risk: "high",
+    status: "pending",
+    arguments_hash: "a".repeat(64),
+    expires_at: "2026-10-20T09:15:00+00:00",
+    decided_at: null,
+    ...overrides,
+  };
+}
+
+/** The save_memory call a paused reply waits on. */
+export function awaitingActivity(pending: Approval = approval()): ToolActivity {
+  return toolActivity({
+    invocation_id: pending.invocation_id,
+    call_id: "call_2",
+    tool_id: "save_memory",
+    tool_name: "Save to memory",
+    position: 1,
+    status: "awaiting_approval",
+    summary: "Saving to your memories",
+    risk: "high",
+    duration_ms: null,
+    result: null,
+    approval: pending,
+  });
+}
+
+export function toolInfo(overrides: Partial<ToolInfo> = {}): ToolInfo {
+  return {
+    id: "calculator",
+    name: "Calculator",
+    description: "Exact arithmetic.",
+    version: "1",
+    category: "math",
+    risk: "low",
+    read_only: true,
+    requires_approval: false,
+    enabled: true,
+    available: true,
+    disabled_by: null,
+    permissions: [],
+    ...overrides,
+  };
 }

@@ -12,6 +12,19 @@ gateway can be exercised end to end, including from the playground:
     [[bad_json_once]]         invalid JSON on the first attempt, valid after the repair turn
     [[length]]                stop with finish_reason=length
 
+Tool calling (Phase 10), when the request offers tools and `tool_choice` is "auto":
+
+    [[tool:NAME {"a": 1}]]    call NAME with these arguments (several phrases: several calls)
+    [[tool:NAME not json]]    a call whose arguments are not a JSON object
+    [[tool_loop:NAME {...}]]  call NAME again after every result (to test the loop limits)
+
+Without phrases, a few plain requests call a tool the way a model would, so tool calling can
+be tried locally without an API key: arithmetic ("what is 12 * (3 + 4)?") calls `calculator`,
+"what time is it" calls `current_time`, "search my documents for X" calls `search_documents`,
+"list my documents" calls `document_metadata`, "my workspace" calls `workspace_info`, and
+"save to memory: X" calls `save_memory`; each only when that tool is offered. After the
+results come back, the mock answers from them.
+
 Control phrases are honoured only when the provider is built with `control_phrases=True`,
 which Runtime does in development and test only. Runtime refuses to register the mock
 provider at all in staging and production (see `nexa_runtime.ai.providers`), so neither the
@@ -51,7 +64,8 @@ from nexa_ai.providers.base import (
 )
 from nexa_ai.structured import repair_instruction
 from nexa_ai.tokens import estimate_message_tokens, estimate_text_tokens
-from nexa_ai.types import FinishReason, Role
+from nexa_ai.tools import decode_arguments
+from nexa_ai.types import FinishReason, Role, ToolCallPart
 
 _FAIL = re.compile(r"\[\[fail:([a-z_]+)(?::(\d+))?\]\]")
 _SLOW = re.compile(r"\[\[slow:(\d{1,5})\]\]")
@@ -113,6 +127,15 @@ class MockProvider:
         prompt = self._prompt(call)
         await self._maybe_fail(call, prompt)
         await self._maybe_slow(prompt)
+        calls = self._tool_calls(call, prompt)
+        if calls:
+            return ProviderResult(
+                content="",
+                finish_reason=FinishReason.TOOL_CALLS,
+                usage=_usage(call, json.dumps([c.model_dump() for c in calls])),
+                provider_response_id=_response_id(call),
+                tool_calls=calls,
+            )
         content, finish = self._answer(call, prompt)
         return ProviderResult(
             content=content,
@@ -130,12 +153,20 @@ class MockProvider:
         delay = _slow_ms(prompt) / 1000
         if delay:
             await self._sleep(delay)
-        content, finish = self._answer(call, prompt)
-        fail_after = _stream_failure_point(prompt)
         yield StreamStart(
             provider_response_id=_response_id(call),
             input_tokens=estimate_message_tokens(call.request.messages),
         )
+        calls = self._tool_calls(call, prompt)
+        if calls:
+            yield StreamEnd(
+                finish_reason=FinishReason.TOOL_CALLS,
+                usage=_usage(call, json.dumps([c.model_dump() for c in calls])),
+                tool_calls=calls,
+            )
+            return
+        content, finish = self._answer(call, prompt)
+        fail_after = _stream_failure_point(prompt)
         for index, chunk in enumerate(_chunks(content)):
             if fail_after is not None and index >= fail_after:
                 raise AIProviderError(
@@ -178,6 +209,8 @@ class MockProvider:
                 return json.dumps(canned), FinishReason.STOP
             return json.dumps(example_for_schema(fmt.json_schema)), FinishReason.STOP
 
+        if call.request.messages[-1].role is Role.TOOL:
+            return _answer_from_results(call), FinishReason.STOP
         visible = _last_user_text(call)
         sources = _evidence(call)
         if sources:
@@ -188,12 +221,125 @@ class MockProvider:
             return " ".join(words[:limit]), FinishReason.LENGTH
         return _base_answer(call, visible), FinishReason.STOP
 
+    def _tool_calls(self, call: ProviderCall, prompt: str) -> tuple[ToolCallPart, ...]:
+        """The calls the mock makes now: none unless tools are offered with "auto"."""
+        request = call.request
+        offered = {tool.name for tool in request.tools or []}
+        if not offered or request.tool_choice != "auto":
+            return ()
+        step = sum(1 for m in request.messages if m.role is Role.TOOL)
+        last = request.messages[-1].role
+        planned: list[tuple[str, dict[str, Any], str | None]] = []
+        if last is Role.TOOL:
+            # Results are back: only a loop phrase asks again; otherwise the mock answers.
+            planned = [
+                (name, *_phrase_arguments(rest)) for name, rest in _TOOL_LOOP.findall(prompt)
+            ]
+        elif last is Role.USER:
+            # A phrase may name a tool that was not offered: a misbehaving model, on purpose.
+            phrases = [*_TOOL_LOOP.findall(prompt), *_TOOL.findall(prompt)]
+            planned = [(name, *_phrase_arguments(rest)) for name, rest in phrases]
+            if not planned:
+                planned = [
+                    (name, arguments, None)
+                    for name, arguments in _planned_by_request(_last_user_text(call), offered)
+                ]
+        return tuple(
+            ToolCallPart(
+                id=f"mock_call_{step}_{index}",
+                name=name,
+                arguments=arguments,
+                raw_arguments=raw,
+            )
+            for index, (name, arguments, raw) in enumerate(planned)
+        )
+
 
 def _last_user_text(call: ProviderCall) -> str:
     for message in reversed(call.request.messages):
         if message.role is Role.USER:
             return message.text
     return ""
+
+
+# --- Tool calling (Phase 10) --------------------------------------------------------------------
+
+_TOOL = re.compile(r"\[\[tool:([A-Za-z0-9_-]{1,64})(?:\s+(.*?))?\]\]", re.DOTALL)
+_TOOL_LOOP = re.compile(r"\[\[tool_loop:([A-Za-z0-9_-]{1,64})(?:\s+(.*?))?\]\]", re.DOTALL)
+# Operators include "x" and the multiplication and division signs (U+00D7, U+00F7).
+_EXPRESSION = re.compile(
+    r"[(\-]*\d+(?:\.\d+)?\)*(?:\s*(?:\*\*|[-+*/^%x\u00d7\u00f7])\s*[(\-]*\d+(?:\.\d+)?\)*)+"
+)
+_SIGNS = str.maketrans({"x": "*", "\u00d7": "*", "\u00f7": "/"})
+_ASKS_MATH = re.compile(r"\b(?:calculate|compute|evaluate|what(?:'s| is)|how much is)\b", re.I)
+_ASKS_TIME = re.compile(
+    r"\b(what time|current time|time is it|today'?s date|what date|what day is it)\b", re.I
+)
+_ASKS_SEARCH = re.compile(
+    r"\b(?:search|find|look up)\b(?: in)? (?:my|our|the) documents? (?:for|about) (.+?)[?.!]*$",
+    re.I | re.S,
+)
+_ASKS_LIST = re.compile(r"\b(?:list|show|which|what)\b.*\b(?:my|our) documents\b", re.I | re.S)
+_ASKS_WORKSPACE = re.compile(r"\b(?:my|our|this) (?:workspace|organi[sz]ation|teams?)\b", re.I)
+_ASKS_SAVE = re.compile(
+    r"\bsave (?:this |that )?(?:to|in) (?:my )?memor(?:y|ies)\s*[:,-]?\s*(.+)", re.I | re.S
+)
+
+
+def _phrase_arguments(rest: str) -> tuple[dict[str, Any], str | None]:
+    return decode_arguments(rest) if rest.strip() else ({}, None)
+
+
+def _planned_by_request(text: str, offered: set[str]) -> list[tuple[str, dict[str, Any]]]:
+    """What a model would plausibly do with a plain request, for the tools offered."""
+    if "save_memory" in offered and (match := _ASKS_SAVE.search(text)):
+        return [("save_memory", {"content": match.group(1).strip()[:500]})]
+    if "search_documents" in offered and (match := _ASKS_SEARCH.search(text)):
+        return [("search_documents", {"query": match.group(1).strip()[:500]})]
+    if "document_metadata" in offered and _ASKS_LIST.search(text):
+        return [("document_metadata", {})]
+    if "workspace_info" in offered and _ASKS_WORKSPACE.search(text):
+        return [("workspace_info", {})]
+    planned: list[tuple[str, dict[str, Any]]] = []
+    if "calculator" in offered and _ASKS_MATH.search(text) and (match := _EXPRESSION.search(text)):
+        expression = match.group(0).translate(_SIGNS).strip()
+        planned.append(("calculator", {"expression": expression}))
+    if "current_time" in offered and _ASKS_TIME.search(text):
+        planned.append(("current_time", {}))
+    return planned
+
+
+def _answer_from_results(call: ProviderCall) -> str:
+    """A deterministic answer built from the last tool results, as data."""
+    messages = call.request.messages
+    names: dict[str, str] = {}
+    for message in messages:
+        for part in message.tool_calls:
+            names[part.id] = part.name
+    sentences: list[str] = []
+    for result in messages[-1].tool_results:
+        name = names.get(result.call_id, "tool")
+        if result.is_error:
+            sentences.append(f"The {name} tool could not complete: {_compact(result.content)}")
+            continue
+        try:
+            value = json.loads(result.content)
+        except json.JSONDecodeError:
+            value = None
+        if isinstance(value, dict) and isinstance(value.get("result"), dict):
+            value = value["result"]  # {"status": "ok", "tool": ..., "result": {...}}
+        if isinstance(value, dict) and "result_text" in value:
+            sentences.append(f"The result is {value['result_text']}.")
+        elif isinstance(value, dict) and "utc" in value:
+            sentences.append(f"The current time is {value['utc']} (UTC).")
+        else:
+            sentences.append(f"From the {name} tool: {_compact(result.content)}")
+    return " ".join(sentences) or "The tools returned nothing."
+
+
+def _compact(text: str, limit: int = 300) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
 # --- Document-grounded answers (nexa_runtime.rag) ---------------------------------------------

@@ -1,15 +1,19 @@
-/** Members and invitations of one organization. The server decides what is allowed; the
- * page only hides controls the current role cannot use. */
+/** Members and invitations of one organization, and (for those who may manage them) its AI
+ * tools. The server decides what is allowed; the page only hides controls the current role
+ * cannot use. */
 
 import { useCallback, useEffect, useState } from "react";
 import { useParams } from "react-router";
 
 import { api } from "../api/client";
 import type { Invitation, Member, OrganizationDetail, Role } from "../api/types";
+import { useAuth } from "../auth/AuthContext";
+import { AiToolsSettings } from "../components/AiToolsSettings";
 import { Alert, Field, describeError } from "../components/forms";
 
 export function OrganizationPage() {
   const { organizationId = "" } = useParams();
+  const { activeOrganizationId } = useAuth();
   const [org, setOrg] = useState<OrganizationDetail | null>(null);
   const [members, setMembers] = useState<Member[]>([]);
   const [invitations, setInvitations] = useState<Invitation[]>([]);
@@ -267,6 +271,17 @@ export function OrganizationPage() {
           )}
         </section>
       )}
+
+      {/* The tool endpoints act on the active organization (the one the access token names). */}
+      {can("ai.tool.manage") &&
+        (organizationId === activeOrganizationId ? (
+          <AiToolsSettings />
+        ) : (
+          <section className="card section">
+            <h2>AI tools</h2>
+            <p className="muted">Switch to this organization to manage the tools its AI may use.</p>
+          </section>
+        ))}
     </>
   );
 }

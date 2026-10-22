@@ -82,6 +82,7 @@ INSTALLED_APPS = [
     "nexa_core.chat",
     "nexa_core.memory",
     "nexa_core.documents",
+    "nexa_core.tools",
     "nexa_core.system",
 ]
 

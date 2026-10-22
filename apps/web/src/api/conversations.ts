@@ -23,6 +23,7 @@ import {
   type Source,
   type UpdateConversationBody,
 } from "../types/chat";
+import type { Approval, ApprovalDecisionBody } from "../types/tools";
 import { ApiError, api } from "./client";
 import { frameObject, notAStream, postForStream } from "./stream";
 
@@ -115,12 +116,15 @@ export async function cancelGeneration(id: string): Promise<CancelResult> {
 
 /**
  * Send a message and stream the reply. Yields the typed events of `nexa.chat.v1` in order:
- * `message_start`, then (grounded sends only) `sources`, then `text_delta` and `usage`, then
- * exactly one terminal event (`message_complete`, `message_cancelled` or `error`), after
- * which the generator ends. `body.grounding` answers from documents; leave it out otherwise.
+ * `message_start`, then (grounded sends only) `sources`, then `text_delta` and `usage` (and,
+ * when the reply uses tools, `tool_call` and `tool_result` between them), then exactly one
+ * terminal event (`message_complete`, `message_cancelled`, `error`, or `approval_required`
+ * when the reply pauses for the user's decision on an action), after which the generator
+ * ends. `body.grounding` answers from documents; leave it out otherwise.
  *
  * Throws `ApiError` when the send is refused before anything is stored (a JSON error
- * envelope with its real status: 404, 409 GENERATION_IN_PROGRESS, 409 CONFLICT, 422, 429;
+ * envelope with its real status: 404, 409 GENERATION_IN_PROGRESS, 409 CONFLICT, 409
+ * TOOL_APPROVAL_PENDING while an earlier reply waits for a decision, 422, 429;
  * with grounding also 404 DOCUMENT_UNAVAILABLE, 409 DOCUMENT_NOT_INDEXED, 422
  * RAG_INVALID_SCOPE and 503 when answers from documents are switched off),
  * `ApiError` NETWORK_ERROR when the connection closes before a terminal event, and the
@@ -132,8 +136,9 @@ export async function cancelGeneration(id: string): Promise<CancelResult> {
  * yielded as the events a stream would have produced: a synthetic `message_start` (the
  * reply shown as `pending`), then the terminal event matching the stored reply:
  * `message_complete` when it completed (the usual case), `message_cancelled` when it was
- * stopped, `error` (from its `error_code`) when it failed. No `text_delta` or `usage` events:
- * the terminal event's message carries the text and the token counts.
+ * stopped, `approval_required` when it is paused, `error` (from its `error_code`) when it
+ * failed. No `text_delta`, `usage` or tool events: the terminal event's message carries the
+ * text, the token counts and the tool calls.
  */
 export function sendMessage(
   id: string,
@@ -153,6 +158,30 @@ export function regenerate(
   control: RequestControl = {},
 ): AsyncGenerator<ChatStreamEvent, void, undefined> {
   return generation(`${conversationPath(id)}regenerate/`, body, control);
+}
+
+/**
+ * Approve or reject the action a paused reply (`awaiting_approval`) proposed, and stream the
+ * same reply as it continues: `message_start` (that reply, status `streaming`, with its text
+ * so far), `tool_call` and `tool_result` for the decided action, more text, then one terminal
+ * event (possibly `approval_required` again). The body must carry the `arguments_hash` of the
+ * approval shown to the user.
+ *
+ * Throws `ApiError` 409 TOOL_APPROVAL_STALE (the action changed: reload the messages),
+ * TOOL_APPROVAL_EXPIRED (too late: the reply is now cancelled), TOOL_APPROVAL_CLOSED (already
+ * decided), and 404 for an approval that is not the caller's. Aborting works as for a send.
+ */
+export function decideApproval(
+  conversationId: string,
+  approvalId: string,
+  body: ApprovalDecisionBody,
+  control: RequestControl = {},
+): AsyncGenerator<ChatStreamEvent, void, undefined> {
+  return generation(
+    `${conversationPath(conversationId)}approvals/${encodeURIComponent(approvalId)}/`,
+    body,
+    control,
+  );
 }
 
 /**
@@ -176,9 +205,12 @@ const EVENT_NAMES: ReadonlySet<string> = new Set<ChatStreamEventName>([
   "sources",
   "text_delta",
   "usage",
+  "tool_call",
+  "tool_result",
   "message_complete",
   "message_cancelled",
   "error",
+  "approval_required",
 ]);
 
 function isEventName(name: string): name is ChatStreamEventName {
@@ -199,7 +231,10 @@ export function parseChatEvent(frame: SseFrame): ChatStreamEvent | null {
 
 function isTerminal(event: ChatStreamEvent): boolean {
   return (
-    event.type === "message_complete" || event.type === "message_cancelled" || event.type === "error"
+    event.type === "message_complete" ||
+    event.type === "message_cancelled" ||
+    event.type === "error" ||
+    event.type === "approval_required"
   );
 }
 
@@ -214,7 +249,7 @@ function isExchange(value: unknown): value is Exchange {
 
 async function* generation(
   path: string,
-  body: SendMessageBody | RegenerateBody,
+  body: SendMessageBody | RegenerateBody | ApprovalDecisionBody,
   control: RequestControl,
 ): AsyncGenerator<ChatStreamEvent, void, undefined> {
   const reply = await postForStream<unknown>(path, body, {
@@ -240,6 +275,12 @@ async function* generation(
   );
 }
 
+/** The approval a paused reply waits for: the pending one among its tool calls. */
+function pendingApproval(reply: Message): Approval | null {
+  const found = (reply.tools ?? []).find((tool) => tool.approval?.status === "pending");
+  return found?.approval ?? null;
+}
+
 /** The replay of an earlier submission as stream events (see `sendMessage`). */
 function* replayEvents(exchange: Exchange): Generator<ChatStreamEvent, void, undefined> {
   const { user_message: user, assistant_message: reply } = exchange;
@@ -252,12 +293,16 @@ function* replayEvents(exchange: Exchange): Generator<ChatStreamEvent, void, und
     user_message: user,
     assistant_message: { ...reply, content: "", status: "pending" },
   };
+  const approval = reply.status === "awaiting_approval" ? pendingApproval(reply) : null;
   if (reply.status === "completed") {
     yield { type: "message_complete", message: reply };
   } else if (reply.status === "cancelled") {
     yield { type: "message_cancelled", message: reply };
+  } else if (approval) {
+    yield { type: "approval_required", message: reply, approval };
   } else {
-    // Failed (or, if the server lost track of it, never finished): report it as a failure.
+    // Failed (or, if the server lost track of it, never finished or paused without an
+    // approval to decide): report it as a failure.
     const code = reply.error_code ?? "AI_INTERNAL_ERROR";
     yield {
       type: "error",

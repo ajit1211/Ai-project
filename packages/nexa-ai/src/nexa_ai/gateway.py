@@ -62,7 +62,9 @@ from nexa_ai.router import (
 )
 from nexa_ai.structured import OutputMismatch, check_schema, parse_structured, repair_instruction
 from nexa_ai.tokens import estimate_message_tokens, estimate_text_tokens
+from nexa_ai.tools import check_tool_request, estimate_tools_tokens
 from nexa_ai.types import (
+    Capability,
     ChatRequest,
     ChatResponse,
     FinishReason,
@@ -75,8 +77,6 @@ from nexa_ai.types import (
     Role,
     StreamError,
     StreamEvent,
-    ToolCallPart,
-    ToolResultPart,
     Usage,
     UsageEvent,
 )
@@ -421,6 +421,27 @@ class Gateway:
             and any(t.is_active and t.provider in self.providers for t in alias.targets)
         ]
 
+    async def model_capabilities(
+        self, ctx: AIRequestContext, model: str | None
+    ) -> frozenset[Capability]:
+        """What a logical model can do here: the union over its active targets whose provider
+        is configured in this process. Empty when the model is unknown or not allowed. A
+        caller offers tools only when TOOL_CALLING is in it; the gateway then routes such a
+        request to the targets that support it, and refuses it when none does."""
+        _require_chat(ctx)
+        policy = await self.catalog.policy(ctx.organization_id)
+        if not policy.ai_enabled:
+            return frozenset()
+        registry = await self.catalog.registry()
+        try:
+            alias = resolve_alias(registry, policy, model)
+        except AIError:
+            return frozenset()
+        sets = [
+            t.capabilities for t in alias.targets if t.is_active and t.provider in self.providers
+        ]
+        return frozenset().union(*sets) if sets else frozenset()
+
     async def chat(self, request: ChatRequest, ctx: AIRequestContext) -> ChatResponse:
         plan = await self._plan(request, ctx, stream=False)
         tally = _Tally()
@@ -457,6 +478,7 @@ class Gateway:
             provider_model=candidate.model.provider_model,
             content=result.content,
             parsed=parsed,
+            tool_calls=list(result.tool_calls),
             finish_reason=result.finish_reason,
             usage=usage,
             latency_ms=self._elapsed_ms(plan.started),
@@ -504,7 +526,7 @@ class Gateway:
         alias = resolve_alias(registry, policy, request.model)
 
         max_output = self._max_output_tokens(request, policy)
-        estimated = estimate_message_tokens(request.messages)
+        estimated = estimate_message_tokens(request.messages) + estimate_tools_tokens(request.tools)
         required = required_capabilities(request, stream=stream)
         found = candidates(
             alias,
@@ -773,6 +795,7 @@ class Gateway:
             yield UsageEvent(usage=usage)
             yield MessageEnd(
                 finish_reason=end.finish_reason,
+                tool_calls=list(end.tool_calls),
                 latency_ms=self._elapsed_ms(plan.started),
                 attempts=tally.attempts,
                 fallback_used=candidate.is_fallback,
@@ -1039,17 +1062,19 @@ def _require_chat(ctx: AIRequestContext) -> None:
 
 
 def _reject_unsupported(request: ChatRequest, *, stream: bool) -> None:
-    """Refuse what Phase 04 cannot serve, before any model is chosen."""
+    """Refuse what cannot be served, before any model is chosen."""
     if stream and request.wants_structured_output:
         raise AIInvalidRequest("Structured output cannot be streamed yet.")
+    if request.wants_structured_output and (request.offers_tools or request.has_tool_history):
+        raise AIInvalidRequest("Tool calling cannot be combined with structured output.")
     for message in request.messages:
-        if message.role is Role.TOOL:
-            raise AIInvalidRequest("Tool messages are not supported yet.")
         for part in message.parts:
             if isinstance(part, ImagePart):
                 raise AIInvalidRequest("Image input is not supported yet.")
-            if isinstance(part, ToolCallPart | ToolResultPart):
-                raise AIInvalidRequest("Tool calls are not supported yet.")
+    if request.has_tool_history and not request.offers_tools:
+        raise AIInvalidRequest("A conversation with tool calls needs the tools it used.")
+    if request.offers_tools or request.has_tool_history or request.tool_choice != "auto":
+        check_tool_request(request)
 
 
 def _worst_case_tokens(plan: _Plan) -> int:

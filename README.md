@@ -4,7 +4,16 @@ AI Intelligence & Agent Platform. The architecture and the 20-phase plan are in
 [docs/architecture/NEXA-architecture.md](docs/architecture/NEXA-architecture.md); decisions
 made since are in [docs/adr/](docs/adr/).
 
-**Current phase: 09, vector search, embeddings and hybrid retrieval.** Document passages are
+**Current phase: 10, AI tool calling.** In the chat, the AI can use tools while it answers:
+a calculator, the clock, your documents' details and contents (searched inside your access
+rights), your workspace, and saving something to your memories, which it only proposes and you
+approve. Every call is checked, run by NEXA's own code under limits, recorded and shown in the
+reply. Details: [tools.md](docs/architecture/tools.md), [docs/api/tools.md](docs/api/tools.md),
+decision in [ADR-038](docs/adr/038-tool-calling-in-runtime.md). Without an API key the mock model
+uses tools too: try "what is 12 * (3 + 4)?", "what time is it?" or "save to memory: I prefer
+metric units".
+
+Phase 09, vector search, embeddings and hybrid retrieval: document passages are
 embedded in the background (OpenAI `text-embedding-3-small` by default; a deterministic mock in
 development) and stored with pgvector; grounded questions are answered from keyword search,
 semantic (vector) search, or both fused (hybrid, the default), always inside your access
