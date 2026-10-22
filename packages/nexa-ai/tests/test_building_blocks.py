@@ -48,7 +48,7 @@ class TestChatRequest:
             {"messages": [{"role": "user", "content": "hi"}], "max_output_tokens": 0},
             {"messages": [{"role": "user", "content": "hi"}], "model": "bad model!"},
             {"messages": [{"role": "user", "content": "hi"}], "stop": ["", "x"]},
-            {"messages": [{"role": "user", "content": "hi"}], "feature": "agent"},
+            {"messages": [{"role": "user", "content": "hi"}], "feature": "workflow"},
             # Provider-specific parameters are not part of the normalized interface.
             {"messages": [{"role": "user", "content": "hi"}], "top_k": 5},
             # Identity can never come from the body.

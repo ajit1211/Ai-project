@@ -137,6 +137,30 @@ class RuntimeSettings(BaseSettings):
     tools_calls_per_minute: int = Field(default=30, ge=1, le=600)
     tools_approval_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
 
+    # AI agents (docs/architecture/agents.md). The agents_max_* values cap what an agent's own
+    # limits may ask for; the per-run budgets are the smaller of the two.
+    agents_enabled: bool = True
+    agents_worker_enabled: bool = True
+    agents_worker_concurrency: int = Field(default=2, ge=1, le=16)
+    agents_poll_interval_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
+    agents_lease_seconds: int = Field(default=60, ge=10, le=600)
+    # How often a running run renews its lease and reads its control flags (cancel, pause):
+    # the delay before a cancellation interrupts a running tool.
+    agents_control_poll_seconds: float = Field(default=2.0, ge=0.1, le=60.0)
+    agents_shutdown_grace_seconds: float = Field(default=20.0, ge=0.0, le=300.0)
+    agents_max_steps: int = Field(default=50, ge=1, le=200)
+    agents_max_tool_calls: int = Field(default=100, ge=0, le=500)
+    agents_max_duration_seconds: int = Field(default=3600, ge=10, le=86_400)
+    agents_max_tokens: int = Field(default=1_000_000, ge=1_000, le=50_000_000)
+    agents_max_output_tokens: int = Field(default=2_048, ge=256, le=16_000)
+    agents_context_max_tokens: int = Field(default=40_000, ge=4_000, le=400_000)
+    agents_step_retries: int = Field(default=1, ge=0, le=3)
+    agents_identical_call_limit: int = Field(default=2, ge=1, le=10)
+    agents_runs_per_user: int = Field(default=3, ge=1, le=100)
+    agents_runs_per_organization: int = Field(default=20, ge=1, le=1000)
+    agents_runs_per_hour: int = Field(default=30, ge=1, le=10_000)
+    agents_approval_ttl_seconds: int = Field(default=86_400, ge=60, le=604_800)
+
     @property
     def async_database_url(self) -> URL:
         return make_url(self.runtime_database_url).set(drivername="postgresql+asyncpg")

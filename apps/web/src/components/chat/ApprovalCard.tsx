@@ -1,9 +1,9 @@
 /**
- * The action a paused reply asks the user to approve: the tool, its risk, what it would do
- * (action, target, the exact content, consequences, and anything else the tool describes),
- * and until when the request stands. Nothing happens until the user presses Approve; Reject
- * declines it. Both continue the same reply. While a decision is being sent, both buttons
- * are disabled and the one pressed says so.
+ * The action a paused reply (or agent task) asks the user to approve: the tool, its risk, what
+ * it would do (action, target, the exact content, consequences, and anything else the tool
+ * describes), and until when the request stands. Nothing happens until the user presses
+ * Approve; Reject (Decline, on a task) declines it. Both continue the same reply or task.
+ * While a decision is being sent, both buttons are disabled and the one pressed says so.
  *
  * The details are written by the tool from the model's request, so they are untrusted text:
  * shown as plain text (line breaks kept), never as HTML or Markdown.
@@ -67,9 +67,11 @@ export interface ApprovalCardProps {
   deciding?: ApprovalChoice | undefined;
   /** Left out where nothing can be decided (an archived conversation): no buttons. */
   onDecide?: ((choice: ApprovalChoice) => void) | undefined;
+  /** The word for turning the action down: "Reject" in the chat, "Decline" for agent tasks. */
+  rejectVerb?: "Reject" | "Decline";
 }
 
-export function ApprovalCard({ approval, busy, deciding, onDecide }: ApprovalCardProps) {
+export function ApprovalCard({ approval, busy, deciding, onDecide, rejectVerb = "Reject" }: ApprovalCardProps) {
   const id = useId();
   const risk = riskLabel(approval.risk);
   const rows = approvalRows(approval.details);
@@ -129,7 +131,7 @@ export function ApprovalCard({ approval, busy, deciding, onDecide }: ApprovalCar
                 onDecide("reject");
               }}
             >
-              {deciding === "reject" ? "Rejecting…" : "Reject"}
+              {deciding === "reject" ? `${rejectVerb === "Decline" ? "Declining" : "Rejecting"}…` : rejectVerb}
             </button>
           </div>
         </>

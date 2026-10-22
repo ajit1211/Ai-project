@@ -27,7 +27,7 @@ Tool results go back to the model as JSON data, and are recorded in `tool_invoca
 import asyncio
 import hashlib
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -70,22 +70,45 @@ DECLINED = "declined_by_user"
 
 @dataclass
 class Turn:
-    """One reply's tool use: who it runs for and what was offered to the model."""
+    """One reply's (or one agent run's) tool use: who it runs for and what was offered to the
+    model. Exactly one owner: a chat reply (`conversation_id` and `message_id`) or an agent
+    run (`run_id`, Phase 11)."""
 
     principal: Principal
-    conversation_id: UUID
-    message_id: UUID
     request_id: str | None
     offered: dict[str, ToolDefinition]
+    conversation_id: UUID | None = None
+    message_id: UUID | None = None
+    run_id: UUID | None = None
+    # Every call waits for the user's approval, whatever the tool says (an agent's policy).
+    approve_all: bool = False
+    # How long an approval stays open; None: the chat default (TOOLS_APPROVAL_TTL_SECONDS).
+    approval_ttl_seconds: int | None = None
     calls_made: int = 0
     output_bytes: int = 0
     seen_call_ids: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if (self.message_id is None) == (self.run_id is None):
+            raise ValueError("A turn belongs to exactly one of a message and an agent run.")
 
     @property
     def organization_id(self) -> UUID:
         if self.principal.organization_id is None:  # pragma: no cover - principals have one
             raise PermissionDenied("Select an organization first.")
         return self.principal.organization_id
+
+    @property
+    def owner_id(self) -> UUID:
+        owner = self.message_id if self.message_id is not None else self.run_id
+        assert owner is not None  # noqa: S101 - checked in __post_init__
+        return owner
+
+    def owner_fields(self) -> dict[str, Any]:
+        """The owner's ids, for records, audit metadata and logs."""
+        if self.run_id is not None:
+            return {"run_id": str(self.run_id)}
+        return {"conversation_id": str(self.conversation_id), "message_id": str(self.message_id)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,12 +208,23 @@ class ToolExecutor:
     # --- Discovery -------------------------------------------------------------------------
 
     async def offer(
-        self, principal: Principal, capabilities: frozenset[Capability]
+        self,
+        principal: Principal,
+        capabilities: frozenset[Capability],
+        *,
+        scope: str = "conversation",
+        allowed: Collection[str] | None = None,
+        require_native: bool = True,
     ) -> list[ToolDefinition]:
-        """The tools a model may be offered for this user now: switched on, permitted, and
-        only if the model can call tools at all. Offering is not authorization: every call is
-        checked again when it runs."""
-        if not self._settings.tools_enabled or Capability.TOOL_CALLING not in capabilities:
+        """The tools a model may be offered for this user now: declared for `scope`, within
+        `allowed` (an agent's own list, Phase 11), switched on, permitted, and only if the
+        model can call tools at all. Offering is not authorization: every call is checked
+        again when it runs."""
+        if not self._settings.tools_enabled:
+            return []
+        # Chat offers tools through the model's own tool calling; an agent asks for decisions
+        # as structured output and needs no native tool calling (Phase 11).
+        if require_native and Capability.TOOL_CALLING not in capabilities:
             return []
         if not principal.has(EXECUTE_PERMISSION) or principal.organization_id is None:
             return []
@@ -198,7 +232,10 @@ class ToolExecutor:
         return [
             d
             for d in self.registry.all()
-            if "conversation" in d.scopes and _enabled(d, switches) and d.allowed_for(principal)
+            if scope in d.scopes
+            and (allowed is None or d.id in allowed)
+            and _enabled(d, switches)
+            and d.allowed_for(principal)
         ]
 
     async def switches(self, organization_id: UUID) -> dict[str, tuple[bool, bool]]:
@@ -270,7 +307,7 @@ class ToolExecutor:
                 "You do not have permission to use this tool.",
                 "TOOL_PERMISSION_DENIED",
             )
-        elif definition.requires_approval and not approval_free:
+        elif (definition.requires_approval or turn.approve_all) and not approval_free:
             rejection = (
                 "one_action_at_a_time",
                 "Only one action that needs approval can be proposed at a time.",
@@ -307,7 +344,9 @@ class ToolExecutor:
 
         tool_id = definition.id if definition is not None else call.name[:64]
         needs_approval = (
-            rejection is None and definition is not None and definition.requires_approval
+            rejection is None
+            and definition is not None
+            and (definition.requires_approval or turn.approve_all)
         )
         status = (
             "rejected" if rejection else ("awaiting_approval" if needs_approval else "validated")
@@ -317,6 +356,7 @@ class ToolExecutor:
             "organization_id": turn.organization_id,
             "conversation_id": turn.conversation_id,
             "message_id": turn.message_id,
+            "run_id": turn.run_id,
             "user_id": turn.principal.user_id,
             "step": step,
             "position": position,
@@ -332,7 +372,7 @@ class ToolExecutor:
             "error_code": rejection[0] if rejection else "",
             "error_message": rejection[1] if rejection else "",
             "sources": [],
-            "idempotency_key": _idempotency_key(turn.message_id, step, position, call),
+            "idempotency_key": _idempotency_key(turn.owner_id, step, position, call),
         }
         if rejection:
             values["completed_at"] = repo.now()
@@ -341,7 +381,14 @@ class ToolExecutor:
             row, created = await repo.record_invocation(conn, **values)
             if created and needs_approval and definition is not None:
                 details = (
-                    definition.approval_details(arguments) if definition.approval_details else {}
+                    definition.approval_details(arguments)
+                    if definition.approval_details
+                    else {
+                        "action": definition.name,
+                        "summary": summary,
+                        "arguments": redacted(definition, arguments),
+                        "consequences": "The agent will run this tool with these arguments.",
+                    }
                 )
                 approval = await repo.create_approval(
                     conn,
@@ -355,7 +402,10 @@ class ToolExecutor:
                     arguments_hash=digest,
                     risk=definition.risk,
                     expires_at=repo.now()
-                    + timedelta(seconds=self._settings.tools_approval_ttl_seconds),
+                    + timedelta(
+                        seconds=turn.approval_ttl_seconds
+                        or self._settings.tools_approval_ttl_seconds
+                    ),
                 )
                 approval_id = approval.id
         if not created:
@@ -481,9 +531,10 @@ class ToolExecutor:
 
         context = ToolContext(
             principal=principal,
+            invocation_id=item.invocation_id,
             conversation_id=turn.conversation_id,
             message_id=turn.message_id,
-            invocation_id=item.invocation_id,
+            run_id=turn.run_id,
             request_id=turn.request_id,
         )
         started = self._clock()
@@ -614,11 +665,17 @@ class ToolExecutor:
         approval_id: UUID,
         tool_id: str,
         decision: str,
-        conversation_id: UUID,
-        message_id: UUID,
         request_id: str | None,
+        conversation_id: UUID | None = None,
+        message_id: UUID | None = None,
+        run_id: UUID | None = None,
     ) -> None:
         log.info("tools.approval.decided", tool_id=tool_id, decision=decision)
+        owner = (
+            {"run_id": str(run_id)}
+            if run_id is not None
+            else {"conversation_id": str(conversation_id), "message_id": str(message_id)}
+        )
         await self._audit.record(
             "TOOL_APPROVAL_DECIDED",
             organization_id=principal.organization_id,
@@ -630,8 +687,7 @@ class ToolExecutor:
                 "tool_id": tool_id,
                 "approval_id": str(approval_id),
                 "decision": decision,
-                "conversation_id": str(conversation_id),
-                "message_id": str(message_id),
+                **owner,
             },
         )
 
@@ -667,11 +723,7 @@ class ToolExecutor:
             resource_type="tool_invocation",
             resource_id=str(invocation_id),
             request_id=turn.request_id,
-            metadata={
-                **metadata,
-                "conversation_id": str(turn.conversation_id),
-                "message_id": str(turn.message_id),
-            },
+            metadata={**metadata, **turn.owner_fields()},
         )
 
 
@@ -697,8 +749,8 @@ def _approved(approval: Any, digest: str, user_id: UUID) -> bool:
     )
 
 
-def _idempotency_key(message_id: UUID, step: int, position: int, call: ToolCallPart) -> str:
-    raw = f"{message_id}|{step}|{position}|{call.id}|{call.name}"
+def _idempotency_key(owner_id: UUID, step: int, position: int, call: ToolCallPart) -> str:
+    raw = f"{owner_id}|{step}|{position}|{call.id}|{call.name}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 

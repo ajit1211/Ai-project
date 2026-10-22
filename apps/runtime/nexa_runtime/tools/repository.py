@@ -164,6 +164,74 @@ async def count_for_message(conn: AsyncConnection, message_id: UUID) -> int:
     return len(rows.all())
 
 
+async def cancel_open_run(conn: AsyncConnection, run_id: UUID) -> int:
+    """As `cancel_open`, for an agent run that ended."""
+    result = await conn.execute(
+        update(t.tool_invocations)
+        .where(
+            t.tool_invocations.c.run_id == run_id,
+            t.tool_invocations.c.status.in_(("requested", "validated", "approved", "executing")),
+        )
+        .values(
+            status="cancelled",
+            error_code="cancelled",
+            error_message="Stopped before the tool finished.",
+            completed_at=now(),
+        )
+    )
+    return result.rowcount
+
+
+async def close_pending_approvals_of_run(
+    conn: AsyncConnection, run_id: UUID, *, status: str
+) -> int:
+    """As `close_pending_approvals`, for an agent run."""
+    ids = select(t.tool_invocations.c.id).where(t.tool_invocations.c.run_id == run_id)
+    closed = await conn.execute(
+        update(t.tool_approvals)
+        .where(t.tool_approvals.c.invocation_id.in_(ids), t.tool_approvals.c.status == "pending")
+        .values(status=status, decided_at=now())
+        .returning(t.tool_approvals.c.invocation_id)
+    )
+    invocation_ids = [row.invocation_id for row in closed.all()]
+    if invocation_ids:
+        await conn.execute(
+            update(t.tool_invocations)
+            .where(
+                t.tool_invocations.c.id.in_(invocation_ids),
+                t.tool_invocations.c.status == "awaiting_approval",
+            )
+            .values(
+                status="cancelled",
+                error_code="approval_" + status,
+                error_message="The action was not approved in time."
+                if status == "expired"
+                else "The action is no longer pending.",
+                completed_at=now(),
+            )
+        )
+    return len(invocation_ids)
+
+
+async def invocations_of_run(conn: AsyncConnection, run_id: UUID) -> list[InvocationRow]:
+    return list(
+        (
+            await conn.execute(
+                select(t.tool_invocations)
+                .where(t.tool_invocations.c.run_id == run_id)
+                .order_by(t.tool_invocations.c.step, t.tool_invocations.c.position)
+            )
+        ).all()
+    )
+
+
+async def count_for_run(conn: AsyncConnection, run_id: UUID) -> int:
+    rows = await conn.execute(
+        select(t.tool_invocations.c.id).where(t.tool_invocations.c.run_id == run_id)
+    )
+    return len(rows.all())
+
+
 # --- Approvals -----------------------------------------------------------------------------
 
 

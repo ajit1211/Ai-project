@@ -25,6 +25,7 @@ export function AppShell() {
           <NavLink to="/chat">Chat</NavLink>
           <NavLink to="/documents">Documents</NavLink>
           <NavLink to="/memories">Memories</NavLink>
+          <NavLink to="/agents">Agents</NavLink>
           <NavLink to="/playground">Playground</NavLink>
           <NavLink to="/settings">Settings</NavLink>
         </nav>

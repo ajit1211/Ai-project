@@ -1,6 +1,6 @@
 /**
  * NEXA's line icons (24×24, drawn with the current text colour), first made for the chat and
- * shared by the document pages. Decorative: the button or link carries the name.
+ * shared by the document and agent pages. Decorative: the button or link carries the name.
  */
 
 const PATHS = {
@@ -32,6 +32,14 @@ const PATHS = {
   ban: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M5.6 5.6l12.8 12.8"],
   clock: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M12 7v5l3 2"],
   shield: ["M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z", "M12 8v4", "M12 15h.01"],
+  // Agent tasks: a decision, a tool call, a progress note; pausing and resuming.
+  spark: ["M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8Z", "M19 17v4", "M17 19h4"],
+  tool: [
+    "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9Z",
+  ],
+  message: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z"],
+  pause: ["M8 5v14", "M16 5v14"],
+  play: ["M7 4l13 8-13 8Z"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type IconName = keyof typeof PATHS;

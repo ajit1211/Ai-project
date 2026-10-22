@@ -83,6 +83,7 @@ INSTALLED_APPS = [
     "nexa_core.memory",
     "nexa_core.documents",
     "nexa_core.tools",
+    "nexa_core.agents",
     "nexa_core.system",
 ]
 

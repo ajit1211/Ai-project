@@ -3,14 +3,19 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { AuthProvider } from "./auth/AuthContext";
 import { ProtectedRoute, PublicOnlyRoute } from "./auth/routes";
 import { AppShell } from "./components/AppShell";
+import { AgentFormPage } from "./pages/AgentFormPage";
+import { AgentsPage } from "./pages/AgentsPage";
 import { ChatRoute } from "./pages/ChatRoute";
 import { DashboardPage } from "./pages/DashboardPage";
 import { DocumentDetailPage } from "./pages/DocumentDetailPage";
 import { DocumentsPage } from "./pages/DocumentsPage";
 import { MemoriesPage } from "./pages/MemoriesPage";
 import { InvitationPage } from "./pages/InvitationPage";
+import { NewRunPage } from "./pages/NewRunPage";
 import { OrganizationPage } from "./pages/OrganizationPage";
 import { PlaygroundPage } from "./pages/PlaygroundPage";
+import { RunPage } from "./pages/RunPage";
+import { RunsPage } from "./pages/RunsPage";
 import {
   NotificationSettings,
   OrganizationSettings,
@@ -55,6 +60,13 @@ export function App() {
               <Route path="/documents" element={<DocumentsPage />} />
               <Route path="/documents/:id" element={<DocumentDetailPage />} />
               <Route path="/memories" element={<MemoriesPage />} />
+              {/* Agents and their tasks; "new" and "runs" rank above an agent id. */}
+              <Route path="/agents" element={<AgentsPage />} />
+              <Route path="/agents/new" element={<AgentFormPage />} />
+              <Route path="/agents/:agentId/edit" element={<AgentFormPage />} />
+              <Route path="/agents/:agentId/run" element={<NewRunPage />} />
+              <Route path="/agents/runs" element={<RunsPage />} />
+              <Route path="/agents/runs/:runId" element={<RunPage />} />
               <Route path="/playground" element={<PlaygroundPage />} />
               <Route path="/organizations/:organizationId" element={<OrganizationPage />} />
               <Route path="/settings" element={<SettingsLayout />}>

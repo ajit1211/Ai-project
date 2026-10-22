@@ -1,8 +1,8 @@
-"""Tool events in the shared audit log (`audit_logs`, owned by Core's audit app).
+"""Tool and agent-run events in the shared audit log (`audit_logs`, owned by Core's audit app).
 
 The action names, categories and severities are the ones Core declares
-(nexa_core.audit.actions: TOOL_*), so investigations see one timeline whichever service wrote
-the row. Metadata carries ids, the tool, its version, the outcome and error codes: never
+(nexa_core.audit.actions: TOOL_*, AGENT_RUN_*), so investigations see one timeline whichever
+service wrote the row. Metadata carries ids, the tool, its version, the outcome and error codes: never
 arguments, results, document text or anything secret. A failed audit write is logged and
 never fails the call it describes.
 """
@@ -30,6 +30,12 @@ ACTIONS: dict[str, tuple[str, str]] = {
     "TOOL_APPROVAL_REQUESTED": ("audit", "info"),
     "TOOL_APPROVAL_DECIDED": ("audit", "info"),
     "TOOL_SETTINGS_CHANGED": ("security", "info"),
+    "AGENT_RUN_STARTED": ("audit", "info"),
+    "AGENT_RUN_COMPLETED": ("audit", "info"),
+    "AGENT_RUN_FAILED": ("audit", "info"),
+    "AGENT_RUN_CANCELLED": ("audit", "info"),
+    "AGENT_RUN_PAUSED": ("audit", "info"),
+    "AGENT_RUN_RESUMED": ("audit", "info"),
 }
 
 

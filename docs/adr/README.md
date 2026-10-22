@@ -27,5 +27,6 @@ ADR-00N"; they are filed under their NEXA numbers:
 | [036](036-rag-in-chat-lexical-baseline.md) | Document-grounded answers inside the chat engine, lexical retrieval first, validated inline citations | 08 |
 | [037](037-pgvector-hybrid-retrieval.md) | Embeddings in PostgreSQL with pgvector, hybrid retrieval by reciprocal rank fusion, keyword search as the floor | 09 |
 | [038](038-tool-calling-in-runtime.md) | Tool calling in Runtime: gateway-normalized calls, a code-defined registry, one checked executor, approvals that pause the reply | 10 |
+| [039](039-agent-runs-in-runtime.md) | Agent runs in Runtime: definitions in Core, a database-leased run queue, one structured decision per step, tools only through the Phase 10 executor | 11 |
 
 Format: context, decision, alternatives, consequences. Status is *accepted* unless noted.

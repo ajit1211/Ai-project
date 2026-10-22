@@ -63,6 +63,11 @@ class ErrorCode(StrEnum):
     TOOL_APPROVAL_EXPIRED = "TOOL_APPROVAL_EXPIRED"
     TOOL_APPROVAL_STALE = "TOOL_APPROVAL_STALE"
     TOOL_APPROVAL_CLOSED = "TOOL_APPROVAL_CLOSED"
+    # AI agents (Phase 11, docs/architecture/agents.md).
+    AGENT_UNAVAILABLE = "AGENT_UNAVAILABLE"
+    RUN_NOT_ACTIVE = "RUN_NOT_ACTIVE"
+    RUN_LIMIT_REACHED = "RUN_LIMIT_REACHED"
+    TOOL_NOT_ALLOWED = "TOOL_NOT_ALLOWED"
 
 
 DEFAULT_MESSAGES: dict[ErrorCode, str] = {
@@ -115,6 +120,10 @@ DEFAULT_MESSAGES: dict[ErrorCode, str] = {
         "The action changed since it was shown to you. Review it again before deciding."
     ),
     ErrorCode.TOOL_APPROVAL_CLOSED: "This action is no longer waiting for a decision.",
+    ErrorCode.AGENT_UNAVAILABLE: "That agent is not available.",
+    ErrorCode.RUN_NOT_ACTIVE: "The task is not in a state that allows this.",
+    ErrorCode.RUN_LIMIT_REACHED: "Too many tasks are in progress. Please wait for one to finish.",
+    ErrorCode.TOOL_NOT_ALLOWED: "That tool cannot be given to this agent.",
 }
 
 

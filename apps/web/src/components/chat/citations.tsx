@@ -1,6 +1,7 @@
 /**
  * Citation markers of a grounded reply ([S1], [S1][S3], [S1, S2]) as small buttons that lead
- * to the cited passage.
+ * to the cited passage. An agent task's answer cites its references the same way with R
+ * labels ([R1]): the `prefix` option picks which letter a pipeline looks for.
  *
  * `rehypeCitations` is a step of the reply's Markdown pipeline. It looks at text nodes only,
  * never inside code, pre or links, and wraps each marker in a `cite` carrier element that
@@ -21,14 +22,20 @@ interface HastParent {
   children: HastChild[];
 }
 
-const MARKER = /\[(S\d+(?:\s*,\s*S\d+)*)\]/g;
+/** The letter of the labels: S for a grounded reply's sources, R for an agent task's references. */
+export type CitationPrefix = "S" | "R";
+
+const MARKERS: Readonly<Record<CitationPrefix, RegExp>> = {
+  S: /\[(S\d+(?:\s*,\s*S\d+)*)\]/g,
+  R: /\[(R\d+(?:\s*,\s*R\d+)*)\]/g,
+};
 /** Code shows markers as typed; links and buttons cannot hold another button. */
 const SKIPPED: ReadonlySet<string> = new Set(["code", "pre", "a", "button"]);
 
-function split(value: string): HastChild[] {
+function split(value: string, marker: RegExp): HastChild[] {
   const parts: HastChild[] = [];
   let last = 0;
-  for (const match of value.matchAll(MARKER)) {
+  for (const match of value.matchAll(marker)) {
     const raw = match[0];
     const labels = (match[1] ?? "").split(",").map((label) => label.trim());
     if (match.index > last) parts.push({ type: "text", value: value.slice(last, match.index) });
@@ -45,18 +52,24 @@ function split(value: string): HastChild[] {
   return parts;
 }
 
-function transform(parent: HastParent): void {
+function transform(parent: HastParent, marker: RegExp): void {
   parent.children = parent.children.flatMap((child) => {
-    if (child.type === "text") return split(child.value);
-    if (child.type === "element" && !SKIPPED.has(child.tagName)) transform(child);
+    if (child.type === "text") return split(child.value, marker);
+    if (child.type === "element" && !SKIPPED.has(child.tagName)) transform(child, marker);
     return [child];
   });
 }
 
+export interface CitationOptions {
+  /** Which labels are markers (default "S"). */
+  prefix?: CitationPrefix;
+}
+
 /** The rehype step: citation markers in text become `cite` carriers (see the module comment). */
-export function rehypeCitations() {
+export function rehypeCitations(options: CitationOptions = {}) {
+  const marker = MARKERS[options.prefix ?? "S"];
   return (tree: HastParent): void => {
-    transform(tree);
+    transform(tree, marker);
   };
 }
 
@@ -137,7 +150,7 @@ export function CitationMarker({ node, children }: { node?: HastElement; childre
               context.onCite(label);
             }}
           >
-            {label.replace(/^S/, "")}
+            {label.replace(/^[SR]/, "")}
           </button>
         );
       })}

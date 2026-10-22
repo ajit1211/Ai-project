@@ -101,7 +101,9 @@ class ApprovalDecision(BaseModel):
 
 
 class InvocationOut(ToolActivityOut):
-    conversation_id: UUID
-    message_id: UUID
+    # The owner: a chat reply, or an agent run (Phase 11).
+    conversation_id: UUID | None = None
+    message_id: UUID | None = None
+    run_id: UUID | None = None
     created_at: datetime
     completed_at: datetime | None = None

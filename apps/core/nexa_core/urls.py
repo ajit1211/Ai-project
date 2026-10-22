@@ -6,6 +6,7 @@ Core owns every `/api/v1` prefix except the Runtime ones listed in doc 18.2.
 from django.contrib import admin
 from django.urls import URLPattern, URLResolver, include, path
 
+from nexa_core.agents.urls import urlpatterns as agent_urls
 from nexa_core.ai.urls import urlpatterns as ai_urls
 from nexa_core.audit.views import AuditLogListView
 from nexa_core.documents.urls import urlpatterns as document_urls
@@ -19,6 +20,7 @@ api_v1: list[URLPattern | URLResolver] = [
     *organization_urls,
     *ai_urls,
     *document_urls,
+    *agent_urls,
     path(
         "organizations/<uuid:organization_id>/audit-logs/",
         AuditLogListView.as_view(),

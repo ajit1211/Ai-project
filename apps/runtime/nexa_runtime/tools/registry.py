@@ -51,9 +51,11 @@ class ToolContext:
     anything the model or the client supplied."""
 
     principal: Principal
-    conversation_id: UUID
-    message_id: UUID
     invocation_id: UUID
+    # The call's owner: a chat reply, or an agent run (Phase 11).
+    conversation_id: UUID | None = None
+    message_id: UUID | None = None
+    run_id: UUID | None = None
     request_id: str | None = None
 
     @property
@@ -95,8 +97,9 @@ class ToolDefinition:
     handler: Handler
     # Checked when the tool is offered and again when a call runs (on top of ai.tool.execute).
     permissions: frozenset[str] = frozenset()
-    # Where the tool may be used; Phase 10 offers tools in conversations only.
-    scopes: frozenset[str] = frozenset({"conversation"})
+    # Where the tool may be used: in chat replies ("conversation") and by agents ("agent",
+    # Phase 11). A tool declares fewer scopes to keep itself out of one of them.
+    scopes: frozenset[str] = frozenset({"conversation", "agent"})
     risk: Risk = "low"
     read_only: bool = True
     requires_approval: bool = False

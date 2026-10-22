@@ -62,6 +62,8 @@ class Feature(StrEnum):
     RAG = "rag"
     # Set for embedding calls: document chunks (Core) and questions (Runtime), Phase 09.
     EMBEDDING = "embedding"
+    # Set by the agent engine for a run's model calls (Phase 11).
+    AGENT = "agent"
 
 
 class FinishReason(StrEnum):

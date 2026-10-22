@@ -74,7 +74,8 @@ class ToolSetting(models.Model):
 
 
 class ToolInvocation(models.Model):
-    """One tool call a model asked for while answering a message, and what became of it.
+    """One tool call a model asked for while answering a message or running an agent task
+    (Phase 11: `run`), and what became of it. Exactly one of `message` and `run` is set.
 
     `arguments` are the validated arguments with sensitive values redacted; `result` the
     validated, size-bounded output (large document text is never copied here: document tools
@@ -96,10 +97,25 @@ class ToolInvocation(models.Model):
     id = models.UUIDField(primary_key=True, default=new_id, editable=False)
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="+")
     conversation = models.ForeignKey(
-        "chat.Conversation", on_delete=models.CASCADE, related_name="tool_invocations"
+        "chat.Conversation",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="tool_invocations",
     )
     message = models.ForeignKey(
-        "chat.Message", on_delete=models.CASCADE, related_name="tool_invocations"
+        "chat.Message",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="tool_invocations",
+    )
+    run = models.ForeignKey(
+        "agents.AgentRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="tool_invocations",
     )
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="tool_invocations"
@@ -131,7 +147,21 @@ class ToolInvocation(models.Model):
         ordering = ("message", "step", "position")
         constraints = [
             models.UniqueConstraint(
-                fields=["message", "step", "position"], name="tool_invocations_order_uniq"
+                fields=["message", "step", "position"],
+                condition=Q(message__isnull=False),
+                name="tool_invocations_order_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["run", "step", "position"],
+                condition=Q(run__isnull=False),
+                name="tool_invocations_run_order_uniq",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(message__isnull=False, conversation__isnull=False, run__isnull=True)
+                    | Q(message__isnull=True, conversation__isnull=True, run__isnull=False)
+                ),
+                name="tool_invocations_owner_chk",
             ),
             # Target of the composite key that keeps an approval in its tenant.
             models.UniqueConstraint(

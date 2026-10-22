@@ -204,7 +204,7 @@ class MockProvider:
             repaired = _is_repair_attempt(call)
             if "[[bad_json]]" in asked or ("[[bad_json_once]]" in asked and not repaired):
                 return '{"this is": not json', FinishReason.STOP
-            canned = _canned_structured(fmt.name, call)
+            canned = _canned_structured(fmt.name, call, self.control_phrases)
             if canned is not None:
                 return json.dumps(canned), FinishReason.STOP
             return json.dumps(example_for_schema(fmt.json_schema)), FinishReason.STOP
@@ -449,12 +449,142 @@ def _block(text: str, tag: str) -> str:
     return match.group(1) if match else text
 
 
-def _canned_structured(schema_name: str, call: ProviderCall) -> dict[str, Any] | None:
+def _canned_structured(
+    schema_name: str, call: ProviderCall, control_phrases: bool = True
+) -> dict[str, Any] | None:
     text = _last_user_text(call)
     if schema_name == "memory_extraction":
         return {"memories": _mock_memories(_block(text, "user_message"))}
     if schema_name == "conversation_summary":
         return _mock_summary(text)
+    if schema_name == "agent_decision":
+        return _mock_agent_decision(call, control_phrases)
+    return None
+
+
+# --- Agent decisions (nexa_runtime.agents, Phase 11) -----------------------------------------------
+#
+# An agent run asks for one decision per step as structured output. Control phrases in the
+# goal script the decisions, one per step, in order:
+#
+#     [[agent:call_tool NAME {"json": "arguments"}]]   call NAME (then the result comes back)
+#     [[agent:request_approval NAME {...}]]            call NAME once the user approves
+#     [[agent:loop NAME {...}]]                        call NAME on this and every later step
+#     [[agent:progress TEXT]]                          report progress
+#     [[agent:complete TEXT]] / [[agent:complete {"json": "output"}]]   finish
+#     [[agent:fail TEXT]]                              give up
+#     [[agent:invalid]]                                a decision that fails validation
+#     [[agent:garbage]]                                an answer that does not match the schema
+#
+# Without phrases the mock behaves like a careful document assistant: it searches the
+# documents with the goal, then answers from the first result (citing it) or says the
+# documents do not answer. That is what the demonstration agent runs on without an API key.
+
+_AGENT_PHRASE = re.compile(
+    r"\[\[agent:(call_tool|request_approval|loop|progress|complete|fail|invalid|garbage)(?:\s+(.*?))?\]\]",
+    re.DOTALL,
+)
+_OBSERVATION = re.compile(r"```json\n(.*?)\n```", re.DOTALL)
+_REPAIR = "Your previous answer did not match the required JSON schema"
+
+
+def _mock_agent_decision(call: ProviderCall, control_phrases: bool) -> dict[str, Any]:
+    messages = call.request.messages
+    goal = next((m.text for m in messages if m.role is Role.USER), "")
+    step = sum(1 for m in messages if m.role is Role.ASSISTANT)
+    if messages and messages[-1].role is Role.USER and messages[-1].text.startswith(_REPAIR):
+        step -= 1  # the gateway's repair turn: the same step again, not the next one
+    if control_phrases:
+        phrases = _AGENT_PHRASE.findall(goal)
+        loop = next((rest for kind, rest in phrases if kind == "loop"), None)
+        if loop is not None and step >= next(i for i, (k, _) in enumerate(phrases) if k == "loop"):
+            return _scripted("call_tool", loop)
+        if step < len(phrases):
+            kind, rest = phrases[step]
+            return _scripted(kind, rest)
+        if phrases:
+            return {"action": "complete", "answer": "Done.", "summary": "Finishing"}
+    if step == 0:
+        return {
+            "action": "call_tool",
+            "tool": "search_documents",
+            "arguments": {"query": _goal_query(goal)},
+            "summary": "Searching the documents",
+        }
+    observation = _last_observation(messages)
+    results: list[Any] = []
+    if isinstance(observation, dict) and isinstance(observation.get("result"), dict):
+        results = observation["result"].get("results") or []
+    if results:
+        first = results[0]
+        answer = (
+            f"According to the documents: {' '.join(str(first.get('excerpt', '')).split())} "
+            f"[{first.get('ref', 'R1')}]"
+        )
+        return {
+            "action": "complete",
+            "answer": answer,
+            "output": {"answer": answer, "answered": True},
+            "summary": "Answering from the documents",
+        }
+    answer = "The available documents do not answer this question."
+    return {
+        "action": "complete",
+        "answer": answer,
+        "output": {"answer": answer, "answered": False},
+        "summary": "No evidence found",
+    }
+
+
+def _scripted(kind: str, rest: str) -> dict[str, Any]:
+    rest = (rest or "").strip()
+    if kind in ("call_tool", "loop", "request_approval"):
+        name, _, arguments = rest.partition(" ")
+        decoded, _ = decode_arguments(arguments)
+        if kind == "request_approval":
+            return {
+                "action": "request_approval",
+                "tool": name,
+                "arguments": decoded,
+                "message": "Please confirm this action before I take it.",
+                "summary": f"Asking to run {name}",
+            }
+        return {
+            "action": "call_tool",
+            "tool": name,
+            "arguments": decoded,
+            "summary": f"Calling {name}",
+        }
+    if kind == "progress":
+        return {"action": "report_progress", "message": rest or "Working on it."}
+    if kind == "complete":
+        if rest.startswith("{"):
+            output, _ = decode_arguments(rest)
+            return {"action": "complete", "answer": "Done.", "output": output}
+        return {"action": "complete", "answer": rest or "Done."}
+    if kind == "fail":
+        return {"action": "fail", "reason": rest or "Cannot do this."}
+    if kind == "garbage":
+        return {"action": "dance", "steps": 3}  # not the decision schema: repaired, then refused
+    return {"action": "call_tool"}  # invalid: no tool named
+
+
+def _goal_query(goal: str) -> str:
+    body = goal.split("## Input", 1)[0]
+    body = body.replace("## Goal", "").strip()
+    return " ".join(body.split())[:200] or "documents"
+
+
+def _last_observation(messages: Any) -> Any:
+    for message in reversed(messages):
+        if message.role is Role.USER and message.text.startswith("Observation"):
+            match = _OBSERVATION.search(message.text)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    return None
+            return None
     return None
 
 

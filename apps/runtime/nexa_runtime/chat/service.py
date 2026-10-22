@@ -860,7 +860,7 @@ class ChatService:
         )
         if gen.resume is not None:
             async with self._engine.connect() as conn:
-                turn.calls_made = await tools_repo.count_for_message(conn, turn.message_id)
+                turn.calls_made = await tools_repo.count_for_message(conn, gen.assistant_message.id)
         log.info(
             "chat.tools.offered",
             message_id=str(gen.assistant_message.id),

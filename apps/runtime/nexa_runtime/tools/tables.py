@@ -25,8 +25,10 @@ tool_invocations = Table(
     metadata,
     Column("id", Uuid, primary_key=True),
     Column("organization_id", Uuid, nullable=False),
-    Column("conversation_id", Uuid, nullable=False),
-    Column("message_id", Uuid, nullable=False),
+    # Exactly one owner: a chat reply (conversation and message) or an agent run (Phase 11).
+    Column("conversation_id", Uuid),
+    Column("message_id", Uuid),
+    Column("run_id", Uuid),
     Column("user_id", Uuid, nullable=False),
     Column("step", SmallInteger, nullable=False),
     Column("position", SmallInteger, nullable=False),

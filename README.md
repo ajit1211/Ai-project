@@ -4,14 +4,23 @@ AI Intelligence & Agent Platform. The architecture and the 20-phase plan are in
 [docs/architecture/NEXA-architecture.md](docs/architecture/NEXA-architecture.md); decisions
 made since are in [docs/adr/](docs/adr/).
 
-**Current phase: 10, AI tool calling.** In the chat, the AI can use tools while it answers:
-a calculator, the clock, your documents' details and contents (searched inside your access
-rights), your workspace, and saving something to your memories, which it only proposes and you
-approve. Every call is checked, run by NEXA's own code under limits, recorded and shown in the
-reply. Details: [tools.md](docs/architecture/tools.md), [docs/api/tools.md](docs/api/tools.md),
-decision in [ADR-038](docs/adr/038-tool-calling-in-runtime.md). Without an API key the mock model
-uses tools too: try "what is 12 * (3 + 4)?", "what time is it?" or "save to memory: I prefer
-metric units".
+**Current phase: 11, AI agents and tasks.** At `/agents`, give a goal to an agent and let it
+work: it decides one step at a time, uses the tools it is allowed (through the same checked
+executor as the chat), asks you before any action that needs approval, and answers with
+citations. Tasks run in the background, survive restarts, stay within step, tool-call, time and
+token budgets, and can be watched live, paused, resumed or cancelled; an agent never has more
+authority than the person who runs it. Start with the built-in **Document Assistant** (it
+searches your documents and cites them), or create your own agents. Details:
+[agents.md](docs/architecture/agents.md), [docs/api/agents.md](docs/api/agents.md), decision in
+[ADR-039](docs/adr/039-agent-runs-in-runtime.md). Without an API key the mock model plays the
+Document Assistant; scripted phrases such as `[[agent:call_tool calculator {"expression":
+"6*7"}]] [[agent:complete Done]]` drive any other agent.
+
+Phase 10, AI tool calling: in the chat, the AI can use tools while it answers (a calculator,
+the clock, your documents, your workspace, and saving to your memories after your approval);
+every call is checked, run by NEXA's own code under limits, recorded and shown in the reply
+([tools.md](docs/architecture/tools.md), [docs/api/tools.md](docs/api/tools.md),
+[ADR-038](docs/adr/038-tool-calling-in-runtime.md)).
 
 Phase 09, vector search, embeddings and hybrid retrieval: document passages are
 embedded in the background (OpenAI `text-embedding-3-small` by default; a deterministic mock in
@@ -45,19 +54,21 @@ and identity and access (Phase 03, [authentication.md](docs/architecture/authent
 [security.md](docs/architecture/security.md)).
 
 ```text
-React (/chat, /documents, /memories) ──► edge (Vite proxy) ──► FastAPI /api/v1/conversations, /memories, /ai
-                                                       └──► Django   /api/v1/auth, /users, /organizations,
-                                                                     /documents, /ai/usage
+React (/chat, /documents, /memories, /agents) ──► edge (Vite proxy) ──► FastAPI /api/v1/conversations, /memories,
+                                                                         /ai, /tools, /runs
+                                                                └──► Django  /api/v1/auth, /users, /organizations,
+                                                                             /documents, /agents, /ai/usage
 Django ──► Celery (core.documents): extraction, search index, embeddings ──► private file storage
-FastAPI ──► memory engine + document retrieval (RAG) ──► AI Gateway ──► Anthropic | OpenAI | mock
+FastAPI ──► memory engine + document retrieval (RAG) + tools ──► AI Gateway ──► Anthropic | OpenAI | mock
+FastAPI ──► agent run workers (queue in PostgreSQL, leases) ──► decision loop ──► tools / AI Gateway
                                                    (one PostgreSQL; Django owns the schema)
 ```
 
 | Part | Where | What it is |
 | --- | --- | --- |
-| React | http://localhost:5173 | `apps/web`: chat workspace, memories, sign-in, settings, organization switcher, the AI playground; `/status` shows the stack |
-| Django | http://localhost:8000 | `apps/core`: the control plane (identity, organizations, roles, audit, AI catalog, usage ledger, the schema of every table, admin) |
-| FastAPI | http://localhost:8001 | `apps/runtime`: the AI plane (`/api/v1/conversations/*`, `/api/v1/memories/*`, `/api/v1/ai/*`) |
+| React | http://localhost:5173 | `apps/web`: chat workspace, documents, memories, agents and tasks, sign-in, settings, organization switcher, the AI playground; `/status` shows the stack |
+| Django | http://localhost:8000 | `apps/core`: the control plane (identity, organizations, roles, audit, AI catalog, usage ledger, agent definitions, the schema of every table, admin) |
+| FastAPI | http://localhost:8001 | `apps/runtime`: the AI plane (`/api/v1/conversations/*`, `/api/v1/memories/*`, `/api/v1/ai/*`, `/api/v1/tools/*`, `/api/v1/runs/*`) and the agent run workers |
 | PostgreSQL | localhost:5433 (project-local) | One database, two roles: `nexa_core` and `nexa_runtime` |
 | Redis | localhost:6379 | Rate limits, AI quotas, Celery broker and pub/sub (db 0), cache (db 1) |
 | Celery | worker process | Emails and background jobs on `core.default`, `core.email` and `core.documents` (extraction, indexing, retention) |
@@ -113,6 +124,9 @@ as down. Without AI provider keys the mock provider answers; add `AI_ANTHROPIC_A
 | `uv run python scripts/e2e_memory.py` | Walks the memory engine (extraction, refusals, approval, manual memories, search, isolation, settings, clearing) against the running stack |
 | `uv run python scripts/e2e_documents.py` | Walks the document pipeline (uploads in every format, processing, indexing, text, preview, download, refusals, retry, isolation, deletion) against the running stack |
 | `uv run python scripts/e2e_rag.py` | Walks document-grounded chat (sources, citations, no-evidence, fabricated citations, isolation, deletion) against the running stack |
+| `uv run python scripts/e2e_tools.py` | Walks tool calling in the chat (calculator, clock, document tools, approvals, switches, isolation) against the running stack |
+| `uv run python scripts/e2e_agents.py` | Walks agents and tasks (library, agent versions, the Document Assistant with citations, steps and progress stream, approvals, pause/resume, cancel, isolation) against the running stack |
+| `uv run python -m nexa_runtime.agents.worker` | A process that only executes agent tasks (for `AGENTS_WORKER_ENABLED=false` on the API processes); `pnpm dev` does not need it |
 | `uv run pytest -s apps/runtime/tests/test_rag_eval.py` | Prints the retrieval and citation evaluation on the synthetic set |
 | `uv run pytest -s apps/runtime/tests/test_rag_eval_modes.py` | Compares lexical, semantic and hybrid retrieval (needs pgvector) |
 | `uv run python apps/core/manage.py setup_vector_search` | Says whether semantic search runs here and creates the vector table when pgvector is installed |

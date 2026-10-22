@@ -12,6 +12,9 @@ from nexa_ai.embeddings import Embedder, EmbeddingProvider, build_embedding_prov
 from nexa_ai.gateway import Gateway
 from nexa_ai.providers.base import AIProvider
 from nexa_common.logs import configure_logging
+from nexa_runtime.agents.engine import AgentEngine
+from nexa_runtime.agents.runner import AgentRunner
+from nexa_runtime.agents.service import AgentService
 from nexa_runtime.ai.catalog import DatabaseCatalog
 from nexa_runtime.ai.providers import build_providers, timeouts
 from nexa_runtime.ai.quota import RedisQuota
@@ -144,9 +147,33 @@ def create_app(
             rag=app.state.rag,
             tools=app.state.tools,
         )
+        # AI agents (docs/architecture/agents.md): the bounded execution engine, the in-process
+        # run worker (claims queued runs from PostgreSQL) and the `/runs` API.
+        app.state.agent_engine = AgentEngine(
+            engine=app.state.engine,
+            gateway=app.state.gateway,
+            tools=app.state.tools,
+            settings=settings,
+            audit=tool_audit,
+        )
+        app.state.runner = AgentRunner(
+            engine=app.state.engine, agent_engine=app.state.agent_engine, settings=settings
+        )
+        app.state.agents = AgentService(
+            engine=app.state.engine,
+            gateway=app.state.gateway,
+            executor=app.state.tools,
+            audit=tool_audit,
+            settings=settings,
+            limiter=app.state.limiter,
+            runner=app.state.runner,
+        )
+        if settings.agents_enabled and settings.agents_worker_enabled:
+            await app.state.runner.start()
         try:
             yield
         finally:
+            await app.state.runner.stop()
             # Finish message and usage writes for cancelled calls before the connections go away.
             await app.state.chat.drain()
             await app.state.gateway.aclose()

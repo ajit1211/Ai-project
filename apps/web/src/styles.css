@@ -189,7 +189,10 @@ hr {
     gap: 12px;
   }
 
+  /* Seven sections do not fit one line on a phone: the links wrap instead of widening the page. */
   .topnav {
+    flex-wrap: wrap;
+    gap: 4px 14px;
     margin-left: 0;
   }
 }
@@ -327,6 +330,12 @@ hr {
 .badge-neutral {
   color: var(--text-muted);
   background: var(--bg);
+}
+
+/* Work in progress (an agent task that is running), and the platform's own agents. */
+.badge-info {
+  color: var(--accent);
+  background: var(--info-tint);
 }
 
 .footer {
@@ -2882,5 +2891,591 @@ button:focus-visible {
 
   .doc-status-row {
     grid-template-columns: 1fr;
+  }
+}
+
+/* Agents: the library */
+
+.agents-page .header {
+  margin-bottom: 20px;
+}
+
+.agents-page .chat-banner {
+  margin: 0 0 16px;
+}
+
+/* Receive focus from a script (after a deletion, a control or a decision). */
+.agents-page h1[tabindex="-1"]:focus,
+.run-status:focus:not(:focus-visible),
+.agent-fieldset:focus,
+.agent-form-alert:focus,
+.run-form-alert:focus {
+  outline: none;
+}
+
+.agents-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px 20px;
+}
+
+.agents-title {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
+.agents-title p {
+  margin: 6px 0 0;
+}
+
+.agents-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-icon-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agent-icon-button .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.agent-badge {
+  margin-left: 0;
+  white-space: nowrap;
+}
+
+.agents-empty {
+  padding: 24px 0;
+}
+
+.agents-empty p {
+  margin: 0 0 8px;
+}
+
+.agent-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+/* The place to start: across the whole row, set off in the accent colour. */
+.agent-card-start {
+  grid-column: 1 / -1;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--info-tint);
+}
+
+.agent-start {
+  align-self: flex-start;
+  margin: 0;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+.agent-card-head h1,
+.agent-name {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-name {
+  font-size: 17px;
+}
+
+.agent-description,
+.agent-start-hint,
+.agent-limits,
+.agent-no-tools {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-tool {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  padding: 3px 4px 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 13px;
+}
+
+.agent-tool-name {
+  font-weight: 600;
+}
+
+.agent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 4px;
+}
+
+/* Agents: the agent form and the new task form */
+
+.field-hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.field-required {
+  color: var(--down);
+}
+
+.field-invalid input,
+.field-invalid select,
+.field-invalid textarea {
+  border-color: var(--down);
+}
+
+.agent-fieldset {
+  min-width: 0;
+  margin: 0 0 18px;
+  padding: 0;
+  border: 0;
+}
+
+.agent-fieldset legend {
+  margin-bottom: 4px;
+  padding: 0;
+}
+
+.agent-fieldset > .field-hint {
+  margin: 0 0 10px;
+}
+
+.agent-tool-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-tool-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.agent-tool-option input {
+  width: auto;
+  margin-top: 3px;
+}
+
+.agent-tool-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.agent-tool-option-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.agent-limits-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: 0 16px;
+}
+
+/* JSON typed by hand. */
+.agent-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.run-form-agent {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-form h2 {
+  margin-bottom: 14px;
+}
+
+.run-input-check {
+  margin-bottom: 0;
+}
+
+.run-schema {
+  margin-bottom: 14px;
+}
+
+.run-schema summary,
+.run-goal-full summary {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* Agents: the task history */
+
+.runs-toolbar select {
+  width: auto;
+  max-width: 100%;
+}
+
+.run-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.run-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.run-item-main {
+  min-width: 0;
+}
+
+.run-item-goal {
+  color: var(--text);
+  font-weight: 600;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.run-item-goal:hover,
+.run-item-goal:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.run-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin: 2px 0 0;
+}
+
+/* Agents: one task */
+
+.run-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 8px;
+}
+
+.run-title {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
+.run-title h1 {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.run-agent {
+  margin: 0;
+}
+
+.run-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-bottom: 12px;
+}
+
+.run-progress {
+  color: var(--text-muted);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+/* The user's goal and the model's notes: plain text, line breaks kept. */
+.run-goal,
+.run-step-text,
+.run-failure-detail {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-goal {
+  margin: 8px 0 0;
+}
+
+.run-goal-full,
+.run-input {
+  margin: 0 0 12px;
+}
+
+.run-input {
+  font-size: 14px;
+}
+
+.run-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.run-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 16px;
+  align-items: start;
+}
+
+.run-main {
+  min-width: 0;
+}
+
+.run-main > .approval-card {
+  margin: 0 0 16px;
+}
+
+.run-side .section {
+  margin-bottom: 16px;
+}
+
+.run-side h2 {
+  font-size: 16px;
+}
+
+.run-failure {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--down-tint);
+  color: var(--down);
+}
+
+/* Cancelled by the user: not an error. */
+.run-failure-cancelled {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.run-failure-summary {
+  margin: 0;
+  font-weight: 600;
+}
+
+.run-failure-detail {
+  margin: 4px 0 0;
+  font-size: 14px;
+}
+
+.run-mode {
+  margin-top: 12px;
+}
+
+.run-result h3 {
+  margin-top: 18px;
+}
+
+/* Structured output and schemas: plain JSON in their own scroll area. */
+.run-output {
+  max-height: 24em;
+  margin: 0 0 12px;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-output:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.run-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+}
+
+.run-source .source-title {
+  overflow-wrap: anywhere;
+}
+
+.run-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border-left: 2px solid var(--border);
+  list-style: none;
+}
+
+.run-step {
+  padding: 4px 0 4px 10px;
+  font-size: 14px;
+}
+
+.run-step-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+}
+
+.run-step-kind {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.run-step-summary {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.run-step-json {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.run-budget {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+}
+
+.run-meter dt {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.run-meter dd {
+  margin: 2px 0 0;
+}
+
+.run-meter-value {
+  display: block;
+  font-size: 14px;
+}
+
+.run-meter-bar {
+  display: block;
+  height: 6px;
+  margin-top: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border);
+}
+
+.run-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+/* Nearly used up. */
+.run-meter-high {
+  background: var(--waiting);
+}
+
+@media (max-width: 800px) {
+  .run-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .agent-card,
+  .run-item {
+    padding: 12px;
+  }
+
+  .run-item {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: start;
   }
 }

@@ -11,17 +11,18 @@
  * - images are shown as links instead of being loaded, so a reply cannot make the browser
  *   fetch an arbitrary address (a known way to leak conversation text through a URL).
  *
- * With `cite`, a grounded reply's citation markers become buttons (see citations.tsx).
+ * With `cite`, a grounded reply's citation markers become buttons (see citations.tsx); an
+ * agent task's answer passes `cite="R"` for its [R1]-style references.
  */
 
 import "highlight.js/styles/github.css";
 
 import { memo } from "react";
-import ReactMarkdown, { type Components } from "react-markdown";
+import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
 
-import { CitationMarker, rehypeCitations } from "./citations";
+import { CitationMarker, rehypeCitations, type CitationPrefix } from "./citations";
 
 const SAFE_PROTOCOLS: ReadonlySet<string> = new Set(["http:", "https:", "mailto:"]);
 
@@ -69,26 +70,33 @@ const components: Components = {
 const remarkPlugins = [remarkGfm];
 const rehypePlugins = [rehypeHighlight];
 
-// A grounded reply also turns its citation markers into buttons (citations.tsx). Ordinary
-// replies never go through this step.
-const citedRehypePlugins = [rehypeCitations, rehypeHighlight];
+// A grounded reply (or an agent task's answer) also turns its citation markers into buttons
+// (citations.tsx). Ordinary replies never go through this step.
+const citedRehypePlugins: Readonly<Record<CitationPrefix, NonNullable<Options["rehypePlugins"]>>> = {
+  S: [rehypeCitations, rehypeHighlight],
+  R: [[rehypeCitations, { prefix: "R" }], rehypeHighlight],
+};
 const citedComponents: Components = { ...components, cite: CitationMarker };
 
 export interface MarkdownProps {
   text: string;
-  /** Make [S1]-style markers citation buttons (a grounded reply, inside a CitationContext). */
-  cite?: boolean;
+  /**
+   * Make citation markers buttons, inside a CitationContext: true (or "S") for a grounded
+   * reply's [S1], "R" for an agent task's [R1].
+   */
+  cite?: boolean | CitationPrefix;
 }
 
 /** Memoized: while a reply streams, only that reply is parsed again. */
 export const Markdown = memo(function Markdown({ text, cite = false }: MarkdownProps) {
+  const prefix: CitationPrefix | null = cite === true ? "S" : cite || null;
   return (
     <div className="markdown">
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
-        rehypePlugins={cite ? citedRehypePlugins : rehypePlugins}
+        rehypePlugins={prefix ? citedRehypePlugins[prefix] : rehypePlugins}
         urlTransform={safeUrl}
-        components={cite ? citedComponents : components}
+        components={prefix ? citedComponents : components}
       >
         {text}
       </ReactMarkdown>

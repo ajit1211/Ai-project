@@ -88,6 +88,18 @@ async def activity_for(
     return dict(found)
 
 
+async def activity_for_run(
+    conn: AsyncConnection, principal: Principal, registry: ToolRegistry, run_id: UUID
+) -> list[ToolActivityOut]:
+    """An agent run's tool calls, in order, with document results re-authorized now."""
+    rows = await repo.invocations_of_run(conn, run_id)
+    if not rows:
+        return []
+    approvals = {a.invocation_id: a for a in await repo.approvals_of(conn, [r.id for r in rows])}
+    readable = await readable_ids(conn, principal, _document_ids(rows))
+    return [activity_out(row, approvals.get(row.id), registry, readable) for row in rows]
+
+
 async def invocation_detail(
     conn: AsyncConnection, principal: Principal, registry: ToolRegistry, row: Any
 ) -> InvocationOut:
@@ -98,6 +110,7 @@ async def invocation_detail(
         **activity.model_dump(),
         conversation_id=row.conversation_id,
         message_id=row.message_id,
+        run_id=row.run_id,
         created_at=row.created_at,
         completed_at=row.completed_at,
     )

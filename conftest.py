@@ -55,3 +55,8 @@ def _access_catalog(request: pytest.FixtureRequest) -> None:
         sync_ai_catalog()
     if not AIEmbeddingModel.objects.exists():
         sync_embedding_models()
+    from nexa_core.agents.catalog import sync_agent_catalog
+    from nexa_core.agents.models import Agent
+
+    if not Agent.objects.filter(is_system=True).exists():
+        sync_agent_catalog()

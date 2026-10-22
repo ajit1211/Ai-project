@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from nexa_common.access import Principal, require
 from nexa_common.errors import NotFound
+from nexa_runtime.agents import repository as agent_repo
 from nexa_runtime.chat import repository as chat_repo
 from nexa_runtime.tools import repository as repo
 from nexa_runtime.tools.activity import invocation_detail
@@ -80,11 +81,16 @@ class ToolService:
             row = await repo.invocation(conn, organization_id, invocation_id)
             if row is None:
                 raise NotFound
-            conversation = await chat_repo.get_conversation(
-                conn, organization_id, row.conversation_id
-            )
-            if conversation is None or conversation.owner_id != principal.user_id:
-                raise NotFound
+            if row.run_id is not None:
+                run = await agent_repo.get_run(conn, organization_id, row.run_id)
+                if run is None or run.user_id != principal.user_id:
+                    raise NotFound
+            else:
+                conversation = await chat_repo.get_conversation(
+                    conn, organization_id, row.conversation_id
+                )
+                if conversation is None or conversation.owner_id != principal.user_id:
+                    raise NotFound
             return await invocation_detail(conn, principal, self._executor.registry, row)
 
     def _out(
