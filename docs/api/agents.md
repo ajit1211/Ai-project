@@ -121,7 +121,7 @@ Submit a task. Needs `ai.chat`, `agents.execute` and `ai.agent.execute`.
 | `goal` | 1–10,000 characters |
 | `input` | An object validated against the agent's `input_schema` (≤ 50,000 characters) |
 | `conversation_id` | Optional; one of your conversations (context link only) |
-| `idempotency_key` | Optional, `[A-Za-z0-9_.:-]{1,128}`: the same key returns the earlier task (200) instead of starting another |
+| `idempotency_key` | Optional, `[A-Za-z0-9_.:-]{1,128}`: the same key in the same organization returns the earlier task (200) instead of starting another |
 
 `202` with the task (`status: "queued"`); a worker picks it up within a second. Audited as
 `AGENT_RUN_STARTED` (without the goal).
@@ -217,16 +217,17 @@ Progress as Server-Sent Events (`Accept: text/event-stream`):
 
 ```text
 event: run
-data: {"type": "run", "run": {…the task object…}}
+data: {"run": {…the task object…}, "step": null}
 
 event: step
-data: {"type": "step", "step": {…a step…}}
+data: {"run": null, "step": {…a step…}}
 
 event: end
-data: {"type": "end", "run": {…the final task object…}}
+data: {"run": {…the final task object…}, "step": null}
 ```
 
-`run` whenever the task changes, `step` for each new step and again when a step's status
+The event name carries the type (the data has no `type` field); each frame also has an `id:`
+line. `run` whenever the task changes, `step` for each new step and again when a step's status
 changes (update by `id`), and `end` once the task is final, after which the stream closes.
 Comment lines (`: ping`) keep idle connections open. The stream reads from the database, so it
 works whichever worker runs the task; it closes after an hour (reconnect to continue).

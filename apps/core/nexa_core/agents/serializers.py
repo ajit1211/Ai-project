@@ -1,5 +1,6 @@
 """Request validation and response shapes of the agents API (docs/api/agents.md#agents)."""
 
+import json
 from typing import Any
 
 from rest_framework import serializers
@@ -75,6 +76,8 @@ class AgentInput(serializers.Serializer[dict[str, Any]]):
     def _object_schema(self, value: Any) -> Any:
         if value is not None and not isinstance(value, dict):
             raise serializers.ValidationError("A JSON Schema object is required.")
+        if value is not None and "\\u0000" in json.dumps(value):
+            raise serializers.ValidationError("The schema contains a NUL character.")
         return value
 
     def validate_input_schema(self, value: Any) -> Any:

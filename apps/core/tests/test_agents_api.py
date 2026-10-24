@@ -228,6 +228,22 @@ class TestCreating:
         AIOrganizationAliasGrant.objects.create(organization=org, alias=alias)
         assert created(api, model=alias.name)["model"] == alias.name
 
+    def test_schemas_that_would_take_forever_to_validate_are_refused(
+        self, owner: User, org: Organization
+    ) -> None:
+        defs: dict[str, Any] = {"d30": {"type": "object"}}
+        for level in range(30):
+            nxt = f"#/$defs/d{level + 1}"
+            defs[f"d{level}"] = {"allOf": [{"$ref": nxt}, {"$ref": nxt}]}
+        schema = {"type": "object", "allOf": [{"$ref": "#/$defs/d0"}], "$defs": defs}
+        response = client_in(owner, org).post(URL, body(input_schema=schema), format="json")
+        assert response.status_code == 422
+        assert "input_schema" in str(response.data["error"])
+        nul = client_in(owner, org).post(
+            URL, body(output_schema={"type": "object", "description": "a\x00b"}), format="json"
+        )
+        assert nul.status_code == 422
+
     def test_tools_are_deduplicated(self, owner: User, org: Organization) -> None:
         agent = created(
             client_in(owner, org), allowed_tools=["calculator", "calculator", "current_time"]

@@ -104,16 +104,20 @@ async def _principal(
             .select_from(
                 t.organization_memberships.join(
                     t.roles, t.roles.c.id == t.organization_memberships.c.role_id
-                ).join(
+                )
+                .join(
                     t.organizations,
                     t.organizations.c.id == t.organization_memberships.c.organization_id,
                 )
+                .join(t.users, t.users.c.id == t.organization_memberships.c.user_id)
             )
             .where(
                 t.organization_memberships.c.user_id == user_id,
                 t.organization_memberships.c.organization_id == organization_id,
                 t.organization_memberships.c.status == "active",
                 t.organizations.c.deleted_at.is_(None),
+                # Work that outlives a request (agent runs) stops with a deactivated account.
+                t.users.c.is_active.is_(True),
             )
         )
     ).first()

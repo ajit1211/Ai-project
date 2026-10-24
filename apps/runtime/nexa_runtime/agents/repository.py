@@ -28,6 +28,11 @@ def now() -> datetime:
     return datetime.now(UTC)
 
 
+def increment(column: str, by: int = 1) -> Any:
+    """`column + by` evaluated by the database, so concurrent increments are never lost."""
+    return t.agent_runs.c[column] + by
+
+
 def _first(result: Any) -> Row[Any] | None:
     return cast("Row[Any] | None", result.first())
 
@@ -101,11 +106,16 @@ async def get_run(
     return _first(await conn.execute(stmt))
 
 
-async def run_by_idempotency_key(conn: AsyncConnection, user_id: UUID, key: str) -> RunRow | None:
+async def run_by_idempotency_key(
+    conn: AsyncConnection, organization_id: UUID, user_id: UUID, key: str
+) -> RunRow | None:
+    """The user's earlier run with this key in this organization (keys are per organization)."""
     return _first(
         await conn.execute(
             select(t.agent_runs).where(
-                t.agent_runs.c.user_id == user_id, t.agent_runs.c.idempotency_key == key
+                t.agent_runs.c.organization_id == organization_id,
+                t.agent_runs.c.user_id == user_id,
+                t.agent_runs.c.idempotency_key == key,
             )
         )
     )
@@ -180,13 +190,22 @@ async def update_run(conn: AsyncConnection, run_id: UUID, **values: Any) -> RunR
 
 
 async def transition(
-    conn: AsyncConnection, run_id: UUID, *, from_states: tuple[str, ...], **values: Any
+    conn: AsyncConnection,
+    run_id: UUID,
+    *,
+    from_states: tuple[str, ...],
+    worker: str | None = None,
+    **values: Any,
 ) -> RunRow | None:
-    """Change a run only from one of `from_states`; None when it is in another state now."""
+    """Change a run only from one of `from_states` (and, with `worker`, only while that worker
+    holds it); None when it is in another state now."""
+    conditions = [t.agent_runs.c.id == run_id, t.agent_runs.c.status.in_(from_states)]
+    if worker is not None:
+        conditions.append(t.agent_runs.c.claimed_by == worker)
     return _first(
         await conn.execute(
             update(t.agent_runs)
-            .where(t.agent_runs.c.id == run_id, t.agent_runs.c.status.in_(from_states))
+            .where(*conditions)
             .values(updated_at=now(), **values)
             .returning(t.agent_runs)
         )
@@ -201,7 +220,15 @@ async def claim_next(conn: AsyncConnection, *, worker: str, lease_seconds: int) 
         select(t.agent_runs.c.id)
         .where(
             or_(
-                t.agent_runs.c.status == "queued",
+                # Queued and not held: a worker that claimed it is still preparing it.
+                and_(
+                    t.agent_runs.c.status == "queued",
+                    or_(
+                        t.agent_runs.c.claimed_by == "",
+                        t.agent_runs.c.lease_expires_at.is_(None),
+                        t.agent_runs.c.lease_expires_at < stamp,
+                    ),
+                ),
                 and_(
                     t.agent_runs.c.status.in_(("running", "cancel_requested")),
                     t.agent_runs.c.lease_expires_at < stamp,
@@ -221,7 +248,7 @@ async def claim_next(conn: AsyncConnection, *, worker: str, lease_seconds: int) 
                 claimed_by=worker,
                 lease_expires_at=stamp + timedelta(seconds=lease_seconds),
                 attempts=t.agent_runs.c.attempts + 1,
-                updated_at=stamp,
+                # updated_at is left alone: it says since when the run has been waiting.
             )
             .returning(t.agent_runs)
         )
@@ -244,13 +271,23 @@ async def renew_lease(
 
 
 async def release(
-    conn: AsyncConnection, run_id: UUID, *, worker: str, **values: Any
+    conn: AsyncConnection,
+    run_id: UUID,
+    *,
+    worker: str,
+    from_states: tuple[str, ...] | None = None,
+    **values: Any,
 ) -> RunRow | None:
-    """Give the run up (paused, waiting, finished): the lease ends with the claim."""
+    """Give the run up (paused, waiting, finished): the lease ends with the claim. With
+    `from_states`, only from those states: a pause or a wait never overwrites a cancellation
+    that arrived meanwhile."""
+    conditions = [t.agent_runs.c.id == run_id, t.agent_runs.c.claimed_by == worker]
+    if from_states is not None:
+        conditions.append(t.agent_runs.c.status.in_(from_states))
     return _first(
         await conn.execute(
             update(t.agent_runs)
-            .where(t.agent_runs.c.id == run_id, t.agent_runs.c.claimed_by == worker)
+            .where(*conditions)
             .values(claimed_by="", lease_expires_at=None, updated_at=now(), **values)
             .returning(t.agent_runs)
         )

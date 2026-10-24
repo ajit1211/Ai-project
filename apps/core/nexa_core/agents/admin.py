@@ -1,5 +1,6 @@
 """Agents are editable by platform staff (platform agents included); runs and their steps are
-read-only, and their goals, results and step details are not shown: they come from private
+read-only, and their goals, inputs, results, progress and failure text and step details are
+not shown: they come from private
 tasks. The admin shows what ran, for whom, how it ended and what it used."""
 
 from typing import Any
@@ -18,7 +19,17 @@ class AgentAdmin(admin.ModelAdmin[Agent]):
     readonly_fields = ("version", "created_at", "updated_at")
 
 
-_RUN_PRIVATE = ("goal", "input", "result", "output", "agent_snapshot", "sources")
+_RUN_PRIVATE = (
+    "goal",
+    "input",
+    "result",
+    "output",
+    "agent_snapshot",
+    "sources",
+    # Model-written text derived from the task (progress, the reason it gave up).
+    "progress_message",
+    "error_message",
+)
 
 
 @admin.register(AgentRun)

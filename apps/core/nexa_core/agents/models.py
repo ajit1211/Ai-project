@@ -202,8 +202,9 @@ class AgentRun(models.Model):
         db_table = "agent_runs"
         ordering = ("-created_at", "-id")
         constraints = [
+            # Keys are per organization: the same key in another organization is another task.
             models.UniqueConstraint(
-                fields=["user", "idempotency_key"],
+                fields=["organization", "user", "idempotency_key"],
                 condition=~Q(idempotency_key=""),
                 name="agent_runs_idempotency_uniq",
             ),

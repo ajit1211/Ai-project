@@ -61,7 +61,8 @@ departs from four of those points, deliberately; the reasons are below.
 8. **Budgets are code.** Steps, tool calls, wall-clock time, tokens, identical repeated calls,
    invalid decisions, active runs per user and organization, and submissions per hour, each
    with a named failure reason. Every model call is in the usage ledger (`feature = agent`,
-   `source_type = agent_run`), and the run's counters are the sum of what was measured.
+   `source_type = agent_run`), and the run's counters are the sum of what was measured (a
+   call interrupted by a stop stays in the ledger as `cancelled` and is not added).
 9. **Progress over Server-Sent Events**, read from the database (any worker of any process
    may be executing the run), consistent with ADR-030; the steps and run endpoints serve
    clients that cannot stream.

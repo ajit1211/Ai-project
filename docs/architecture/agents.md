@@ -40,10 +40,10 @@ Runtime ─ AgentService ─► agent_runs (queued) ──► AgentRunner (worke
 
 | Where | Module | Role |
 | --- | --- | --- |
-| Core | `nexa_core.agents.models` | `Agent`, `AgentRun`, `AgentStep`: the schema (migrations 0001–0003) |
+| Core | `nexa_core.agents.models` | `Agent`, `AgentRun`, `AgentStep`: the schema (migrations 0001–0004) |
 | Core | `nexa_core.agents.services`, `serializers`, `views` | `/api/v1/agents/`: visibility, the creator rule, validation, versioning, soft delete, audit |
 | Core | `nexa_core.agents.catalog` | Platform agents, seeded after every `migrate` (the Document Assistant) |
-| Core | `nexa_core.agents.admin` | Agents editable by staff; runs and steps read-only, without goals, results or step details |
+| Core | `nexa_core.agents.admin` | Agents editable by staff; runs and steps read-only, without goals, inputs, results, progress or failure text, or step details |
 | Shared | `nexa_common.tool_catalog` | The built-in tools as Core needs to know them (id, risk, approval, permissions) |
 | Runtime | `nexa_runtime.agents.service` | Submitting (permissions, idempotency, input schema, caps), reading, controls, decisions, the event stream |
 | Runtime | `nexa_runtime.agents.runner` | Worker loops: claim, lease, execute, sweep expired approvals, graceful stop |
@@ -65,9 +65,11 @@ Runtime ─ AgentService ─► agent_runs (queued) ──► AgentRunner (worke
 
 Integrity: slugs are unique per organization while alive (`agents_org_slug_uniq`,
 `agents_platform_slug_uniq`); limits are checked by the database (`agents_limits_chk`); run
-statuses by `agent_runs_status_chk`; one idempotency key per user; steps unique per
-`(run, sequence)`. Composite keys `(organization_id, run_id)` keep steps and tool calls in their
-run's organization and cascade on delete (migration `agents.0002`, raw SQL like Phase 10).
+statuses by `agent_runs_status_chk`; one idempotency key per user and organization; steps
+unique per `(run, sequence)`. Composite keys `(organization_id, run_id)` keep steps and tool
+calls in their run's organization and cascade on delete (migration `agents.0002`, raw SQL like
+Phase 10); a run's conversation must be in its organization, and deleting the conversation only
+clears the link (`ON DELETE SET NULL (conversation_id)`, migration `agents.0004`).
 Runtime has `SELECT, INSERT, UPDATE` on `agent_runs` and `agent_steps`, `SELECT` on `agents`,
 and nothing else new.
 
@@ -88,7 +90,8 @@ saved:
 - **Schemas**: valid JSON Schemas of objects, local only (no remote `$ref`), within the same
   limits as structured output (`nexa_ai.structured.check_schema`).
 - **Limits**: within the platform maxima (steps ≤ 50, tool calls ≤ 100, duration ≤ 3600 s,
-  tokens ≤ 1,000,000); the database refuses zero or negative values.
+  tokens ≤ 1,000,000); the database enforces the minimums (steps ≥ 1, tool calls ≥ 0, duration
+  ≥ 10 s, tokens ≥ 1,000).
 - **Approval policy**: `registry` (tools that require approval ask) or `all_tool_calls` (every
   call asks).
 
@@ -170,7 +173,8 @@ A worker that claims a run calls `AgentEngine.execute`:
      `source_type = agent_run`). Transient provider errors are retried
      (`AGENTS_STEP_RETRIES`); a quota, context-size or withdrawn-model error ends the run with
      its reason. Every call the gateway metered counts toward the run, whatever its outcome
-     (an invalid answer, a failed attempt), so the run's usage equals its ledger rows.
+     (an invalid answer, a failed attempt). A call interrupted by a stop (cancel, shutdown,
+     deadline) is recorded by the gateway as `cancelled` but is not added to the run.
    - **Record** the decision as a step (validated, tool arguments redacted per the tool's
      `redact` list) and add its measured usage to the run.
    - **Act**: `call_tool` / `request_approval` → [Tools](#tools); `report_progress` → a
@@ -305,10 +309,15 @@ Celery. `AgentRunner` starts `AGENTS_WORKER_CONCURRENCY` loops per process (and 
 - **Claim**: `UPDATE agent_runs SET claimed_by = <worker>, lease_expires_at = now() + lease,
   attempts = attempts + 1 WHERE id = (SELECT id … WHERE status = 'queued' OR (status IN
   ('running','cancel_requested') AND lease_expires_at < now()) ORDER BY created_at LIMIT 1
-  FOR UPDATE SKIP LOCKED) RETURNING *`. Two workers never take the same run; any number of
+  FOR UPDATE SKIP LOCKED) RETURNING *` (a queued run is claimable only while nobody holds a
+  live lease on it). Each worker loop claims under its own id. Two loops never take the same
+  run; any number of
   Runtime processes share the queue.
-- **Lease**: renewed by the run's heartbeat; every write of the run's state checks
-  `claimed_by`, so a worker that lost its lease cannot overwrite the new owner's work.
+- **Lease**: renewed by the run's heartbeat. Starting a run, renewing its lease and releasing
+  it (pause, wait, end) are conditional on `claimed_by`, and a pause or a wait is only
+  recorded from `running`, so a cancellation that arrives during a step is never overwritten.
+  A worker that lost its lease notices at its next renewal or checkpoint; counters are
+  incremented by the database, so concurrent increments are not lost.
 - **Wake-up**: a submission, resume or decision in the same process wakes the loops at once;
   otherwise they poll every `AGENTS_POLL_INTERVAL_SECONDS`.
 - **Shutdown**: on process exit the loops stop claiming, running steps get
@@ -387,7 +396,7 @@ step, the last progress message and the measured usage.
 | Invalid or malicious model output | Structured output + `parse_decision` + output schema; two strikes | `test_invalid_decisions_fail_the_run`, `test_the_output_must_match_the_output_schema`, `TestDecisions` |
 | Invented citations | Only references seen in this run's results become sources | `test_a_reference_the_agent_never_saw_is_not_a_source` |
 | Sensitive data in logs and audit | Ids, counts and statuses only; arguments redacted per tool; admin hides goals and results | `test_it_answers_from_the_documents_and_cites_them` (audit has no goal) |
-| Two workers on one run | `FOR UPDATE SKIP LOCKED`, leases, writes conditional on the claim | `test_a_live_lease_is_never_taken` |
+| Two workers on one run | `FOR UPDATE SKIP LOCKED`; a held queued run is not claimable; one claim id per worker loop; preparation and every release conditional on the claim | `test_a_live_lease_is_never_taken`, `test_a_claimed_queued_run_is_not_claimed_again` |
 
 ## Demonstration agent
 

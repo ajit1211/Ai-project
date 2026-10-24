@@ -89,16 +89,19 @@ class AgentRunner:
 
     async def run_once(self) -> bool:
         """Claim and execute one run, if any (tests and scripts). Returns whether one ran."""
-        run = await self._claim()
+        worker = f"{self.worker_id}/once"
+        run = await self._claim(worker)
         if run is None:
             return False
-        await self._execute(run)
+        await self._execute(run, worker)
         return True
 
     async def _loop(self, index: int) -> None:
+        # Each loop holds its claims under its own id: a lease names exactly one executor.
+        worker = f"{self.worker_id}/{index}"
         while not self._shutdown.is_set():
             try:
-                run = await self._claim()
+                run = await self._claim(worker)
             except Exception as exc:
                 log.error("agents.runner.claim_failed", error=type(exc).__name__)
                 await asyncio.sleep(self._settings.agents_poll_interval_seconds * 5)
@@ -110,15 +113,15 @@ class AgentRunner:
                         self._wake.wait(), timeout=self._settings.agents_poll_interval_seconds
                     )
                 continue
-            await self._execute(run)
+            await self._execute(run, worker)
 
-    async def _claim(self) -> repo.RunRow | None:
+    async def _claim(self, worker: str) -> repo.RunRow | None:
         async with self._engine.begin() as conn:
             return await repo.claim_next(
-                conn, worker=self.worker_id, lease_seconds=self._settings.agents_lease_seconds
+                conn, worker=worker, lease_seconds=self._settings.agents_lease_seconds
             )
 
-    async def _execute(self, run: repo.RunRow) -> None:
+    async def _execute(self, run: repo.RunRow, worker: str) -> None:
         queued_for = (repo.now() - run.updated_at).total_seconds()
         log.info(
             "agents.runner.claimed",
@@ -128,9 +131,7 @@ class AgentRunner:
             queue_delay_ms=max(0, int(queued_for * 1000)),
         )
         try:
-            outcome = await self._agent_engine.execute(
-                run, worker=self.worker_id, shutdown=self._shutdown
-            )
+            outcome = await self._agent_engine.execute(run, worker=worker, shutdown=self._shutdown)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # the engine reports its own failures; this is a bug

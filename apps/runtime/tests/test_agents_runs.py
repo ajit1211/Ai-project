@@ -31,7 +31,7 @@ from nexa_ai.types import Role
 from nexa_common.access import Principal
 from nexa_core.agents.catalog import DOCUMENT_ASSISTANT_SLUG
 from nexa_core.agents.models import Agent, AgentRun, AgentStep
-from nexa_core.ai.models import AIModelAlias, AIUsageEvent
+from nexa_core.ai.models import AIModelAlias, AIOrganizationPolicy, AIUsageEvent
 from nexa_core.audit.models import AuditLog
 from nexa_core.identity.keys import jwks
 from nexa_core.identity.models import User
@@ -40,6 +40,8 @@ from nexa_core.organizations.models import Organization, RolePermission
 from nexa_core.organizations.services import create_organization
 from nexa_core.testing import add_member, indexed_document
 from nexa_core.tools.models import ToolApproval, ToolInvocation
+from nexa_runtime.agents import repository as agent_repo
+from nexa_runtime.agents.errors import RunLimitReached
 from nexa_runtime.agents.runner import AgentRunner
 from nexa_runtime.agents.schemas import CreateRun
 from nexa_runtime.agents.worker import run_worker
@@ -244,12 +246,13 @@ def auth(user: User) -> dict[str, str]:
     return {"Authorization": f"Bearer {start_session(user, client_type='web').access_token}"}
 
 
-def principal_for(user: User) -> Principal:
-    membership = user.memberships.get(organization=acme())
+def principal_for(user: User, organization: Organization | None = None) -> Principal:
+    organization = organization or acme()
+    membership = user.memberships.get(organization=organization)
     return Principal(
         user_id=user.id,
         session_id=None,
-        organization_id=acme().id,
+        organization_id=organization.id,
         membership_id=membership.id,
         role_key=membership.role.key,
         permissions=frozenset(
@@ -1333,6 +1336,190 @@ class TestWorkerProcess:
             thread.join(timeout=30)
         assert not thread.is_alive()
         assert run_of(runtime, headers, run["id"])["result"] == "Done by a worker"
+
+
+class TestHardening:
+    """Regressions for the defects found by the Phase 11 review."""
+
+    def test_a_claimed_queued_run_is_not_claimed_again(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        run = submit(runtime, auth(owner), make_agent(), "[[agent:complete Hi]]")
+        engine = cast(Any, runtime.app).state.engine
+
+        async def two_claims() -> tuple[Any, Any]:
+            async with engine.begin() as conn:
+                first = await agent_repo.claim_next(conn, worker="w1", lease_seconds=60)
+            async with engine.begin() as conn:
+                second = await agent_repo.claim_next(conn, worker="w2", lease_seconds=60)
+            return first, second
+
+        first, second = call(runtime, two_claims)
+        assert first is not None
+        assert first.id == UUID(run["id"])
+        assert second is None  # still queued while w1 prepares it, but held
+
+    def test_a_cancel_during_a_step_wins_over_waiting_for_approval(
+        self, runtime: TestClient, owner: User, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        headers = auth(owner)
+        run = submit(runtime, headers, make_agent(tools=("send_note",)), SEND)
+        state = cast(Any, runtime.app).state
+        original = state.tools.plan
+        principal = principal_for(owner)
+
+        async def plan_then_cancel(*args: Any, **kwargs: Any) -> Any:
+            planned = await original(*args, **kwargs)
+            # The user's cancel arrives while the engine is still inside this step.
+            await state.agents.cancel(principal, UUID(run["id"]), request_id=None)
+            return planned
+
+        monkeypatch.setattr(state.tools, "plan", plan_then_cancel)
+        drain(runtime)
+        done = run_of(runtime, headers, run["id"])
+        assert (done["status"], done["failure_reason"]) == ("cancelled", "cancelled")
+        assert ToolApproval.objects.get().status == "invalidated"
+        assert _effects == []
+
+    def test_invalid_outputs_in_a_row_fail_the_run(self, runtime: TestClient, owner: User) -> None:
+        agent = make_agent(
+            tools=(),
+            output_schema={
+                "type": "object",
+                "properties": {"n": {"type": "integer"}},
+                "required": ["n"],
+                "additionalProperties": False,
+            },
+        )
+        headers = auth(owner)
+        goal = '[[agent:complete {"n": "x"}]] [[agent:complete {"n": "y"}]] [[agent:complete {"n": 3}]]'
+        run = submit(runtime, headers, agent, goal)
+        drain(runtime)
+        done = run_of(runtime, headers, run["id"])
+        assert (done["status"], done["failure_reason"]) == ("failed", "validation_failed")
+        assert done["usage"]["model_calls"] == 2
+
+    def test_an_idempotency_key_is_per_organization(self, runtime: TestClient, owner: User) -> None:
+        beta = create_organization(name="Beta", owner=owner)
+        theirs = Agent.objects.create(organization=beta, name="B", slug="b", instructions="x")
+        service = cast(Any, runtime.app).state.agents
+        in_acme = CreateRun(
+            agent_id=make_agent().id, goal="[[agent:complete A]]", idempotency_key="k"
+        )
+        in_beta = CreateRun(agent_id=theirs.id, goal="[[agent:complete B]]", idempotency_key="k")
+
+        in_a, in_b = principal_for(owner), principal_for(owner, beta)
+
+        async def both() -> tuple[Any, Any]:
+            first = await service.submit(in_a, in_acme, request_id=None)
+            second = await service.submit(in_b, in_beta, request_id=None)
+            return first, second
+
+        (a, a_created), (b, b_created) = call(runtime, both)
+        assert a_created
+        assert b_created  # not the other organization's task
+        assert a.id != b.id
+        assert AgentRun.objects.get(id=b.id).organization_id == beta.id
+
+    def test_deleting_a_linked_conversation_only_forgets_the_link(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        headers = auth(owner)
+        created = runtime.post("/api/v1/conversations/", json={}, headers=headers)
+        conversation = created.json()["data"]["id"]
+        run = submit(
+            runtime, headers, make_agent(), "[[agent:complete Hi]]", conversation_id=conversation
+        )
+        drain(runtime)
+        deleted = runtime.delete(f"/api/v1/conversations/{conversation}/", headers=headers)
+        assert deleted.status_code in (200, 204), deleted.text
+        assert run_of(runtime, headers, run["id"])["conversation_id"] is None
+
+    def test_declining_with_a_long_comment(self, runtime: TestClient, owner: User) -> None:
+        headers = auth(owner)
+        run = submit(
+            runtime, headers, make_agent(tools=("send_note",)), SEND + " [[agent:complete No]]"
+        )
+        drain(runtime)
+        pending = run_of(runtime, headers, run["id"])["pending_approval"]
+        response = runtime.post(
+            f"{RUNS}{run['id']}/approvals/{pending['id']}/",
+            json={
+                "decision": "reject",
+                "arguments_hash": pending["arguments_hash"],
+                "comment": "x" * 500,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        assert len(ToolInvocation.objects.get().error_message) == 300
+
+    def test_a_nul_character_in_the_input_is_refused(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        response = runtime.post(
+            RUNS,
+            json={"agent_id": str(assistant().id), "goal": "hi", "input": {"note": "a\u0000b"}},
+            headers=auth(owner),
+        )
+        assert response.status_code == 422, response.text
+        assert not AgentRun.objects.exists()
+
+    def test_a_deactivated_account_runs_nothing_more(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        user = member()
+        run = submit(runtime, auth(user), make_agent(), "[[agent:complete Hi]]")
+        User.objects.filter(id=user.id).update(is_active=False)
+        drain(runtime)
+        row = AgentRun.objects.get(id=run["id"])
+        assert (row.status, row.failure_reason) == ("failed", "permission_denied")
+
+    def test_switching_ai_off_ends_runs_as_permission_denied(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        run = submit(runtime, auth(owner), make_agent(), "[[agent:complete Hi]]")
+        AIOrganizationPolicy.objects.create(organization=acme(), ai_enabled=False)
+        drain(runtime)
+        row = AgentRun.objects.get(id=run["id"])
+        assert (row.status, row.failure_reason) == ("failed", "permission_denied")
+
+    def test_concurrent_submissions_respect_the_active_run_cap(
+        self, make_runtime: Runtime, owner: User
+    ) -> None:
+        client = make_runtime(agents_runs_per_user=2, agents_runs_per_hour=100)
+        agent = make_agent()
+        service = cast(Any, client.app).state.agents
+        principal = principal_for(owner)
+        bodies = [
+            CreateRun(agent_id=agent.id, goal="Hi", idempotency_key=f"k{i}") for i in range(5)
+        ]
+
+        async def together() -> list[Any]:
+            return list(
+                await asyncio.gather(
+                    *(service.submit(principal, body, request_id=None) for body in bodies),
+                    return_exceptions=True,
+                )
+            )
+
+        results = call(client, together)
+        refused = [r for r in results if isinstance(r, BaseException)]
+        assert len(results) - len(refused) == 2
+        assert all(isinstance(r, RunLimitReached) for r in refused)
+        assert AgentRun.objects.count() == 2
+
+    def test_asking_twice_to_pause_a_running_run_is_audited_once(
+        self, runtime: TestClient, owner: User
+    ) -> None:
+        headers = auth(owner)
+        run = submit(runtime, headers, make_agent(), "[[agent:complete Hi]]")
+        died(run["id"], claimed_by="alive", lease_expires_at=timezone.now() + timedelta(minutes=5))
+        first = control(runtime, headers, run["id"], "pause")
+        second = control(runtime, headers, run["id"], "pause")
+        assert first.json()["data"]["pause_requested"] is True
+        assert second.json()["message"] == "Already pausing."
+        assert AuditLog.objects.filter(action="AGENT_RUN_PAUSED").count() == 1
 
 
 class TestIsolation:

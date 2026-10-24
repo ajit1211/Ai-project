@@ -37,6 +37,9 @@ MAX_SCHEMA_BYTES = 32 * 1024
 MAX_SCHEMA_DEPTH = 24
 MAX_SCHEMA_NODES = 2_000
 MAX_SCHEMA_REFERENCES = 100
+# Reference evaluations a schema may imply once every reference is followed (see
+# _check_references): bounds validation time for schemas whose references fan out.
+MAX_SCHEMA_EXPANSION = 1_000
 _ERROR_LIMIT = 500
 
 Pointer = tuple[str, ...]
@@ -215,6 +218,20 @@ def _check_references(schema: dict[str, Any], references: list[tuple[Pointer, Po
     for i in following:
         if i not in state:
             visit(i)
+
+    # Without a loop, references can still fan out: two references to a target that holds two
+    # references to the next one double the work at every level, and the validator does not
+    # memoize. Count the reference evaluations each reference implies and refuse a schema
+    # whose total would make validation slow.
+    expanded: dict[int, int] = {}
+
+    def cost(i: int) -> int:
+        if i not in expanded:
+            expanded[i] = min(MAX_SCHEMA_EXPANSION + 1, 1 + sum(cost(j) for j in following[i]))
+        return expanded[i]
+
+    if sum(cost(i) for i in following) > MAX_SCHEMA_EXPANSION:
+        raise AIInvalidRequest("The response schema's references expand too much.")
 
 
 def _describe(error: ValidationError) -> str:

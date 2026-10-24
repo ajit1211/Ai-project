@@ -336,6 +336,26 @@ class TestUntrustedSchemas:
         with pytest.raises(AIInvalidRequest, match="Recursive"):
             check_schema(schema)
 
+    def test_references_that_fan_out_are_refused_before_validating_anything(self) -> None:
+        """Each level references the next one twice: 2^n evaluations without a loop. The
+        validator does not memoize, so 40 levels would never finish."""
+        defs: dict[str, object] = {"d40": {"type": "object"}}
+        for level in range(40):
+            nxt = f"#/$defs/d{level + 1}"
+            defs[f"d{level}"] = {"allOf": [{"$ref": nxt}, {"$ref": nxt}]}
+        schema = {"type": "object", "allOf": [{"$ref": "#/$defs/d0"}], "$defs": defs}
+        with pytest.raises(AIInvalidRequest, match="expand too much"):
+            check_schema(schema)
+
+    def test_a_definition_shared_by_many_properties_is_fine(self) -> None:
+        schema = {
+            "type": "object",
+            "$defs": {"name": {"type": "string", "maxLength": 80}},
+            "properties": {f"p{i}": {"$ref": "#/$defs/name"} for i in range(30)},
+        }
+        check_schema(schema)
+        assert parse_structured('{"p1": "Ada"}', schema) == {"p1": "Ada"}
+
     def test_missing_local_reference(self) -> None:
         with pytest.raises(AIInvalidRequest, match="reference"):
             check_schema({"type": "object", "properties": {"a": {"$ref": "#/$defs/missing"}}})

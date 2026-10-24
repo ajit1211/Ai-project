@@ -26,6 +26,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
+import structlog
 from jsonschema import Draft202012Validator
 from referencing import Registry as SchemaRegistry
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -35,11 +36,13 @@ from nexa_ai.cost import usd_to_micros
 from nexa_ai.errors import (
     AIContextTooLarge,
     AIError,
+    AIInvalidRequest,
     AIModelUnavailable,
     AIOutputInvalid,
     AIQuotaExceeded,
 )
 from nexa_ai.gateway import Gateway
+from nexa_ai.structured import check_schema
 from nexa_ai.types import (
     ChatRequest,
     ChatResponse,
@@ -171,6 +174,15 @@ class AgentEngine:
         run's own failure; a CancelledError (the worker is stopping) puts it back in the
         queue."""
         state = _Run(row=row, worker=worker, snapshot=dict(row.agent_snapshot or {}))
+        with structlog.contextvars.bound_contextvars(
+            organization_id=str(row.organization_id),
+            user_id=str(row.user_id),
+            request_id=row.request_id or None,
+            run_id=str(row.id),
+        ):
+            return await self._execute(state, shutdown)
+
+    async def _execute(self, state: _Run, shutdown: asyncio.Event) -> Outcome:
         try:
             prepared = await self._prepare(state)
         except _RunFailed as failed:
@@ -266,7 +278,11 @@ class AgentEngine:
         if values:
             async with self._engine.begin() as conn:
                 updated = await repo.transition(
-                    conn, row.id, from_states=("queued", "running", "cancel_requested"), **values
+                    conn,
+                    row.id,
+                    from_states=("queued", "running", "cancel_requested"),
+                    worker=state.worker,
+                    **values,
                 )
             if updated is None:
                 return Outcome("lost")
@@ -411,7 +427,8 @@ class AgentEngine:
                 usage_event_id=UUID(response.id),
                 model=response.model,
             )
-        state.invalid_streak = 0
+        if decision.action != "complete":
+            state.invalid_streak = 0  # a 'complete' counts once its output passed (_complete)
         summary = decision.summary or _default_summary(decision)
         traced = _traced(decision, state.offered.get(decision.tool))
         async with self._engine.begin() as conn:
@@ -478,8 +495,8 @@ class AgentEngine:
         """One model call, retried once after a transient provider failure; None when a stop
         arrived meanwhile. Raises _InvalidOutput when the answer did not match the schema even
         after the gateway's repair, and _RunFailed for everything that ends the run. Every call
-        the gateway metered is added to the run, whatever its outcome, so the run's counters
-        equal its rows in the usage ledger."""
+        the gateway metered is added to the run, whatever its outcome (a call interrupted by
+        a stop is the exception: the gateway records it as cancelled)."""
         ctx = self._context(state)
         attempts = self._settings.agents_step_retries + 1
         for attempt in range(1, attempts + 1):
@@ -497,6 +514,9 @@ class AgentEngine:
                 # The agent's model was switched off or withdrawn from the organization.
                 await self._meter_failed(state, exc)
                 raise _RunFailed("model_unavailable", exc.message) from exc
+            except PermissionDenied as exc:
+                # AI was switched off for the organization (or the user lost ai.chat) meanwhile.
+                raise _RunFailed("permission_denied", exc.message) from exc
             except AIError as exc:
                 await self._meter_failed(state, exc)
                 transient = exc.retryable or exc.fallback_eligible
@@ -677,7 +697,7 @@ class AgentEngine:
         [item] = await self._tools.plan(turn, step_index, [call])
         async with self._engine.begin() as conn:
             await repo.update_step(conn, step.id, invocation_id=item.invocation_id)
-            await repo.update_run(conn, row.id, tool_call_count=row.tool_call_count + 1)
+            await repo.update_run(conn, row.id, tool_call_count=repo.increment("tool_call_count"))
         if item.status == "awaiting_approval":
             async with self._engine.begin() as conn:
                 await repo.update_step(conn, step.id, status="waiting")
@@ -925,6 +945,12 @@ class AgentEngine:
         row = state.row
         schema = state.snapshot.get("output_schema")
         if schema:
+            try:
+                check_schema(schema)  # bounds validation time, whatever saved the agent
+            except AIInvalidRequest as exc:
+                raise _RunFailed(
+                    "invalid_configuration", "The agent's output schema cannot be used."
+                ) from exc
             if decision.output is None:
                 return await self._invalid(
                     state,
@@ -1065,8 +1091,27 @@ class AgentEngine:
         if status in ("paused", "waiting_for_approval"):
             values.update(repo.stopped_clock(state.row))
         async with self._engine.begin() as conn:
-            row = await repo.release(conn, state.id, worker=state.worker, status=status, **values)
+            row = await repo.release(
+                conn,
+                state.id,
+                worker=state.worker,
+                from_states=("running",),
+                status=status,
+                **values,
+            )
+            current = (
+                None
+                if row is not None
+                else await repo.get_run(conn, state.row.organization_id, state.id)
+            )
         if row is None:
+            if (
+                current is not None
+                and current.claimed_by == state.worker
+                and (current.status == "cancel_requested" or current.cancel_requested)
+            ):
+                # Cancelled while this step ran: the cancellation wins over the pause or wait.
+                return await self._finish(state, "cancelled", "cancelled", "Cancelled by the user.")
             return Outcome("lost")
         if audit:
             await self._audit.record(

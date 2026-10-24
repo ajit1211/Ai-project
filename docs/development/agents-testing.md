@@ -4,7 +4,7 @@
 
 ```powershell
 ./scripts/dev-db.ps1 start   # after every reboot
-pnpm migrate                 # agents.0001–0003, tools.0003; seeds the Document Assistant
+pnpm migrate                 # agents.0001–0004, tools.0003; seeds the Document Assistant
 pnpm dev                     # React :5173, Django :8000, FastAPI :8001 (agent workers inside), Celery
 ```
 

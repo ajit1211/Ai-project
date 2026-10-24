@@ -10,12 +10,14 @@ from uuid import UUID
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel
 from referencing import Registry as SchemaRegistry
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from nexa_ai.context import AIRequestContext
-from nexa_ai.errors import AIModelUnavailable
+from nexa_ai.errors import AIInvalidRequest, AIModelUnavailable
 from nexa_ai.gateway import Gateway, KeepAlive
+from nexa_ai.structured import check_schema
 from nexa_common.access import Principal, require
 from nexa_common.errors import FieldError, NotFound, ValidationFailed
 from nexa_common.logs import get_logger
@@ -94,7 +96,7 @@ class AgentService:
         async with self._engine.connect() as conn:
             if body.idempotency_key:
                 earlier = await repo.run_by_idempotency_key(
-                    conn, principal.user_id, body.idempotency_key
+                    conn, organization_id, principal.user_id, body.idempotency_key
                 )
                 if earlier is not None:
                     return await self._out(conn, principal, earlier), False
@@ -123,23 +125,34 @@ class AgentService:
                 limit=self._settings.agents_runs_per_hour,
                 window_seconds=3600,
             )
-            if (
-                await repo.count_active(
-                    conn, organization_id=organization_id, user_id=principal.user_id
-                )
-                >= self._settings.agents_runs_per_user
-            ):
-                raise RunLimitReached("You have too many runs in progress. Wait for one to finish.")
-            if (
-                await repo.count_active(conn, organization_id=organization_id, user_id=None)
-                >= self._settings.agents_runs_per_organization
-            ):
-                raise RunLimitReached(
-                    "Your organization has too many runs in progress. Try again later."
-                )
         snapshot = self._snapshot(agent)
         try:
             async with self._engine.begin() as conn:
+                # Counting and inserting under the organization's lock: concurrent submissions
+                # cannot all see room under the caps.
+                await conn.execute(
+                    select(
+                        func.pg_advisory_xact_lock(
+                            func.hashtextextended(f"agent_runs:{organization_id}", 0)
+                        )
+                    )
+                )
+                if (
+                    await repo.count_active(
+                        conn, organization_id=organization_id, user_id=principal.user_id
+                    )
+                    >= self._settings.agents_runs_per_user
+                ):
+                    raise RunLimitReached(
+                        "You have too many runs in progress. Wait for one to finish."
+                    )
+                if (
+                    await repo.count_active(conn, organization_id=organization_id, user_id=None)
+                    >= self._settings.agents_runs_per_organization
+                ):
+                    raise RunLimitReached(
+                        "Your organization has too many runs in progress. Try again later."
+                    )
                 row = await repo.create_run(
                     conn,
                     organization_id=organization_id,
@@ -161,7 +174,7 @@ class AgentService:
                 raise
             async with self._engine.connect() as conn:
                 earlier = await repo.run_by_idempotency_key(
-                    conn, principal.user_id, body.idempotency_key
+                    conn, organization_id, principal.user_id, body.idempotency_key
                 )
                 if earlier is None:  # pragma: no cover - the constraint names this key
                     raise
@@ -270,6 +283,8 @@ class AgentService:
                     **repo.stopped_clock(row),
                 )
                 message = "Paused."
+            elif row.status == "running" and row.pause_requested:
+                updated, message = row, "Already pausing."
             elif row.status == "running":
                 updated = await repo.update_run(conn, row.id, pause_requested=True)
                 message = "The run will pause at its next checkpoint."
@@ -279,7 +294,7 @@ class AgentService:
                 raise RunNotActive("Only a queued or running task can be paused.")
         if updated is None:  # pragma: no cover - the row was locked
             raise RunNotActive
-        if row.status == "paused":
+        if row.status == "paused" or (row.status == "running" and row.pause_requested):
             return _control_out(updated, message)  # nothing changed: nothing to audit
         await self._audit.record(
             "AGENT_RUN_PAUSED",
@@ -436,8 +451,10 @@ class AgentService:
                         from_states=("awaiting_approval",),
                         status="rejected",
                         error_code=DECLINED,
-                        error_message="The user declined this action."
-                        + (f" ({body.comment})" if body.comment else ""),
+                        error_message=(
+                            "The user declined this action."
+                            + (f" ({body.comment})" if body.comment else "")
+                        )[:300],
                     )
                 updated = await repo.transition(
                     conn,
@@ -635,8 +652,16 @@ class AgentService:
 
 
 def _validate_input(schema: Any, data: dict[str, Any]) -> dict[str, Any]:
+    if _has_nul(data):
+        raise ValidationFailed(
+            details=[FieldError(field="input", code="invalid", message="Contains a NUL character.")]
+        )
     if not schema:
         return data
+    try:
+        check_schema(schema)  # also bounds validation time; agents saved elsewhere are rechecked
+    except AIInvalidRequest as exc:
+        raise AgentUnavailable("This agent's input schema cannot be used.") from exc
     errors = sorted(
         Draft202012Validator(schema, registry=_OFFLINE).iter_errors(data),
         key=lambda e: list(e.path),
@@ -653,6 +678,16 @@ def _validate_input(schema: Any, data: dict[str, Any]) -> dict[str, Any]:
             ]
         )
     return data
+
+
+def _has_nul(value: Any) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_has_nul(k) or _has_nul(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_has_nul(item) for item in value)
+    return False
 
 
 def _step_out(step: Any, tool: ToolActivityOut | None) -> StepOut:

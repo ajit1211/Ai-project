@@ -59,7 +59,10 @@ def run():
     _, payload = call("GET", "/agents/", token=token, expect=200)
     agents = payload.get("data") or []
     assistant = next((a for a in agents if a["slug"] == "document-assistant"), None)
-    check(assistant is not None and assistant["scope"] == "platform", "the Document Assistant is listed")
+    check(
+        assistant is not None and assistant["scope"] == "platform",
+        "the Document Assistant is listed",
+    )
     check(
         assistant is not None
         and {t["id"] for t in assistant["tools"]} == {"search_documents", "document_metadata"},
@@ -89,8 +92,20 @@ def run():
         expect=200,
     )
     check((payload.get("data") or {}).get("version") == 2, "changing its behaviour is version 2")
-    call("POST", "/agents/", {"name": "Bad", "instructions": "x", "allowed_tools": ["shell"]}, token=token, expect=422)
-    call("POST", "/agents/", {"name": "Bad", "instructions": "x", "code": "import os"}, token=token, expect=422)
+    call(
+        "POST",
+        "/agents/",
+        {"name": "Bad", "instructions": "x", "allowed_tools": ["shell"]},
+        token=token,
+        expect=422,
+    )
+    call(
+        "POST",
+        "/agents/",
+        {"name": "Bad", "instructions": "x", "code": "import os"},
+        token=token,
+        expect=422,
+    )
     check(True, "unknown tools and unknown fields are refused")
 
     # --- The Document Assistant over an uploaded handbook ---------------------------------
@@ -107,7 +122,9 @@ def run():
     check(task.get("status") == "queued", "a task is queued")
     done = wait_for(token, task.get("id"), lambda r: r.get("status") in FINAL)
     check(done.get("status") == "completed", f"the task completes ({done.get('status')})")
-    check("thirty days" in done.get("result", ""), "the answer comes from the handbook (mock model)")
+    check(
+        "thirty days" in done.get("result", ""), "the answer comes from the handbook (mock model)"
+    )
     check(
         bool(done.get("sources")) and done["sources"][0]["document_id"] == document_id,
         "it cites the handbook",
@@ -119,7 +136,9 @@ def run():
     names = [name for name, _ in events(stream)]
     check(names[:1] == ["run"] and names[-1:] == ["end"], "the progress stream reports and ends")
     _, payload = call("GET", "/runs/?status=finished", token=token, expect=200)
-    check(task.get("id") in [r["id"] for r in payload.get("data") or []], "the task is in the history")
+    check(
+        task.get("id") in [r["id"] for r in payload.get("data") or []], "the task is in the history"
+    )
 
     # --- An action waits for approval -----------------------------------------------------
     goal = '[[agent:call_tool save_memory {"content": "I prefer metric units"}]] [[agent:complete Saved.]]'
@@ -131,7 +150,13 @@ def run():
     check(approval is not None, "saving a memory waits for approval (mock model)")
     if approval:
         url = f"/runs/{pending_task['id']}/approvals/{approval['id']}/"
-        call("POST", url, {"decision": "approve", "arguments_hash": "0" * 64}, token=token, expect=409)
+        call(
+            "POST",
+            url,
+            {"decision": "approve", "arguments_hash": "0" * 64},
+            token=token,
+            expect=409,
+        )
         call(
             "POST",
             url,
@@ -143,16 +168,24 @@ def run():
         check(finished.get("status") == "completed", "approved, the task continues and completes")
         _, memories = call("GET", "/memories/", token=token, expect=200)
         check(
-            sum(1 for m in memories.get("data") or [] if m["content"] == "I prefer metric units") == 1,
+            sum(1 for m in memories.get("data") or [] if m["content"] == "I prefer metric units")
+            == 1,
             "the memory was saved exactly once",
         )
 
     # --- Pause and resume, cancel ---------------------------------------------------------
-    slow = submit(token, helper.get("id"), "[[slow:2500]] [[agent:progress Working]] [[agent:complete Done]]")
+    slow = submit(
+        token, helper.get("id"), "[[slow:2500]] [[agent:progress Working]] [[agent:complete Done]]"
+    )
     time.sleep(0.8)
     _, payload = call("POST", f"/runs/{slow.get('id')}/pause/", token=token, expect=200)
-    paused = wait_for(token, slow.get("id"), lambda r: r.get("status") in ("paused", *FINAL), seconds=20)
-    check(paused.get("status") == "paused", f"pausing stops it at a checkpoint ({paused.get('status')})")
+    paused = wait_for(
+        token, slow.get("id"), lambda r: r.get("status") in ("paused", *FINAL), seconds=20
+    )
+    check(
+        paused.get("status") == "paused",
+        f"pausing stops it at a checkpoint ({paused.get('status')})",
+    )
     call("POST", f"/runs/{slow.get('id')}/resume/", token=token, expect=200)
     resumed = wait_for(token, slow.get("id"), lambda r: r.get("status") in FINAL)
     check(resumed.get("status") == "completed", "resumed, it completes")
